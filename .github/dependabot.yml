@@ -1,13 +1,8 @@
 version: 2
 updates:
-  - package-ecosystem: cargo
-    directory: /
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
-    groups:
-      rust-dependencies:
-        patterns: ["*"]
+  # Cargo's cross-repository path dependencies need the pinned sibling checkouts.
+  # Keep coordinated Cargo upgrades maintainer-owned; dependency-audit.yml checks
+  # the lockfiles weekly for known vulnerabilities without resolving those paths.
   - package-ecosystem: github-actions
     directory: /
     schedule:

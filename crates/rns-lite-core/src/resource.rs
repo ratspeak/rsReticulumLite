@@ -27,8 +27,8 @@
 //!
 //! Honest-subset bounds (fail-closed, documented divergences from the full stack):
 //! - MCU caps: [`MAX_PARTS`] parts / [`TRANSFER_MAX`] ciphertext / [`DATA_MAX`] payload per
-//!   resource. Larger advertisements are cleanly rejected ([`ResourceError::TooLarge`]) — the peer
-//!   observes a refused transfer, exactly like any resource the receiving side declines.
+//!   resource. Larger advertisements return [`ResourceError::TooLarge`]. The host must send an
+//!   encrypted RESOURCE_RCL containing [`ResourceAdv::rejection_hash`] to notify the sender.
 //! - UNCOMPRESSED only: the fleet ships bz2 disabled (micro fork) and lite targets MCU, so
 //!   compressed ADVs are rejected at accept time ([`ResourceError::CompressedUnsupported`]) — the
 //!   honest no-bz2 behaviour (a bz2-less peer would fail the transfer at assembly; lite fails it
@@ -412,6 +412,24 @@ impl ResourceAdv {
     /// (larger resources return [`ResourceError::TooLarge`]). Trailing bytes after the map are
     /// ignored (both references decode a single object).
     pub fn parse(data: &[u8]) -> Result<Self, ResourceError> {
+        let adv = Self::parse_bounded(data)?;
+        if adv.hashmap_len > MAX_PARTS * MAPHASH_LEN {
+            return Err(ResourceError::TooLarge);
+        }
+        Ok(adv)
+    }
+
+    /// Identify a syntactically valid advertisement even when its hashmap exceeds our endpoint
+    /// capacity. The host can refuse it with RESOURCE_RCL without allocating a transfer or
+    /// accepting its data. As in the trusted runtime, cancellation names the segment hash `h`,
+    /// not the original multi-segment hash `o`. Malformed maps never yield a cancellation target.
+    pub fn rejection_hash(data: &[u8]) -> Result<[u8; 32], ResourceError> {
+        Ok(Self::parse_bounded(data)?.resource_hash)
+    }
+
+    // Parse the entire map before exposing its hash. Large hashmaps are validated as slices,
+    // not copied; this private intermediate must not be passed to the transfer implementation.
+    fn parse_bounded(data: &[u8]) -> Result<Self, ResourceError> {
         let mut r = MpReader { data, pos: 0 };
         let head = r.byte()?;
         if !(0x80..=0x8F).contains(&head) || head & 0x0F != 11 {
@@ -494,10 +512,9 @@ impl ResourceAdv {
                     if s.len() % MAPHASH_LEN != 0 {
                         return Err(ResourceError::InvalidAdvertisement);
                     }
-                    if s.len() > MAX_PARTS * MAPHASH_LEN {
-                        return Err(ResourceError::TooLarge);
+                    if s.len() <= MAX_PARTS * MAPHASH_LEN {
+                        adv.hashmap[..s.len()].copy_from_slice(s);
                     }
-                    adv.hashmap[..s.len()].copy_from_slice(s);
                     adv.hashmap_len = s.len();
                 }
                 _ => unreachable!(),
@@ -1275,11 +1292,42 @@ mod tests {
         // Every prefix must return a clean error, never panic.
         for cut in 0..n {
             assert!(ResourceAdv::parse(&buf[..cut]).is_err());
+            assert!(ResourceAdv::rejection_hash(&buf[..cut]).is_err());
         }
         // Trailing garbage after a whole map is ignored (single-object decode).
         let mut extended = [0u8; ADV_PACKED_MAX + 4];
         extended[..n].copy_from_slice(&buf[..n]);
         assert!(ResourceAdv::parse(&extended[..n + 4]).is_ok());
+    }
+
+    #[test]
+    fn rejection_hash_matches_full_rust_large_segment() {
+        use rns_protocol::resource::ResourceFlags as FullFlags;
+        use rns_protocol::resource_adv::ResourceAdvertisement;
+        let mut adv = ResourceAdvertisement::new(
+            40_000,
+            39_936,
+            87,
+            [0x45; 32],
+            std::vec![0x22; 4],
+            FullFlags {
+                encrypted: true,
+                ..Default::default()
+            },
+            &[[0x13; 4]; 74],
+            LINK_MDU,
+        );
+        adv.original_hash = [0x99; 32];
+        let bytes = adv.pack();
+        assert!(bytes.len() > ADV_PACKED_MAX);
+        assert_eq!(ResourceAdv::parse(&bytes), Err(ResourceError::TooLarge));
+        assert_eq!(ResourceAdv::rejection_hash(&bytes), Ok(adv.resource_hash));
+        for cut in 0..bytes.len() {
+            assert!(ResourceAdv::rejection_hash(&bytes[..cut]).is_err());
+        }
+        let mut malformed = bytes.clone();
+        malformed[2] = b'd'; // Duplicate field: no partial hash may escape.
+        assert!(ResourceAdv::rejection_hash(&malformed).is_err());
     }
 
     #[test]
