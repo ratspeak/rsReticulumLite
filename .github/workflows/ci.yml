@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  RSLITE_RSRETICULUM_COMMIT: 3b3eb29c16c9dbc114c9b31d9f912a7b1a68652c
+  RSLITE_PYTHON_RNS_VERSION: "1.4.2"
+
+jobs:
+  quality:
+    name: Full no_std matrix (Rust 1.87)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          path: rsReticulumLite
+          fetch-depth: 0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          repository: ${{ github.repository_owner }}/rsReticulum
+          ref: ${{ env.RSLITE_RSRETICULUM_COMMIT }}
+          path: rsReticulum
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.87.0
+          components: clippy, rustfmt
+          targets: thumbv7em-none-eabihf,riscv32imc-unknown-none-elf
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: rsReticulumLite -> target
+          cache-bin: false
+      - name: Run public core matrix
+        working-directory: rsReticulumLite
+        run: ./scripts/test-matrix.sh
+      - name: Enforce exact trusted source
+        working-directory: rsReticulumLite
+        run: ./scripts/check-trusted-ref.sh --strict
+
+  test:
+    name: Host tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          path: rsReticulumLite
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          repository: ${{ github.repository_owner }}/rsReticulum
+          ref: ${{ env.RSLITE_RSRETICULUM_COMMIT }}
+          path: rsReticulum
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: rsReticulumLite -> target
+          cache-bin: false
+      - run: cargo +stable test --workspace --locked
+        working-directory: rsReticulumLite
+      - run: cargo +stable check --manifest-path tests/api/Cargo.toml --locked
+        working-directory: rsReticulumLite
+
+  python-vectors:
+    name: Python RNS 1.4.2 bidirectional vectors
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          path: rsReticulumLite
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          repository: ${{ github.repository_owner }}/rsReticulum
+          ref: ${{ env.RSLITE_RSRETICULUM_COMMIT }}
+          path: rsReticulum
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.87.0
+      - name: Install exact Python validator
+        run: python3 -m pip install --disable-pip-version-check "rns==$RSLITE_PYTHON_RNS_VERSION"
+      - run: ./vectors/run.sh
+        working-directory: rsReticulumLite
