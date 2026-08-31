@@ -19,13 +19,14 @@ supplies clocks, entropy, storage and interface I/O.
 - LoRa split framing, airtime limiting and carrier-sense backoff.
 - `MicroNode` and `SmallNode` profiles, with custom capacities through `LiteNode`.
 
-Resource endpoints support encrypted, uncompressed, single-segment transfers:
-up to eight parts and 3,659 bytes of application data. This limit does not
-restrict a relay forwarding Resource packets between other endpoints.
+Resources sent or received by this library are limited to 3,659 bytes of data
+per transfer. Transfers are encrypted; compression and multi-segment transfers
+are not supported. This size limit does not apply when forwarding Resource
+packets between other nodes.
 
-This is a protocol library, not a board driver or complete Reticulum runtime.
-Link scheduling, durable writes and transmission outcomes remain with the
-caller. LXMF message encoding lives in [rsLXMFLite](https://github.com/ratspeak/rsLXMFLite).
+The library does not run a networking loop or drive hardware. Your firmware
+manages Link timers, writes persistent state and handles transmission failures.
+For LXMF messages, use [rsLXMFLite](https://github.com/ratspeak/rsLXMFLite).
 
 ## Build and test
 
@@ -44,7 +45,8 @@ done < TRUSTED_REF
 
 The matrix runs host tests, ARM/RISC-V checks, Clippy, rustdoc and compatibility
 tests against the exact rsReticulum revision in [`TRUSTED_REF`](TRUSTED_REF).
-Python Resource checks are described in the [testing notes](docs/testing/matrix.md#python-interoperability).
+For Python interoperability checks, install the RNS version in
+[`vectors/RNS_VERSION`](vectors/RNS_VERSION) and run `./vectors/run.sh`.
 
 For a firmware dependency, pin a source revision:
 
@@ -54,8 +56,7 @@ rns-lite-core = { git = "https://github.com/ratspeak/rsReticulumLite", rev = "<c
 ```
 
 The crate is distributed from source, not crates.io.
-See the [path-request example](crates/rns-lite-core/examples/path_request.rs)
-and [integration notes](docs/architecture/lite-transport-node.md).
+See the [path-request example](crates/rns-lite-core/examples/path_request.rs).
 Build API documentation with `cargo doc --workspace --no-deps --open`.
 
 ## License

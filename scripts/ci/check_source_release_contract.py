@@ -32,14 +32,12 @@ def check_required_files() -> None:
     required = [
         ".github/workflows/ci.yml",
         ".github/workflows/release-readiness.yml",
-        "CHANGELOG.md",
         "LICENSE",
         "README.md",
         "SECURITY.md",
         "TRUSTED_REF",
         "api/fixtures/Cargo.lock",
         "api/fixtures/Cargo.toml",
-        "docs/README.md",
         "rust-toolchain.toml",
     ]
     missing = [path for path in required if not (ROOT / path).is_file()]
@@ -150,13 +148,11 @@ def check_python_validator() -> None:
 
 
 def check_documents() -> None:
-    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    if not re.search(r"^## Unreleased\s*$", changelog, re.MULTILINE):
-        fail("CHANGELOG.md is missing an Unreleased section")
-
     for path in source_files():
-        if path.suffix != ".md":
+        if path.suffix.lower() != ".md":
             continue
+        if path.relative_to(ROOT).as_posix() not in {"README.md", "SECURITY.md"}:
+            fail(f"unexpected public Markdown file: {path.relative_to(ROOT)}")
         text = path.read_text(encoding="utf-8")
         for target in LINK_PATTERN.findall(text):
             if target.startswith(("http://", "https://", "mailto:", "#")):
