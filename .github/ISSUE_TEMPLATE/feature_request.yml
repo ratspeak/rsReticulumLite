@@ -1,0 +1,26 @@
+name: Feature request
+description: Propose a bounded protocol surface or integration improvement
+title: "proposal: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What constrained MCU use case is not served today?
+    validations:
+      required: true
+  - type: textarea
+    id: bounds
+    attributes:
+      label: Proposed bounds and ownership
+      description: State memory/wire limits and which responsibilities remain host-owned.
+    validations:
+      required: true
+  - type: textarea
+    id: source
+    attributes:
+      label: Trusted Rust source behavior
+      description: Identify the corresponding rsReticulum behavior or explain why none exists.
+    validations:
+      required: true

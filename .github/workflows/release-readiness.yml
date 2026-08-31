@@ -1,0 +1,64 @@
+name: Release readiness
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Existing branch, tag, or commit to qualify
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+env:
+  RSLITE_RSRETICULUM_COMMIT: 3b3eb29c16c9dbc114c9b31d9f912a7b1a68652c
+  RSLITE_PYTHON_RNS_VERSION: "1.4.2"
+
+jobs:
+  qualify:
+    name: Qualify source without publishing
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source_ref }}
+          path: rsReticulumLite
+          fetch-depth: 0
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          repository: ${{ github.repository_owner }}/rsReticulum
+          ref: ${{ env.RSLITE_RSRETICULUM_COMMIT }}
+          path: rsReticulum
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.87.0
+          components: clippy, rustfmt
+          targets: thumbv7em-none-eabihf,riscv32imc-unknown-none-elf
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: rsReticulumLite -> target
+          cache-bin: false
+      - name: Install exact Python validator
+        run: python3 -m pip install --disable-pip-version-check "rns==$RSLITE_PYTHON_RNS_VERSION"
+      - name: Run strict release matrix
+        working-directory: rsReticulumLite
+        run: ./scripts/release-matrix.sh
+      - name: Stage review-only source archive
+        working-directory: rsReticulumLite
+        shell: bash
+        run: |
+          set -euo pipefail
+          git archive --format=tar --prefix=rsReticulumLite-source/ HEAD | gzip -n > rsReticulumLite-source.tar.gz
+          sha256sum rsReticulumLite-source.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: rsReticulumLite-release-candidate
+          path: |
+            rsReticulumLite/rsReticulumLite-source.tar.gz
+            rsReticulumLite/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14

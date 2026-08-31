@@ -1,0 +1,5 @@
+[toolchain]
+channel = "1.87.0"
+components = ["clippy", "rustfmt"]
+targets = ["riscv32imc-unknown-none-elf", "thumbv7em-none-eabihf"]
+profile = "minimal"

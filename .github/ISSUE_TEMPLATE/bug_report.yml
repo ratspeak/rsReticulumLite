@@ -1,0 +1,40 @@
+name: Bug report
+description: Report reproducible protocol, parser, compatibility, or build behavior
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: For security-sensitive reports, stop and follow SECURITY.md instead.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Exact rsReticulumLite commit or release tag
+    validations:
+      required: true
+  - type: input
+    id: target
+    attributes:
+      label: Target and profile
+      description: Host or MCU target, plus MicroNode/SmallNode/custom capacities
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal packet/vector/code and the command used
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      render: shell

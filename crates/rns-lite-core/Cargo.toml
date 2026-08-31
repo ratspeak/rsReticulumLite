@@ -1,0 +1,44 @@
+[package]
+name = "rns-lite-core"
+description = "Bounded no_std Reticulum transport and endpoint primitives for MCU-class devices"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+repository = "https://github.com/ratspeak/rsReticulumLite"
+readme = "../../README.md"
+keywords = ["reticulum", "embedded", "no-std", "lora", "networking"]
+categories = ["embedded", "network-programming", "no-std"]
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["fast", "zeroize"] }
+sha2 = { version = "0.10", default-features = false }
+# Endpoint role only (announce-create): derive the X25519 public key + wipe key copies.
+# The relay path does not need these operations.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+zeroize = { version = "1", default-features = false }
+# Endpoint LXMF single-frame: SINGLE-destination encryption (Token/ECIES). Same RustCrypto
+# primitives rns-crypto builds on; no_std + no-alloc (fixed-buffer / in-place APIs only).
+aes = { version = "0.8", default-features = false }
+cbc = { version = "0.1", default-features = false, features = ["block-padding"] }
+hmac = { version = "0.12", default-features = false }
+hkdf = { version = "0.12", default-features = false }
+subtle = { version = "2", default-features = false }
+
+[dev-dependencies]
+rns-identity = { path = "../../../rsReticulum/crates/rns-identity", version = "1.2.0" }
+rns-wire = { path = "../../../rsReticulum/crates/rns-wire", version = "1.2.0" }
+rns-crypto = { path = "../../../rsReticulum/crates/rns-crypto", version = "1.2.0" }
+rns-link = { path = "../../../rsReticulum/crates/rns-link", version = "1.2.0" }
+# Trusted IFAC wrap/verify lives in rns-transport; dev-only, so the host deps it
+# pulls (tokio et al.) never touch the no_std MCU build path.
+rns-transport = { path = "../../../rsReticulum/crates/rns-transport", version = "1.2.0" }
+# Resource transfer reference for byte-exact cross-checks; dev-only.
+rns-protocol = { path = "../../../rsReticulum/crates/rns-protocol", version = "1.2.0" }
