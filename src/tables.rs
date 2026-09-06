@@ -63,6 +63,33 @@ impl<T: Copy, const N: usize> Queue<T, N> {
         self.entries[self.head].as_ref()
     }
 
+    /// Iterate in FIFO order. The physical ring layout stays private so callers cannot create
+    /// holes or violate the queue's bounded accounting.
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        (0..self.len).filter_map(|offset| {
+            let idx = (self.head + offset) % N.max(1);
+            self.entries[idx].as_ref()
+        })
+    }
+
+    /// Remove the entry at `offset` in FIFO order. This is used by the transport's fair scheduler
+    /// to choose another interface without allocating one queue per interface.
+    pub fn remove(&mut self, offset: usize) -> Option<T> {
+        if offset >= self.len || N == 0 {
+            return None;
+        }
+
+        let idx = (self.head + offset) % N;
+        let value = self.entries[idx].take();
+        for shift in offset..self.len - 1 {
+            let from = (self.head + shift + 1) % N;
+            let to = (self.head + shift) % N;
+            self.entries[to] = self.entries[from].take();
+        }
+        self.len -= 1;
+        value
+    }
+
     pub fn pop(&mut self) -> Option<T> {
         if self.len == 0 || N == 0 {
             return None;
@@ -187,6 +214,20 @@ impl<const N: usize> PathTable<N> {
         self.get(destination_hash).map(|entry| &entry.public_key)
     }
 
+    /// Immediately remove a failed route, like trusted rns-transport's
+    /// PathTable::expire(destination). Known identities are stored separately.
+    pub fn drop_path(&mut self, destination_hash: &Hash16) -> bool {
+        if let Some(slot) = self.entries.iter_mut().find(|slot| {
+            slot.as_ref()
+                .is_some_and(|entry| &entry.destination_hash == destination_hash)
+        }) {
+            *slot = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn live_count(&self, now_ms: u64) -> usize {
         self.entries
             .iter()
@@ -302,6 +343,15 @@ impl<const N: usize> AnnounceCache<N> {
         }
     }
 
+    /// A signed announce is useful only while its matching route is retained.
+    pub fn retain_paths<const P: usize>(&mut self, paths: &PathTable<P>, now_ms: u64) {
+        for slot in &mut self.entries {
+            if slot.is_some_and(|entry| paths.get_live(&entry.destination_hash, now_ms).is_none()) {
+                *slot = None;
+            }
+        }
+    }
+
     pub fn expire(&mut self, now_ms: u64) {
         for slot in &mut self.entries {
             if slot.is_some_and(|entry| now_ms >= entry.expires_ms) {
@@ -414,6 +464,13 @@ impl<const N: usize> ReverseTable<N> {
         if let Some(idx) = replacement {
             self.entries[idx] = Some(entry);
         }
+    }
+
+    pub fn get(&self, proof_hash: &Hash16, now_ms: u64) -> Option<&ReverseEntry> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|entry| &entry.proof_hash == proof_hash && now_ms < entry.expires_ms)
     }
 
     pub fn remove(&mut self, proof_hash: &Hash16, now_ms: u64) -> Option<ReverseEntry> {
@@ -688,6 +745,23 @@ mod tests {
                 .flatten()
                 .any(|entry| entry.hash == hash(3))
         );
+    }
+
+    #[test]
+    fn dropping_a_path_allows_the_same_announce_through_a_farther_transport() {
+        let mut table: PathTable<2> = PathTable::new();
+        let direct = path(1, 100);
+        table.insert_or_update(direct, 0);
+        table.insert_or_update(path(2, 100), 0);
+        let mut relayed = direct;
+        relayed.hops += 1;
+        relayed.next_hop = Some([3; 16]);
+        assert!(!table.insert_or_update(relayed, 1));
+        assert!(table.drop_path(&direct.destination_hash));
+        assert!(!table.drop_path(&direct.destination_hash));
+        assert!(table.get_live(&[2; 16], 1).is_some());
+        assert!(table.insert_or_update(relayed, 1));
+        assert_eq!(table.get_live(&direct.destination_hash, 1), Some(&relayed));
     }
 
     #[test]

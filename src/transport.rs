@@ -82,6 +82,27 @@ pub struct OutboundFrame {
     /// Wire bytes: a plain packet, or an IFAC-wrapped frame up to MTU + tag.
     pub packet: WireBuffer,
     pub reason: OutboundReason,
+    pub lifetime: OutboundLifetime,
+}
+
+/// A queued packet may wait at most the existing duplicate-hash horizon. Discovery
+/// work additionally uses the existing path-request timeout. This is bounded local
+/// queue policy; protocol route, reverse, and link timeouts are never extended.
+pub const OUTBOUND_MAX_AGE_MS: u64 = HASHLIST_LIFETIME_MS;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutboundLifetime {
+    pub enqueued_ms: u64,
+    pub expires_ms: u64,
+    path: Option<(Hash16, [u8; 32])>,
+    state: OutboundState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutboundState {
+    Independent,
+    Reverse(Hash16),
+    Link(Hash16),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,6 +143,8 @@ pub struct TransportStats {
     pub validation_failures: u64,
     /// Outbound frames evicted (oldest-dropped) because the TX queue was full — backpressure loss.
     pub outbound_dropped: u64,
+    /// Queued or driver-held frames discarded after their deadline/state became stale.
+    pub outbound_expired: u64,
     /// Announces rejected by the pre-verify admission limiter.
     pub announces_rate_dropped: u64,
 }
@@ -183,9 +206,12 @@ pub struct LiteNode<
     const TAGS: usize,
     const OUTBOUND: usize,
     const KNOWN_DESTINATIONS: usize = KNOWN_DESTINATIONS_SMALL,
+    const SCHEDULED: usize = ANNOUNCES,
 > {
     #[doc(hidden)]
     pub config: LiteConfig,
+    #[doc(hidden)]
+    pub clock_ms: u64,
     #[doc(hidden)]
     pub transport_id: Hash16,
     #[doc(hidden)]
@@ -201,7 +227,7 @@ pub struct LiteNode<
     #[doc(hidden)]
     pub announce_cache: AnnounceCache<ANNOUNCES>,
     #[doc(hidden)]
-    pub announce_schedule: AnnounceSchedule<ANNOUNCES>,
+    pub announce_schedule: AnnounceSchedule<SCHEDULED>,
     #[doc(hidden)]
     pub reverse: ReverseTable<REVERSE>,
     #[doc(hidden)]
@@ -223,7 +249,19 @@ impl<
     const TAGS: usize,
     const OUTBOUND: usize,
     const KNOWN_DESTINATIONS: usize,
-> LiteNode<PATHS, HASHES, ANNOUNCES, REVERSE, LINKS, TAGS, OUTBOUND, KNOWN_DESTINATIONS>
+    const SCHEDULED: usize,
+>
+    LiteNode<
+        PATHS,
+        HASHES,
+        ANNOUNCES,
+        REVERSE,
+        LINKS,
+        TAGS,
+        OUTBOUND,
+        KNOWN_DESTINATIONS,
+        SCHEDULED,
+    >
 {
     pub fn new(config: LiteConfig, transport_id: Hash16) -> Result<Self, TransportError> {
         Self::validate_config(&config)?;
@@ -258,6 +296,7 @@ impl<
     pub const fn new_const(config: LiteConfig, transport_id: Hash16) -> Self {
         Self {
             config,
+            clock_ms: 0,
             transport_id,
             own_destinations: [None; OWN_DESTINATIONS_MAX],
             announce_admission: AnnounceAdmission::new(),
@@ -278,6 +317,7 @@ impl<
                 dropped: 0,
                 validation_failures: 0,
                 outbound_dropped: 0,
+                outbound_expired: 0,
                 announces_rate_dropped: 0,
             },
         }
@@ -380,6 +420,12 @@ impl<
         self.paths.live_count(now_ms)
     }
 
+    /// Forget a failed route before rediscovery without forgetting the peer's
+    /// identity or cached announce. Adapted from trusted TransportQuery::DropPath.
+    pub fn drop_path(&mut self, destination_hash: &Hash16) -> bool {
+        self.paths.drop_path(destination_hash)
+    }
+
     /// Originate a path request for `destination_hash` (the endpoint operation): build the wire
     /// packet and enqueue it for transmission on `interface_id`. `tag` is a caller-supplied 16-byte
     /// request tag (random per Reticulum; no_std has no RNG). Wire-identical to Python
@@ -392,6 +438,8 @@ impl<
         interface_id: InterfaceId,
         now_ms: u64,
     ) -> Result<(), TransportError> {
+        self.clock_ms = now_ms;
+        self.expire_outbound(now_ms);
         let request = self.build_path_request(*destination_hash, tag)?;
         // Send before recording: a request that never queued must not burn the
         // duplicate gate or register its tag (trusted send-before-record ordering).
@@ -409,7 +457,144 @@ impl<
         Ok(())
     }
 
+    /// The clock is advanced by ingest, request_path, and tick. Drivers retaining
+    /// a popped frame must recheck this predicate immediately before admission.
+    pub fn outbound_lifetime_is_live(
+        &self,
+        interface_id: InterfaceId,
+        lifetime: OutboundLifetime,
+        now_ms: u64,
+    ) -> bool {
+        if now_ms >= lifetime.expires_ms || !self.outbound_interface_online(interface_id) {
+            return false;
+        }
+        if lifetime.path.is_some_and(|(destination, packet_hash)| {
+            !self
+                .paths
+                .get_live(&destination, now_ms)
+                .is_some_and(|path| {
+                    path.packet_hash == packet_hash
+                        && self.outbound_interface_online(path.interface_id)
+                })
+        }) {
+            return false;
+        }
+        match lifetime.state {
+            OutboundState::Independent => true,
+            OutboundState::Reverse(hash) => self.reverse.get(&hash, now_ms).is_some_and(|entry| {
+                entry.outbound_interface == interface_id
+                    && self.outbound_interface_online(entry.receiving_interface)
+            }),
+            OutboundState::Link(id) => self.links.get(&id, now_ms).is_some_and(|entry| {
+                (entry.outbound_interface == interface_id
+                    || entry.receiving_interface == interface_id)
+                    && self.outbound_interface_online(entry.outbound_interface)
+                    && self.outbound_interface_online(entry.receiving_interface)
+            }),
+        }
+    }
+
+    pub fn record_expired_outbound(&mut self) {
+        self.stats.outbound_expired = self.stats.outbound_expired.saturating_add(1);
+        self.stats.outbound_dropped = self.stats.outbound_dropped.saturating_add(1);
+    }
+
+    pub fn outbound_oldest_age_ms(&self, now_ms: u64) -> u64 {
+        self.outbound
+            .iter()
+            .map(|frame| now_ms.saturating_sub(frame.lifetime.enqueued_ms))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn expire_outbound(&mut self, now_ms: u64) {
+        loop {
+            let stale = self.outbound.iter().position(|frame| {
+                !self.outbound_lifetime_is_live(frame.interface_id, frame.lifetime, now_ms)
+            });
+            let Some(offset) = stale else { break };
+            self.outbound.remove(offset);
+            self.record_expired_outbound();
+        }
+    }
+
+    fn packet_lifetime(&self, packet: &PacketBuffer, reason: OutboundReason) -> OutboundLifetime {
+        let now_ms = self.clock_ms;
+        let mut lifetime = OutboundLifetime {
+            enqueued_ms: now_ms,
+            expires_ms: now_ms.saturating_add(OUTBOUND_MAX_AGE_MS),
+            path: None,
+            state: OutboundState::Independent,
+        };
+        if matches!(
+            reason,
+            OutboundReason::PathRequest
+                | OutboundReason::PathRequestForward
+                | OutboundReason::PathResponse
+        ) {
+            lifetime.expires_ms = lifetime.expires_ms.min(
+                now_ms
+                    .saturating_add(u64::from(crate::constants::PATH_REQUEST_TIMEOUT_SECS) * 1000),
+            );
+        }
+        let Ok(view) = PacketView::parse(packet.as_slice()) else {
+            return lifetime;
+        };
+        let header = view.header;
+        let path_dependent = header.flags.packet_type == PacketType::Announce
+            || (header.flags.destination_type == DestinationType::Single
+                && reason == OutboundReason::TransportForward);
+        if let Some(path) = self
+            .paths
+            .get_live(&header.destination_hash, now_ms)
+            .filter(|_| path_dependent)
+        {
+            lifetime.path = Some((path.destination_hash, path.packet_hash));
+            lifetime.expires_ms = lifetime.expires_ms.min(path.expires_ms);
+            if header.flags.packet_type == PacketType::LinkRequest {
+                lifetime.state = OutboundState::Link(link_id_from_raw(
+                    packet.as_slice(),
+                    header.flags.header_type,
+                ));
+                lifetime.expires_ms = lifetime.expires_ms.min(now_ms.saturating_add(
+                    u64::from(LINK_PROOF_TIMEOUT_PER_HOP_SECS) * 1000 * u64::from(path.hops.max(1)),
+                ));
+            } else if header.flags.packet_type == PacketType::Data {
+                lifetime.state = OutboundState::Reverse(truncated_packet_hash(
+                    packet.as_slice(),
+                    header.flags.header_type,
+                ));
+                lifetime.expires_ms = lifetime
+                    .expires_ms
+                    .min(now_ms.saturating_add(u64::from(REVERSE_TIMEOUT_SECS) * 1000));
+            }
+        }
+        if header.flags.destination_type == DestinationType::Link
+            || header.context == PacketContext::Lrproof
+        {
+            lifetime.state = OutboundState::Link(header.destination_hash);
+            if let Some(link) = self.links.get(&header.destination_hash, now_ms) {
+                // Successful admission promotes a verified establishment proof or
+                // refreshes an already validated link's idle timeout. Snapshot that
+                // resulting deadline, not the old idle deadline that this very frame
+                // renews. Pending links retain their original establishment deadline.
+                let link_deadline = if link.validated || header.context == PacketContext::Lrproof {
+                    now_ms.saturating_add(u64::from(LINK_TIMEOUT_SECS) * 1000)
+                } else {
+                    link.expires_ms
+                };
+                lifetime.expires_ms = lifetime.expires_ms.min(link_deadline);
+            }
+        }
+        lifetime
+    }
+
+    fn outbound_interface_online(&self, _interface_id: InterfaceId) -> bool {
+        true
+    }
+
     pub fn poll_tx(&mut self) -> Option<OutboundFrame> {
+        self.expire_outbound(self.clock_ms);
         self.outbound.pop()
     }
 
@@ -424,15 +609,29 @@ impl<
     }
 
     pub fn tick(&mut self, now_ms: u64) {
+        self.clock_ms = now_ms;
         self.packet_hashes.expire(now_ms);
         self.paths.expire(now_ms);
         self.announce_cache.expire(now_ms);
+        self.announce_cache.retain_paths(&self.paths, now_ms);
         self.announce_schedule.expire(now_ms);
         self.reverse.expire(now_ms);
         self.links.expire(now_ms);
         self.request_tags.expire(now_ms);
+        self.expire_outbound(now_ms);
 
         while let Some(announce) = self.announce_schedule.pop_due(now_ms) {
+            let Some(path) = self.paths.get_live(&announce.destination_hash, now_ms) else {
+                continue;
+            };
+            if !announce.block_rebroadcast
+                && PacketView::parse(announce.packet.as_slice()).map_or(true, |view| {
+                    packet_hash(announce.packet.as_slice(), view.header.flags.header_type)
+                        != path.packet_hash
+                })
+            {
+                continue;
+            }
             self.enqueue(
                 announce.interface_id,
                 announce.packet,
@@ -451,6 +650,8 @@ impl<
         meta: RxMeta,
         now_ms: u64,
     ) -> Result<IngestAction, TransportError> {
+        self.clock_ms = now_ms;
+        self.expire_outbound(now_ms);
         let mut ifac_plain = PacketBuffer::new();
         let raw = if let Some(ifac) = self.config.ifac {
             match ifac_verify_into(raw, &ifac.key, ifac.size, &mut ifac_plain) {
@@ -649,6 +850,7 @@ impl<
             // inside `if should_add` (Transport.py:1998); caching unconditionally would let a
             // freshness-rejected (replayed/older/higher-hop) announce poison the path-response
             // cache that handle_path_request answers from, while the path table kept the fresh entry.
+            self.announce_cache.retain_paths(&self.paths, now_ms);
             self.announce_cache.insert(
                 CachedAnnounce {
                     destination_hash: header.destination_hash,
@@ -777,10 +979,10 @@ impl<
                     return Ok(IngestAction::AnsweredPathRequest);
                 }
             }
-            // Upstream Transport.py:2977-2978: a live path whose announce is no
-            // longer retrievable from cache IGNORES the request; it must not
-            // fall through to discovery-forwarding a path we already know.
-            return Ok(IngestAction::Dropped);
+            // Trusted Rust outbound.rs deliberately falls through to the ordinary
+            // discovery gates when signed cache material is unavailable. Python
+            // ignores this case; the September 2026 canon adjudication retains the
+            // trusted Rust recovery behavior without bypassing discovery policy.
         }
 
         if self.config.transport_enabled && mode_discovers_unknown_paths(self.config.mode) {
@@ -960,10 +1162,16 @@ impl<
         if let Some(reverse) = self.reverse.remove(&header.destination_hash, now_ms) {
             if reverse.outbound_interface == meta.interface_id {
                 let packet = PacketBuffer::from_slice(raw)?.copy_with_hops(header.hops);
-                if !self.enqueue(
+                if !self.enqueue_with_lifetime(
                     reverse.receiving_interface,
                     packet,
                     OutboundReason::ProofReturn,
+                    OutboundLifetime {
+                        expires_ms: reverse
+                            .expires_ms
+                            .min(now_ms.saturating_add(OUTBOUND_MAX_AGE_MS)),
+                        ..self.packet_lifetime(&packet, OutboundReason::ProofReturn)
+                    },
                 ) {
                     // Restore the consumed entry with its original deadline.
                     self.reverse.insert(reverse, now_ms);
@@ -1222,6 +1430,21 @@ impl<
         packet: PacketBuffer,
         reason: OutboundReason,
     ) -> bool {
+        self.enqueue_with_lifetime(
+            interface_id,
+            packet,
+            reason,
+            self.packet_lifetime(&packet, reason),
+        )
+    }
+
+    fn enqueue_with_lifetime(
+        &mut self,
+        interface_id: InterfaceId,
+        packet: PacketBuffer,
+        reason: OutboundReason,
+        lifetime: OutboundLifetime,
+    ) -> bool {
         let mut wire = WireBuffer::new();
         if let Some(ifac) = self.config.ifac {
             if ifac_sign_into(packet.as_slice(), &ifac.key, ifac.size, &mut wire).is_err() {
@@ -1239,6 +1462,7 @@ impl<
             interface_id,
             packet: wire,
             reason,
+            lifetime,
         });
         if evicted {
             self.stats.outbound_dropped = self.stats.outbound_dropped.saturating_add(1);
@@ -2141,9 +2365,9 @@ mod tests {
     }
 
     #[test]
-    fn path_request_for_live_path_with_evicted_cache_is_ignored() {
-        // Upstream Transport.py:2977-2978: live path + missing cached announce
-        // means the request is ignored, not re-forwarded as discovery.
+    fn path_request_for_live_path_with_evicted_cache_uses_trusted_discovery() {
+        // Trusted Rust falls through to ordinary discovery when cache material is absent.
+        // This intentionally differs from Python; see the internal canon adjudication.
         // One-slot announce cache so the second announce evicts the first.
         type TinyCacheNode = LiteNode<8, 16, 1, 4, 4, 8, 4>;
         let mut config = LiteConfig::ESP32_LORA_TRANSPORT_SMALL;
@@ -2180,11 +2404,11 @@ mod tests {
         assert_eq!(
             node.ingest(request.as_slice(), RxMeta::new(9), 6200)
                 .unwrap(),
-            IngestAction::Dropped
+            IngestAction::ForwardedPathRequest
         );
-        assert!(
-            node.poll_tx().is_none(),
-            "no discovery forward for a known path"
+        assert_eq!(
+            node.poll_tx().unwrap().reason,
+            OutboundReason::PathRequestForward
         );
     }
 
@@ -2586,7 +2810,7 @@ mod tests {
         // Cardputer budget (no PSRAM, ~55 KB free heap): the MICRO node must stay <= 32 KB so
         // cap drift can't silently blow the internal-heap allocation.
         let micro = core::mem::size_of::<MicroNode>();
-        assert_eq!(micro, 31_232, "MicroNode layout changed unexpectedly");
+        assert_eq!(micro, 31_952, "MicroNode layout changed unexpectedly");
         assert!(micro <= 32 * 1024, "MicroNode grew to {micro} B (> 32 KB)");
         // Profile caps must construct within their node type's const-generic capacities.
         assert!(MicroNode::new(LiteConfig::ESP32_LORA_TRANSPORT_MICRO, TRANSPORT_ID).is_ok());
@@ -2682,5 +2906,202 @@ mod tests {
         let frame = node.poll_tx().unwrap();
         assert_eq!(frame.packet.len(), crate::constants::WIRE_MTU_MAX);
         assert_eq!(node.stats.outbound_dropped, 0);
+    }
+    #[test]
+    fn queued_and_held_requests_expire_at_discovery_deadline() {
+        let mut node = node();
+        node.request_path(&[0x21; 16], &[0x31; 16], IFACE, 1000)
+            .unwrap();
+        let held = node.poll_tx().unwrap();
+        assert!(node.outbound_lifetime_is_live(IFACE, held.lifetime, 15_999));
+        assert!(!node.outbound_lifetime_is_live(IFACE, held.lifetime, 16_000));
+        node.request_path(&[0x22; 16], &[0x32; 16], IFACE, 1000)
+            .unwrap();
+        assert_eq!(node.outbound_oldest_age_ms(2000), 1000);
+        node.tick(16_000);
+        assert_eq!(node.outbound_len(), 0);
+        assert_eq!(node.stats().outbound_expired, 1);
+    }
+
+    #[test]
+    fn consumed_reverse_proof_owns_original_deadline() {
+        let mut node = node();
+        let announce = signed_announce([0x73; 32], "lxmf.delivery", b"proof-owner");
+        node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
+            .unwrap();
+        let data = h2_data(announce.destination_hash, b"return path");
+        let hash = truncated_packet_hash(data.as_slice(), HeaderType::Header2);
+        node.ingest(data.as_slice(), RxMeta::new(9), 1100).unwrap();
+        node.poll_tx().unwrap();
+        // A nearly expired reverse entry makes ownership transfer observable.
+        let mut reverse = node.reverse.get(&hash, 1100).copied().unwrap();
+        reverse.expires_ms = 2000;
+        node.reverse.insert(reverse, 1100);
+        let valid = proof(hash);
+        assert_eq!(
+            node.ingest(valid.as_slice(), RxMeta::new(IFACE), 1500)
+                .unwrap(),
+            IngestAction::ForwardedProof
+        );
+        assert!(node.reverse.get(&hash, 1500).is_none());
+        let held = node.poll_tx().unwrap();
+        assert_eq!(held.lifetime.expires_ms, 2000);
+        assert!(node.outbound_lifetime_is_live(9, held.lifetime, 1999));
+        assert!(!node.outbound_lifetime_is_live(9, held.lifetime, 2000));
+    }
+
+    #[test]
+    fn held_data_expires_when_return_state_is_evicted_or_route_changes() {
+        let mut node = node();
+        let announce = signed_announce([0x75; 32], "lxmf.delivery", b"route");
+        node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
+            .unwrap();
+        let data = h2_data(announce.destination_hash, b"payload");
+        let hash = truncated_packet_hash(data.as_slice(), HeaderType::Header2);
+        node.ingest(data.as_slice(), RxMeta::new(9), 1100).unwrap();
+        let held = node.poll_tx().unwrap();
+        assert!(node.outbound_lifetime_is_live(IFACE, held.lifetime, 1200));
+        let reverse = node.reverse.remove(&hash, 1200).unwrap();
+        assert!(!node.outbound_lifetime_is_live(IFACE, held.lifetime, 1200));
+        node.reverse.insert(reverse, 1200);
+        assert!(node.outbound_lifetime_is_live(IFACE, held.lifetime, 1200));
+        let newer = signed_announce_rh([0x75; 32], "lxmf.delivery", b"route", [0xBD; 10]);
+        node.ingest(newer.raw.as_slice(), RxMeta::new(2), 1300)
+            .unwrap();
+        assert!(!node.outbound_lifetime_is_live(IFACE, held.lifetime, 1300));
+    }
+
+    #[test]
+    fn pending_link_queue_never_extends_six_second_establishment_window() {
+        let mut node = node();
+        let announce = signed_announce([0x76; 32], "lxmf.delivery", b"link");
+        node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
+            .unwrap();
+        let request = link_request(announce.destination_hash, 0);
+        node.ingest(request.as_slice(), RxMeta::new(9), 1100)
+            .unwrap();
+        let held = node.poll_tx().unwrap();
+        assert_eq!(held.lifetime.expires_ms, 7100);
+        assert!(node.outbound_lifetime_is_live(IFACE, held.lifetime, 7099));
+        assert!(!node.outbound_lifetime_is_live(IFACE, held.lifetime, 7100));
+        let id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
+        node.links = LinkTable::new();
+        assert!(!node.outbound_lifetime_is_live(IFACE, held.lifetime, 1200));
+        assert!(node.links.get(&id, 1200).is_none());
+    }
+    #[test]
+    fn sixteen_routes_keep_signed_cache_coverage_with_four_scheduled_announces() {
+        type CapacityNode = LiteNode<16, 64, 16, 8, 4, 16, 8, KNOWN_DESTINATIONS_SMALL, 4>;
+        let mut config = LiteConfig::ESP32_LORA_TRANSPORT_SMALL;
+        config.table_caps = crate::config::TableCaps {
+            path_entries: 16,
+            announce_entries: 16,
+            reverse_entries: 8,
+            link_entries: 4,
+            packet_hashes: 64,
+            path_request_tags: 16,
+            queued_announces_per_interface: 4,
+            tx_queue_depth: 8,
+            ..crate::config::TableCaps::ESP32_LORA_TRANSPORT_SMALL
+        };
+        let mut node = CapacityNode::new(config, TRANSPORT_ID).unwrap();
+        let mut destinations = [[0u8; 16]; 16];
+        for (index, destination) in destinations.iter_mut().enumerate() {
+            let announce = signed_announce([index as u8 + 1; 32], "lxmf.delivery", b"sixteen");
+            *destination = announce.destination_hash;
+            node.ingest(
+                announce.raw.as_slice(),
+                RxMeta::new(IFACE),
+                1000 + index as u64,
+            )
+            .unwrap();
+        }
+        node.tick(2000);
+        assert_eq!(
+            node.outbound_len(),
+            4,
+            "schedule bound is independent of cache coverage"
+        );
+        while node.poll_tx().is_some() {}
+        for (index, destination) in destinations.into_iter().enumerate() {
+            assert!(node.has_path(&destination, 3000));
+            let request = path_request(destination, [index as u8 + 1; 16]);
+            assert_eq!(
+                node.ingest(request.as_slice(), RxMeta::new(IFACE), 3000)
+                    .unwrap(),
+                IngestAction::AnsweredPathRequest
+            );
+            assert_eq!(node.poll_tx().unwrap().reason, OutboundReason::PathResponse);
+        }
+        // Churn evicts the matching cache slot even when mode-dependent route
+        // deadlines differ; every still-retained route remains answerable.
+        let extra = signed_announce([77; 32], "lxmf.delivery", b"seventeenth");
+        node.ingest(extra.raw.as_slice(), RxMeta::new(IFACE), 3100)
+            .unwrap();
+        assert!(!node.has_path(&destinations[0], 3100));
+        assert!(node.announce_cache.get(&destinations[0], 3100).is_none());
+        for destination in destinations
+            .into_iter()
+            .skip(1)
+            .chain([extra.destination_hash])
+        {
+            assert!(node.announce_cache.get(&destination, 3100).is_some());
+        }
+        std::println!(
+            "node bytes={}, queue frame bytes={}",
+            core::mem::size_of::<CapacityNode>(),
+            core::mem::size_of::<OutboundFrame>()
+        );
+    }
+    #[test]
+    fn validated_link_activity_renews_queued_and_held_deadline() {
+        for is_proof in [false, true] {
+            let mut node = node();
+            let announce = signed_announce([0x7B; 32], "lxmf.delivery", b"active-link");
+            node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
+                .unwrap();
+            node.tick(1500);
+            while node.poll_tx().is_some() {}
+            let request = link_request(announce.destination_hash, 0);
+            let id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
+            node.ingest(request.as_slice(), RxMeta::new(9), 1600)
+                .unwrap();
+            node.poll_tx().unwrap();
+            node.links.mark_validated(&id, 2000, 1700);
+
+            // Ordinary traffic arrives one millisecond before the previous idle
+            // deadline. Successful admission renews the validated session.
+            let packet = if is_proof {
+                link_proof(id, 0, PacketContext::None)
+            } else {
+                link_packet(id, 0, PacketContext::Channel)
+            };
+            assert_eq!(
+                node.ingest(packet.as_slice(), RxMeta::new(9), 1999)
+                    .unwrap(),
+                if is_proof {
+                    IngestAction::ForwardedProof
+                } else {
+                    IngestAction::ForwardedTransport
+                }
+            );
+            assert_eq!(node.links.get(&id, 1999).unwrap().expires_ms, 901_999);
+            node.tick(2001);
+            assert_eq!(
+                node.outbound_len(),
+                1,
+                "renewed activity survives the previous idle deadline while queued"
+            );
+            let held = node.poll_tx().unwrap();
+            assert_eq!(
+                held.lifetime.expires_ms, 121_999,
+                "renewal retains the independent 120-second queue bound"
+            );
+            // The runtime checks the estimated entire burst end before it
+            // acquires the radio; that end can be past the old idle deadline.
+            let estimated_burst_end_ms = 2001 + 8000;
+            assert!(node.outbound_lifetime_is_live(IFACE, held.lifetime, estimated_burst_end_ms));
+            assert!(!node.outbound_lifetime_is_live(IFACE, held.lifetime, 121_999));
+        }
     }
 }
