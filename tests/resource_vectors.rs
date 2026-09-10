@@ -17,7 +17,7 @@ use std::fmt::Write as _;
 const VECTORS: &str = include_str!("../vectors/resource_vectors.json");
 
 fn from_hex(s: &str) -> Vec<u8> {
-    assert!(s.len() % 2 == 0, "odd hex length");
+    assert!(s.len().is_multiple_of(2), "odd hex length");
     (0..s.len() / 2)
         .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
         .collect()

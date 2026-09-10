@@ -692,11 +692,13 @@ fn lite_adv_watchdog_matches_trusted_check_timeout() {
     assert_eq!(lite.poll(now_ms, rtt_ms), AdvWatchdogAction::Failed);
     assert_eq!(trusted.resource.state, ResourceState::Failed);
 
-    // Terminal on both sides.
+    // Both remain terminal. The full transfer repeats its failure for owners
+    // that settle on their next poll; Lite's consumed ADV watchdog is quiescent.
     trusted.started_at = Instant::now() - Duration::from_secs(60);
     now_ms += 60_000;
-    assert!(matches!(trusted.check_timeout(), TransferAction::None));
+    assert!(matches!(trusted.check_timeout(), TransferAction::Failed(_)));
     assert_eq!(lite.poll(now_ms, rtt_ms), AdvWatchdogAction::Wait);
+    assert_eq!(lite.retries(), MAX_ADV_RETRIES);
 }
 
 #[test]
@@ -886,16 +888,19 @@ fn lite_receives_rns_protocol_resource_and_rns_protocol_validates_proof() {
                     rns_lite_core::resource::InboundResource::from_advertisement(&adv).unwrap(),
                 );
             }
-            TransferAction::SendPart(_, part) => {
-                assert!(lite_inb.as_mut().unwrap().receive_part(&part));
-            }
+            TransferAction::SendPart(_, _) => panic!("sender emitted an unsolicited part"),
             TransferAction::None => {
                 let inb = lite_inb.as_mut().unwrap();
                 if inb.is_complete() {
                     break;
                 }
-                // Sender window drained: lite requests the missing parts.
-                assert!(outbound.awaiting_hmu);
+                // The receiver requests parts after the advertisement; the
+                // trusted sender no longer emits an unsolicited first window.
+                assert!(matches!(
+                    outbound.resource.state,
+                    rns_protocol::resource::ResourceState::Advertised
+                        | rns_protocol::resource::ResourceState::Transferring
+                ));
                 let mut req = [0u8; rns_lite_core::resource::REQUEST_MAX];
                 let rn = inb.build_part_request(&mut req).unwrap();
                 for action in outbound.handle_request(&req[..rn]) {

@@ -3,9 +3,11 @@ use ed25519_dalek::Verifier;
 use crate::announce_admission::AnnounceAdmission;
 use crate::config::{InterfaceMode, LiteConfig};
 use crate::constants::{
-    AP_PATH_TIME_SECS, LINK_PROOF_TIMEOUT_PER_HOP_SECS, LINK_TIMEOUT_SECS,
-    PATH_REQUEST_DUPLICATE_GATE_SECS, PATHFINDER_E_SECS, PATHFINDER_M, QUEUED_ANNOUNCE_LIFE_SECS,
-    REVERSE_TIMEOUT_SECS, ROAMING_PATH_TIME_SECS,
+    AP_PATH_TIME_SECS, LINK_TIMEOUT_SECS, PATH_REQUEST_DUPLICATE_GATE_SECS, PATHFINDER_E_SECS,
+    PATHFINDER_M, QUEUED_ANNOUNCE_LIFE_SECS, REVERSE_TIMEOUT_SECS, ROAMING_PATH_TIME_SECS,
+};
+use crate::discovery::{
+    BeginDiscovery, Discoveries, REQUEST_GATE_MS, REQUESTERS, discovery_timeout, link_deadline,
 };
 use crate::identity::{
     AnnounceError, AnnounceView, LXMF_DELIVERY_NAME, SIGNED_DATA_MAX, destination_hash_from_name,
@@ -85,24 +87,109 @@ pub struct OutboundFrame {
     pub lifetime: OutboundLifetime,
 }
 
-/// A queued packet may wait at most the existing duplicate-hash horizon. Discovery
-/// work additionally uses the existing path-request timeout. This is bounded local
-/// queue policy; protocol route, reverse, and link timeouts are never extended.
-pub const OUTBOUND_MAX_AGE_MS: u64 = HASHLIST_LIFETIME_MS;
+/// Internal handheld adapter metadata. Not a wire or public packet representation.
+#[doc(hidden)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutboundDelivery {
+    pub identity: u64,
+    pub interface_generations: [u32; 7],
+    /// Before binding, allowed targets; afterwards, only still-unadmitted targets.
+    pub pending_targets: u8,
+    pub initialized: bool,
+}
+
+/// Internal queue entry; legacy consumers still receive the unchanged OutboundFrame.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueuedOutbound {
+    pub frame: OutboundFrame,
+    pub delivery: OutboundDelivery,
+}
+
+/// Immutable local queue-wait ceiling, checked before a driver starts a packet.
+/// Discovery operation timers, deduplication retention and on-air completion are
+/// separate policies. Once started, an atomic radio burst may finish after this
+/// queue deadline; route, reverse and link state is never extended by waiting.
+pub const OUTBOUND_MAX_AGE_MS: u64 = 120_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OutboundLifetime {
     pub enqueued_ms: u64,
     pub expires_ms: u64,
-    path: Option<(Hash16, [u8; 32])>,
+    path: u64,
     state: OutboundState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OutboundState {
     Independent,
-    Reverse(Hash16),
-    Link(Hash16),
+    Reverse(u64),
+    Link(u64),
+    Discovery(u64),
+}
+
+impl OutboundLifetime {
+    /// Portable owner-to-driver token. This is process-local metadata, never a
+    /// Reticulum packet or persistent format. Explicit bytes avoid exposing Rust
+    /// enum/Option layout across a C ABI. Hosts must retain the original token.
+    pub const TOKEN_BYTES: usize = 88;
+
+    pub fn to_token(self) -> [u8; Self::TOKEN_BYTES] {
+        let mut token = [0; Self::TOKEN_BYTES];
+        token[..4].copy_from_slice(b"RTX\x02");
+        token[4] = u8::from(self.path != 0);
+        token[8..16].copy_from_slice(&self.enqueued_ms.to_le_bytes());
+        token[16..24].copy_from_slice(&self.expires_ms.to_le_bytes());
+        token[24..32].copy_from_slice(&self.path.to_le_bytes());
+        let (kind, generation) = match self.state {
+            OutboundState::Independent => (0, 0),
+            OutboundState::Reverse(generation) => (1, generation),
+            OutboundState::Link(generation) => (2, generation),
+            OutboundState::Discovery(identity) => (3, identity),
+        };
+        token[5] = kind;
+        token[32..40].copy_from_slice(&generation.to_le_bytes());
+        token
+    }
+
+    /// Decode only the defined token version and discriminants. The token is
+    /// not authentication; in-process callers still obey the ownership contract.
+    /// Version 1 hash snapshots do not identify a state incarnation and are
+    /// deliberately rejected. The remaining fixed-size bytes are reserved zero.
+    pub fn from_token(token: &[u8; Self::TOKEN_BYTES]) -> Option<Self> {
+        if &token[..4] != b"RTX\x02"
+            || token[4] > 1
+            || token[6..8] != [0; 2]
+            || token[40..].iter().any(|&byte| byte != 0)
+        {
+            return None;
+        }
+        let enqueued_ms = u64::from_le_bytes(token[8..16].try_into().ok()?);
+        let expires_ms = u64::from_le_bytes(token[16..24].try_into().ok()?);
+        if expires_ms < enqueued_ms || expires_ms > enqueued_ms.saturating_add(OUTBOUND_MAX_AGE_MS)
+        {
+            return None;
+        }
+        let path = u64::from_le_bytes(token[24..32].try_into().ok()?);
+        if (token[4] == 1) != (path != 0) {
+            return None;
+        }
+        let generation = u64::from_le_bytes(token[32..40].try_into().ok()?);
+        let state = match token[5] {
+            0 if generation == 0 => OutboundState::Independent,
+            1 if generation != 0 => OutboundState::Reverse(generation),
+            2 if generation != 0 => OutboundState::Link(generation),
+            3 if generation != 0 => OutboundState::Discovery(generation),
+            _ => return None,
+        };
+        Some(Self {
+            enqueued_ms,
+            expires_ms,
+            path,
+            state,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,6 +277,31 @@ impl From<KnownDestinationError> for TransportError {
     }
 }
 
+/// Private host facts; no IFAC keys, driver pointers or packet storage. IDs are
+/// mapped to at most8 stable requester slots, independent of their u8 value.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterfaceFacts {
+    pub generation: u32,
+    pub bitrate_bps: u32,
+    pub id: u8,
+    pub mode: InterfaceMode,
+    // occupied1, outbound2, explicit host registration4, local client8.
+    pub flags: u8,
+}
+impl InterfaceFacts {
+    pub const EMPTY: Self = Self {
+        generation: 0,
+        bitrate_bps: 0,
+        id: 0,
+        mode: InterfaceMode::Full,
+        flags: 0,
+    };
+    fn outbound(self) -> bool {
+        self.flags & 2 != 0 && self.generation != 0
+    }
+}
+
 /// PLACEMENT CONTRACT: fields are `#[doc(hidden)] pub` so the FFI crate's in-place
 /// constructor can initialize a caller-provided buffer via raw field projections —
 /// this crate forbids unsafe, and every safe construction path takes `Self` BY VALUE
@@ -235,7 +347,15 @@ pub struct LiteNode<
     #[doc(hidden)]
     pub request_tags: RequestTagTable<TAGS>,
     #[doc(hidden)]
-    pub outbound: Queue<OutboundFrame, OUTBOUND>,
+    pub outbound: Queue<QueuedOutbound, OUTBOUND>,
+    #[doc(hidden)]
+    pub last_delivery_identity: u64,
+    #[doc(hidden)]
+    pub retained_owner_mode: bool,
+    #[doc(hidden)]
+    pub discoveries: Discoveries<LINKS>,
+    #[doc(hidden)]
+    pub interface_facts: [InterfaceFacts; REQUESTERS],
     #[doc(hidden)]
     pub stats: TransportStats,
 }
@@ -309,6 +429,10 @@ impl<
             links: LinkTable::new(),
             request_tags: RequestTagTable::new(),
             outbound: Queue::new(),
+            last_delivery_identity: 0,
+            retained_owner_mode: false,
+            discoveries: Discoveries::new(),
+            interface_facts: [InterfaceFacts::EMPTY; REQUESTERS],
             stats: TransportStats {
                 accepted: 0,
                 duplicates: 0,
@@ -465,33 +589,70 @@ impl<
         lifetime: OutboundLifetime,
         now_ms: u64,
     ) -> bool {
-        if now_ms >= lifetime.expires_ms || !self.outbound_interface_online(interface_id) {
+        if now_ms < lifetime.enqueued_ms
+            || now_ms >= lifetime.expires_ms
+            || !self.outbound_interface_online(interface_id)
+        {
             return false;
         }
-        if lifetime.path.is_some_and(|(destination, packet_hash)| {
-            !self
+        if lifetime.path != 0
+            && !self
                 .paths
-                .get_live(&destination, now_ms)
-                .is_some_and(|path| {
-                    path.packet_hash == packet_hash
-                        && self.outbound_interface_online(path.interface_id)
-                })
-        }) {
+                .get_generation(lifetime.path, now_ms)
+                .is_some_and(|path| self.outbound_interface_online(path.interface_id))
+        {
             return false;
         }
         match lifetime.state {
             OutboundState::Independent => true,
-            OutboundState::Reverse(hash) => self.reverse.get(&hash, now_ms).is_some_and(|entry| {
-                entry.outbound_interface == interface_id
-                    && self.outbound_interface_online(entry.receiving_interface)
-            }),
-            OutboundState::Link(id) => self.links.get(&id, now_ms).is_some_and(|entry| {
-                (entry.outbound_interface == interface_id
-                    || entry.receiving_interface == interface_id)
-                    && self.outbound_interface_online(entry.outbound_interface)
-                    && self.outbound_interface_online(entry.receiving_interface)
-            }),
+            OutboundState::Discovery(identity) => {
+                self.config.transport_enabled && self.discoveries.live(identity, now_ms)
+            }
+            OutboundState::Reverse(generation) => self
+                .reverse
+                .get_generation(generation, now_ms)
+                .is_some_and(|entry| {
+                    entry.outbound_interface == interface_id
+                        && self.outbound_interface_online(entry.receiving_interface)
+                }),
+            OutboundState::Link(generation) => self
+                .links
+                .get_generation(generation, now_ms)
+                .is_some_and(|entry| {
+                    (entry.outbound_interface == interface_id
+                        || entry.receiving_interface == interface_id)
+                        && self.outbound_interface_online(entry.outbound_interface)
+                        && self.outbound_interface_online(entry.receiving_interface)
+                }),
         }
+    }
+
+    /// Snapshot a locally constructed packet before a host driver retains it.
+    /// The selected table incarnation identifies a learned route; endpoint Link
+    /// membership is owned by the host's local Link registry, not the relay table.
+    /// No reverse-route entry is fabricated for local outgoing application data.
+    pub fn local_outbound_lifetime(
+        &self,
+        packet: &[u8],
+        now_ms: u64,
+    ) -> Result<OutboundLifetime, TransportError> {
+        let header = PacketView::parse(packet)?.header;
+        let mut lifetime = OutboundLifetime {
+            enqueued_ms: now_ms,
+            expires_ms: now_ms.saturating_add(OUTBOUND_MAX_AGE_MS),
+            path: 0,
+            state: OutboundState::Independent,
+        };
+        if header.flags.destination_type == DestinationType::Single {
+            if let Some(path) = self.paths.get_live(&header.destination_hash, now_ms) {
+                lifetime.path = self
+                    .paths
+                    .generation(&path.destination_hash, now_ms)
+                    .unwrap_or(0);
+                lifetime.expires_ms = lifetime.expires_ms.min(path.expires_ms);
+            }
+        }
+        Ok(lifetime)
     }
 
     pub fn record_expired_outbound(&mut self) {
@@ -502,7 +663,7 @@ impl<
     pub fn outbound_oldest_age_ms(&self, now_ms: u64) -> u64 {
         self.outbound
             .iter()
-            .map(|frame| now_ms.saturating_sub(frame.lifetime.enqueued_ms))
+            .map(|queued| now_ms.saturating_sub(queued.frame.lifetime.enqueued_ms))
             .max()
             .unwrap_or(0)
     }
@@ -510,7 +671,11 @@ impl<
     fn expire_outbound(&mut self, now_ms: u64) {
         loop {
             let stale = self.outbound.iter().position(|frame| {
-                !self.outbound_lifetime_is_live(frame.interface_id, frame.lifetime, now_ms)
+                !self.outbound_lifetime_is_live(
+                    frame.frame.interface_id,
+                    frame.frame.lifetime,
+                    now_ms,
+                )
             });
             let Some(offset) = stale else { break };
             self.outbound.remove(offset);
@@ -523,20 +688,9 @@ impl<
         let mut lifetime = OutboundLifetime {
             enqueued_ms: now_ms,
             expires_ms: now_ms.saturating_add(OUTBOUND_MAX_AGE_MS),
-            path: None,
+            path: 0,
             state: OutboundState::Independent,
         };
-        if matches!(
-            reason,
-            OutboundReason::PathRequest
-                | OutboundReason::PathRequestForward
-                | OutboundReason::PathResponse
-        ) {
-            lifetime.expires_ms = lifetime.expires_ms.min(
-                now_ms
-                    .saturating_add(u64::from(crate::constants::PATH_REQUEST_TIMEOUT_SECS) * 1000),
-            );
-        }
         let Ok(view) = PacketView::parse(packet.as_slice()) else {
             return lifetime;
         };
@@ -549,21 +703,24 @@ impl<
             .get_live(&header.destination_hash, now_ms)
             .filter(|_| path_dependent)
         {
-            lifetime.path = Some((path.destination_hash, path.packet_hash));
+            lifetime.path = self
+                .paths
+                .generation(&path.destination_hash, now_ms)
+                .unwrap_or(0);
             lifetime.expires_ms = lifetime.expires_ms.min(path.expires_ms);
             if header.flags.packet_type == PacketType::LinkRequest {
-                lifetime.state = OutboundState::Link(link_id_from_raw(
-                    packet.as_slice(),
-                    header.flags.header_type,
-                ));
-                lifetime.expires_ms = lifetime.expires_ms.min(now_ms.saturating_add(
-                    u64::from(LINK_PROOF_TIMEOUT_PER_HOP_SECS) * 1000 * u64::from(path.hops.max(1)),
+                // handle_link_request supplies the checked generation reserved
+                // for the insertion after successful queue admission.
+                lifetime.state = OutboundState::Link(0);
+                lifetime.expires_ms = lifetime.expires_ms.min(link_deadline(
+                    now_ms,
+                    path.hops,
+                    u64::from(self.interface_bitrate(path.interface_id)),
                 ));
             } else if header.flags.packet_type == PacketType::Data {
-                lifetime.state = OutboundState::Reverse(truncated_packet_hash(
-                    packet.as_slice(),
-                    header.flags.header_type,
-                ));
+                // handle_transport_forward supplies the checked generation
+                // for the insertion after successful queue admission.
+                lifetime.state = OutboundState::Reverse(0);
                 lifetime.expires_ms = lifetime
                     .expires_ms
                     .min(now_ms.saturating_add(u64::from(REVERSE_TIMEOUT_SECS) * 1000));
@@ -572,7 +729,11 @@ impl<
         if header.flags.destination_type == DestinationType::Link
             || header.context == PacketContext::Lrproof
         {
-            lifetime.state = OutboundState::Link(header.destination_hash);
+            lifetime.state = OutboundState::Link(
+                self.links
+                    .generation(&header.destination_hash, now_ms)
+                    .unwrap_or(0),
+            );
             if let Some(link) = self.links.get(&header.destination_hash, now_ms) {
                 // Successful admission promotes a verified establishment proof or
                 // refreshes an already validated link's idle timeout. Snapshot that
@@ -589,19 +750,254 @@ impl<
         lifetime
     }
 
+    fn interface_slot(&self, id: u8) -> Option<usize> {
+        self.interface_facts
+            .iter()
+            .position(|f| f.flags & 1 != 0 && f.id == id)
+    }
+
+    /// Private owner metadata. Call before ingest/tick; generation changes or
+    /// loss of outbound availability retire requester bits before slot reuse.
+    /// Rates are sampled only when a new operation begins, never on retry/join.
+    #[doc(hidden)]
+    pub fn update_interface(
+        &mut self,
+        id: u8,
+        generation: u32,
+        mode: InterfaceMode,
+        bitrate_bps: u32,
+        outbound: bool,
+        local_client: bool,
+    ) -> bool {
+        let slot = self
+            .interface_slot(id)
+            .or_else(|| self.interface_facts.iter().position(|f| f.flags & 1 == 0));
+        let Some(slot) = slot else {
+            return false;
+        };
+        let previous = self.interface_facts[slot];
+        if previous.flags & 1 != 0 && (previous.generation != generation || !outbound) {
+            self.retained_outbound_retire_interface(id);
+        }
+        self.interface_facts[slot] = InterfaceFacts {
+            id,
+            generation,
+            mode,
+            bitrate_bps,
+            flags: 1
+                | 4
+                | if outbound && generation != 0 { 2 } else { 0 }
+                | if local_client { 8 } else { 0 },
+        };
+        true
+    }
+
+    fn observe_interface(&mut self, meta: RxMeta) {
+        if let Some(slot) = self.interface_slot(meta.interface_id) {
+            if self.interface_facts[slot].flags & 4 == 0 {
+                self.interface_facts[slot].mode = meta.interface_mode.unwrap_or(self.config.mode);
+            }
+        } else if let Some(slot) = self.interface_facts.iter().position(|f| f.flags & 1 == 0) {
+            self.interface_facts[slot] = InterfaceFacts {
+                id: meta.interface_id,
+                generation: 1,
+                mode: meta.interface_mode.unwrap_or(self.config.mode),
+                bitrate_bps: 0,
+                flags: 1 | 2,
+            };
+        }
+    }
+
+    fn interface_bitrate(&self, id: u8) -> u32 {
+        self.interface_slot(id)
+            .map(|s| self.interface_facts[s])
+            .filter(|f| f.outbound())
+            .map_or(0, |f| f.bitrate_bps)
+    }
+    fn slowest_outbound_bitrate(&self, requester: u8) -> u64 {
+        self.interface_facts
+            .iter()
+            .filter(|f| f.id != requester && f.outbound() && f.bitrate_bps > 0)
+            .map(|f| u64::from(f.bitrate_bps))
+            .min()
+            .unwrap_or(0)
+    }
+    fn finish_discovery(
+        &mut self,
+        raw: &[u8],
+        header: PacketHeader,
+        meta: RxMeta,
+        now_ms: u64,
+    ) -> Result<(), TransportError> {
+        if !self.config.transport_enabled {
+            return Ok(());
+        }
+        let Some(owner) = self.discoveries.take(&header.destination_hash, now_ms) else {
+            return Ok(());
+        };
+        let Ok(response) =
+            self.path_response_from_cached_announce(raw, header.destination_hash, header.hops)
+        else {
+            self.stats.outbound_dropped = self
+                .stats
+                .outbound_dropped
+                .saturating_add(u64::from(owner.requesters.count_ones()));
+            return Ok(());
+        };
+        for slot in 0..REQUESTERS {
+            let target = self.interface_facts[slot];
+            if owner.requesters & (1 << slot) != 0
+                && target.outbound()
+                && (target.id != meta.interface_id
+                    || (target.flags & 8 == 0 && target.mode != InterfaceMode::Roaming))
+            {
+                // One bounded admission attempt. Existing enqueue accounts loss;
+                // no packet or retry queue is introduced by the requester ledger.
+                self.enqueue(target.id, response, OutboundReason::PathResponse);
+            }
+        }
+        Ok(())
+    }
+
     fn outbound_interface_online(&self, _interface_id: InterfaceId) -> bool {
         true
     }
 
     pub fn poll_tx(&mut self) -> Option<OutboundFrame> {
+        // A legacy consumer cannot reinterpret partially admitted target bits.
+        if self.retained_owner_mode {
+            return None;
+        }
         self.expire_outbound(self.clock_ms);
-        self.outbound.pop()
+        self.outbound.pop().map(|queued| queued.frame)
     }
 
     /// Byte length of the next queued outbound packet without consuming it, so a consumer can size
     /// its buffer before [`Self::poll_tx`] (avoids destructively popping a frame that won't fit).
     pub fn outbound_peek_len(&self) -> Option<usize> {
-        self.outbound.peek().map(|f| f.packet.len())
+        if self.retained_owner_mode {
+            return None;
+        }
+        self.outbound.peek().map(|f| f.frame.packet.len())
+    }
+
+    /// Private handheld owner API. Copies leave this borrow before driver callbacks.
+    /// Seven target bits map to the existing handheld interface registry only.
+    #[doc(hidden)]
+    pub fn retained_outbound_select(
+        &mut self,
+        after: u64,
+        blocked: u8,
+        generations: [u32; 7],
+    ) -> Option<&QueuedOutbound> {
+        self.retained_owner_mode = true;
+        self.expire_outbound(self.clock_ms);
+        for queued in self.outbound.iter_mut() {
+            let delivery = &mut queued.delivery;
+            if !delivery.initialized {
+                let selected = match queued.frame.reason {
+                    OutboundReason::PathResponse
+                    | OutboundReason::TransportForward
+                    | OutboundReason::ProofReturn => {
+                        if queued.frame.interface_id < 7 {
+                            1u8 << queued.frame.interface_id
+                        } else {
+                            0
+                        }
+                    }
+                    OutboundReason::AnnounceRebroadcast | OutboundReason::PathRequestForward => {
+                        if queued.frame.interface_id < 7 {
+                            0x7f & !(1u8 << queued.frame.interface_id)
+                        } else {
+                            0x7f
+                        }
+                    }
+                    OutboundReason::PathRequest => 0x7f,
+                };
+                delivery.pending_targets &= selected;
+                delivery.interface_generations = generations;
+                delivery.initialized = true;
+            }
+            for (id, generation) in generations.iter().enumerate() {
+                if *generation == 0 || *generation != delivery.interface_generations[id] {
+                    delivery.pending_targets &= !(1u8 << id);
+                }
+            }
+        }
+        loop {
+            let offset = self
+                .outbound
+                .iter()
+                .position(|q| q.delivery.pending_targets == 0);
+            let Some(offset) = offset else {
+                break;
+            };
+            self.outbound.remove(offset);
+            // Fully acknowledged rows are removed by ack. Reaching this path
+            // means the remaining delivery permission was retired or no live
+            // target existed; expose that terminal loss through the existing
+            // saturating queue-drop counter.
+            self.stats.outbound_dropped = self.stats.outbound_dropped.saturating_add(1);
+        }
+        self.outbound
+            .iter()
+            .find(|q| q.delivery.identity > after && q.delivery.pending_targets & !blocked != 0)
+    }
+
+    #[doc(hidden)]
+    pub fn retained_outbound_ack(&mut self, identity: u64, completed: u8) -> bool {
+        if !self.retained_owner_mode || identity == 0 {
+            return false;
+        }
+        let offset = self
+            .outbound
+            .iter()
+            .position(|q| q.delivery.identity == identity);
+        let Some(offset) = offset else {
+            return false;
+        };
+        let queued = self
+            .outbound
+            .get_mut(offset)
+            .expect("located occupied queue slot");
+        if !queued.delivery.initialized {
+            return false;
+        }
+        queued.delivery.pending_targets &= !completed;
+        if queued.delivery.pending_targets == 0 {
+            self.outbound.remove(offset);
+        }
+        true
+    }
+
+    #[doc(hidden)]
+    pub fn retained_outbound_take(&mut self, identity: u64) -> bool {
+        if !self.retained_owner_mode || identity == 0 {
+            return false;
+        }
+        let offset = self
+            .outbound
+            .iter()
+            .position(|q| q.delivery.identity == identity);
+        offset
+            .and_then(|offset| self.outbound.remove(offset))
+            .is_some()
+    }
+
+    /// Also retire permission on rows that have never been peeked. Re-registering
+    /// this physical interface cannot bind its replacement to old queued bytes.
+    #[doc(hidden)]
+    pub fn retained_outbound_retire_interface(&mut self, interface: u8) {
+        if let Some(slot) = self.interface_slot(interface) {
+            self.discoveries.retire_requester(slot);
+            self.interface_facts[slot].flags &= !2;
+        }
+        if interface >= 7 {
+            return;
+        }
+        for queued in self.outbound.iter_mut() {
+            queued.delivery.pending_targets &= !(1u8 << interface);
+        }
     }
 
     pub const fn outbound_len(&self) -> usize {
@@ -610,6 +1006,10 @@ impl<
 
     pub fn tick(&mut self, now_ms: u64) {
         self.clock_ms = now_ms;
+        if !self.config.transport_enabled {
+            self.discoveries.clear();
+        }
+        self.discoveries.expire(now_ms);
         self.packet_hashes.expire(now_ms);
         self.paths.expire(now_ms);
         self.announce_cache.expire(now_ms);
@@ -650,7 +1050,30 @@ impl<
         meta: RxMeta,
         now_ms: u64,
     ) -> Result<IngestAction, TransportError> {
+        self.ingest_with_local_link(raw, meta, now_ms, None)
+    }
+
+    /// Ingest with an endpoint Link owned outside the relay's transit Link table.
+    ///
+    /// `local_link` must come from the caller's live endpoint registry, not from
+    /// untrusted packet bytes alone. Only a matching Link destination defers
+    /// global duplicate admission to that endpoint's interface/authentication and
+    /// message-dedup owner. All normal ingress checks and relay policy still run.
+    /// This mirrors rns-transport's registered-local-Link hashlist deferral without
+    /// adding endpoint entries to the bounded transit table.
+    pub fn ingest_with_local_link(
+        &mut self,
+        raw: &[u8],
+        meta: RxMeta,
+        now_ms: u64,
+        local_link: Option<&Hash16>,
+    ) -> Result<IngestAction, TransportError> {
         self.clock_ms = now_ms;
+        self.observe_interface(meta);
+        if !self.config.transport_enabled {
+            self.discoveries.clear();
+        }
+        self.discoveries.expire(now_ms);
         self.expire_outbound(now_ms);
         let mut ifac_plain = PacketBuffer::new();
         let raw = if let Some(ifac) = self.config.ifac {
@@ -717,7 +1140,9 @@ impl<
         let defer_hashlist = self
             .links
             .contains_live(&view.header.destination_hash, now_ms)
-            || view.header.context == PacketContext::Lrproof;
+            || view.header.context == PacketContext::Lrproof
+            || (view.header.flags.destination_type == DestinationType::Link
+                && local_link == Some(&view.header.destination_hash));
         if !view.header.context.skip_hashlist() && !defer_hashlist {
             let hash = packet_hash(raw, view.header.flags.header_type);
             let inserted = self.packet_hashes.insert(
@@ -754,7 +1179,7 @@ impl<
                 )? {
                     Ok(IngestAction::ForwardedTransport)
                 } else if header.destination_hash == path_request_destination() {
-                    self.handle_path_request(view.payload, meta.interface_id, now_ms)
+                    self.handle_path_request(view.payload, meta, now_ms)
                 } else {
                     self.handle_transport_forward(raw, view.header, header, meta, now_ms)
                 }
@@ -861,6 +1286,11 @@ impl<
                 now_ms,
             );
 
+            // Trusted recursive discovery completion is independent of ordinary
+            // announce rebroadcast. In particular PATH_RESPONSE must reach each
+            // retained requester, without becoming a general broadcast.
+            self.finish_discovery(raw, header, meta, now_ms)?;
+
             // Rebroadcast only when the announce actually updated the path (upstream rebroadcasts
             // only on should_add) — a duplicate/older announce that did not replace must not amplify.
             // Reframing for forwarding adds the HEADER_2 transport_id (16 B); a single-packet
@@ -903,9 +1333,11 @@ impl<
     fn handle_path_request(
         &mut self,
         payload: &[u8],
-        interface_id: InterfaceId,
+        meta: RxMeta,
         now_ms: u64,
     ) -> Result<IngestAction, TransportError> {
+        let interface_id = meta.interface_id;
+        let mode = meta.interface_mode.unwrap_or(self.config.mode);
         if payload.len() <= 16 {
             self.stats.dropped = self.stats.dropped.saturating_add(1);
             return Ok(IngestAction::Dropped);
@@ -959,9 +1391,7 @@ impl<
             }
             // Roaming self-loop suppression: don't answer for a path learned from the same
             // interface the request arrived on (upstream Transport.py:2941-2942).
-            if self.config.mode == crate::config::InterfaceMode::Roaming
-                && path.interface_id == interface_id
-            {
+            if mode == crate::config::InterfaceMode::Roaming && path.interface_id == interface_id {
                 return Ok(IngestAction::Dropped);
             }
             // Only answer cached path requests when acting as a transport node (upstream gates the
@@ -985,12 +1415,41 @@ impl<
             // trusted Rust recovery behavior without bypassing discovery policy.
         }
 
-        if self.config.transport_enabled && mode_discovers_unknown_paths(self.config.mode) {
-            let request = self.build_path_request(requested, tag)?;
-            if !self.enqueue(interface_id, request, OutboundReason::PathRequestForward) {
+        if self.config.transport_enabled && mode_discovers_unknown_paths(mode) {
+            let Some(slot) = self
+                .interface_slot(interface_id)
+                .filter(|&slot| self.interface_facts[slot].outbound())
+            else {
                 return Ok(IngestAction::Dropped);
+            };
+            let timeout = discovery_timeout(self.slowest_outbound_bitrate(interface_id));
+            match self.discoveries.begin(requested, slot, now_ms, timeout) {
+                BeginDiscovery::Joined => return Ok(IngestAction::Accepted),
+                BeginDiscovery::Refused => {
+                    self.stats.dropped = self.stats.dropped.saturating_add(1);
+                    return Ok(IngestAction::Dropped);
+                }
+                BeginDiscovery::New(identity) => {
+                    let request = self.build_path_request(requested, tag)?;
+                    let lifetime = OutboundLifetime {
+                        enqueued_ms: now_ms,
+                        expires_ms: now_ms
+                            .saturating_add(REQUEST_GATE_MS)
+                            .min(self.discoveries.deadline(identity).unwrap_or(now_ms)),
+                        path: 0,
+                        state: OutboundState::Discovery(identity),
+                    };
+                    if !self.enqueue_with_lifetime(
+                        interface_id,
+                        request,
+                        OutboundReason::PathRequestForward,
+                        lifetime,
+                    ) {
+                        return Ok(IngestAction::Dropped);
+                    }
+                    return Ok(IngestAction::ForwardedPathRequest);
+                }
             }
-            return Ok(IngestAction::ForwardedPathRequest);
         }
 
         Ok(IngestAction::Dropped)
@@ -1018,11 +1477,20 @@ impl<
         };
 
         let proof_hash = truncated_packet_hash(raw, original_header.flags.header_type);
-        // Send before recording: no reverse entry for a forward that never queued.
-        if !self.enqueue(
+        // Check the next non-reused incarnation before accepting a forward.
+        // enqueue_with_lifetime only wraps/pushes bytes and cannot mutate tables;
+        // insertion below therefore commits exactly this generation. Failed
+        // queue admission creates no reverse entry and consumes no generation.
+        let Some(generation) = self.reverse.next_generation() else {
+            return Ok(IngestAction::Dropped);
+        };
+        let mut lifetime = self.packet_lifetime(&forwarded, OutboundReason::TransportForward);
+        lifetime.state = OutboundState::Reverse(generation);
+        if !self.enqueue_with_lifetime(
             target_interface,
             forwarded,
             OutboundReason::TransportForward,
+            lifetime,
         ) {
             return Ok(IngestAction::Dropped);
         }
@@ -1057,6 +1525,13 @@ impl<
             return Ok(IngestAction::Dropped);
         }
 
+        let link_id = link_id_from_raw(raw, original_header.flags.header_type);
+        // Signalling suffixes change packet hashes, but not Link ID. A pending
+        // or validated owner cannot be replaced/renewed by another suffix.
+        if self.links.contains_live(&link_id, now_ms) {
+            return Ok(IngestAction::Dropped);
+        }
+
         let Some((target_interface, forwarded)) =
             self.rewrite_forwarded_transport_packet(raw, original_header, header, now_ms)?
         else {
@@ -1077,25 +1552,33 @@ impl<
                     remaining_hops: path.hops,
                     taken_hops: header.hops,
                     validated: false,
-                    expires_ms: now_ms.saturating_add(
-                        (LINK_PROOF_TIMEOUT_PER_HOP_SECS as u64)
-                            .saturating_mul(1000)
-                            .saturating_mul(path.hops.max(1) as u64),
+                    expires_ms: link_deadline(
+                        now_ms,
+                        path.hops,
+                        u64::from(self.interface_bitrate(target_interface)),
                     ),
                 }
             });
 
-        // Send before recording: no link-table entry for a request that never queued.
-        if !self.enqueue(
+        let Some(entry) = entry else {
+            return Ok(IngestAction::Dropped);
+        };
+        let Some(generation) = self.links.next_generation() else {
+            return Ok(IngestAction::Dropped);
+        };
+        // As for reverse entries, queue success precedes state insertion, and
+        // the checked generation is bound before any frame can leave the node.
+        let mut lifetime = self.packet_lifetime(&forwarded, OutboundReason::TransportForward);
+        lifetime.state = OutboundState::Link(generation);
+        if !self.enqueue_with_lifetime(
             target_interface,
             forwarded,
             OutboundReason::TransportForward,
+            lifetime,
         ) {
             return Ok(IngestAction::Dropped);
         }
-        if let Some(entry) = entry {
-            self.links.insert(entry, now_ms);
-        }
+        self.links.insert(entry, now_ms);
         Ok(IngestAction::ForwardedTransport)
     }
 
@@ -1458,11 +1941,24 @@ impl<
             return false;
         }
 
-        let evicted = self.outbound.push_drop_oldest(OutboundFrame {
-            interface_id,
-            packet: wire,
-            reason,
-            lifetime,
+        let Some(identity) = self.last_delivery_identity.checked_add(1) else {
+            self.stats.outbound_dropped = self.stats.outbound_dropped.saturating_add(1);
+            return false;
+        };
+        self.last_delivery_identity = identity;
+        let evicted = self.outbound.push_drop_oldest(QueuedOutbound {
+            frame: OutboundFrame {
+                interface_id,
+                packet: wire,
+                reason,
+                lifetime,
+            },
+            delivery: OutboundDelivery {
+                identity,
+                interface_generations: [0; 7],
+                pending_targets: 0x7f,
+                initialized: false,
+            },
         });
         if evicted {
             self.stats.outbound_dropped = self.stats.outbound_dropped.saturating_add(1);
@@ -1512,6 +2008,81 @@ mod tests {
     use crate::wire::{PacketView, build_packet};
     use ed25519_dalek::{Signer, SigningKey};
     use std::vec::Vec;
+
+    #[test]
+    fn recursive_capacity_and_identity_exhaustion_refuse_before_fanout() {
+        let mut n = node();
+        for index in 0..32u8 {
+            let request = path_request([index; 16], [index; 16]);
+            assert_eq!(
+                n.ingest(
+                    request.as_slice(),
+                    RxMeta::new(IFACE),
+                    1000 + u64::from(index)
+                )
+                .unwrap(),
+                IngestAction::ForwardedPathRequest
+            );
+            assert!(n.poll_tx().is_some());
+            while n.poll_tx().is_some() {}
+        }
+        let refused = path_request([99; 16], [99; 16]);
+        assert_eq!(
+            n.ingest(refused.as_slice(), RxMeta::new(IFACE), 1100)
+                .unwrap(),
+            IngestAction::Dropped
+        );
+        assert!(n.poll_tx().is_none());
+        assert!(n.stats.dropped > 0);
+        n.discoveries.last_identity = u64::MAX;
+        let exhausted = path_request([100; 16], [100; 16]);
+        assert_eq!(
+            n.ingest(exhausted.as_slice(), RxMeta::new(IFACE), 17000)
+                .unwrap(),
+            IngestAction::Dropped
+        );
+        assert!(n.poll_tx().is_none());
+        assert_eq!(n.discoveries.last_identity, u64::MAX);
+        assert!(n.discoveries.entries.iter().all(|row| row.identity == 0));
+    }
+
+    #[test]
+    fn recursive_micro_budget_capacity_and_disabled_retirement() {
+        let mut n = MicroNode::new(LiteConfig::ESP32_LORA_TRANSPORT_MICRO, TRANSPORT_ID).unwrap();
+        assert!(core::mem::size_of_val(&n) <= 32768);
+        for index in 0..4u8 {
+            let request = path_request([index; 16], [index; 16]);
+            assert_eq!(
+                n.ingest(request.as_slice(), RxMeta::new(IFACE), 1000)
+                    .unwrap(),
+                IngestAction::ForwardedPathRequest
+            );
+            assert!(n.poll_tx().is_some());
+        }
+        let request = path_request([99; 16], [99; 16]);
+        assert_eq!(
+            n.ingest(request.as_slice(), RxMeta::new(IFACE), 1001)
+                .unwrap(),
+            IngestAction::Dropped
+        );
+        assert!(n.poll_tx().is_none());
+        n.config.transport_enabled = false;
+        n.tick(1002);
+        assert!(
+            n.discoveries
+                .entries
+                .iter()
+                .all(|entry| entry.identity == 0)
+        );
+        n.config.transport_enabled = true;
+        let request = path_request([100; 16], [100; 16]);
+        assert_eq!(
+            n.ingest(request.as_slice(), RxMeta::new(IFACE), 1003)
+                .unwrap(),
+            IngestAction::ForwardedPathRequest
+        );
+        assert_eq!(n.discoveries.last_identity, 5);
+    }
 
     const TRANSPORT_ID: [u8; 16] = [0x42; 16];
     const IFACE: InterfaceId = 1;
@@ -1923,6 +2494,69 @@ mod tests {
         SmallNode::new(LiteConfig::ESP32_LORA_TRANSPORT_SMALL, TRANSPORT_ID).unwrap()
     }
 
+    #[test]
+    fn endpoint_link_defers_hash_until_its_owner_accepts() {
+        let id = [0x78; 16];
+        let packet = link_packet(id, 0, PacketContext::None);
+        let mut n = node();
+        for iface in [1, 2, 2] {
+            assert_eq!(
+                n.ingest_with_local_link(packet.as_slice(), RxMeta::new(iface), 1000, Some(&id))
+                    .unwrap(),
+                IngestAction::Dropped // no relay route; endpoint owns local admission
+            );
+        }
+        // Ending endpoint ownership immediately restores ordinary dedup policy.
+        assert_eq!(
+            n.ingest(packet.as_slice(), RxMeta::new(2), 1000).unwrap(),
+            IngestAction::Dropped
+        );
+        assert_eq!(
+            n.ingest(packet.as_slice(), RxMeta::new(2), 1000).unwrap(),
+            IngestAction::Duplicate
+        );
+    }
+
+    #[test]
+    fn endpoint_link_hint_cannot_exempt_another_destination_or_kind() {
+        let id = [0x79; 16];
+        for flags in [0x00, 0x04, 0x08, 0x0c] {
+            let mut packet = link_packet(id, 0, PacketContext::None);
+            packet.as_mut_slice()[0] = flags;
+            let mut n = node();
+            let other = [0x80; 16];
+            let registered = if flags == 0x0c { &other } else { &id };
+            for expected in [IngestAction::Dropped, IngestAction::Duplicate] {
+                assert_eq!(
+                    n.ingest_with_local_link(
+                        packet.as_slice(),
+                        RxMeta::new(IFACE),
+                        1000,
+                        Some(registered)
+                    )
+                    .unwrap(),
+                    expected
+                );
+            }
+        }
+        let mut packet = link_packet(id, PATHFINDER_M, PacketContext::None);
+        let mut n = node();
+        for _ in 0..2 {
+            assert_eq!(
+                n.ingest_with_local_link(packet.as_slice(), RxMeta::new(IFACE), 1000, Some(&id))
+                    .unwrap(),
+                IngestAction::Dropped
+            );
+        }
+        packet.as_mut_slice()[1] = 0;
+        // Rejected raw hops never poison an otherwise admissible ordinary frame.
+        assert_eq!(
+            n.ingest(packet.as_slice(), RxMeta::new(IFACE), 1000)
+                .unwrap(),
+            IngestAction::Dropped
+        );
+    }
+
     fn ifac_config() -> (LiteConfig, [u8; 64]) {
         let key = [0x73; 64];
         let mut config = LiteConfig::ESP32_LORA_TRANSPORT_SMALL;
@@ -1943,6 +2577,37 @@ mod tests {
         );
         assert_eq!(node.stats().validation_failures, 1);
         assert!(!node.has_path(&announce.destination_hash, 1000));
+    }
+
+    #[test]
+    fn endpoint_link_hint_preserves_ifac_validation() {
+        let id = [0x81; 16];
+        let packet = link_packet(id, 0, PacketContext::None);
+        let (config, key) = ifac_config();
+        let mut n = SmallNode::new(config, TRANSPORT_ID).unwrap();
+        let mut wrapped = PacketBuffer::new();
+        ifac_sign_into(packet.as_slice(), &key, 8, &mut wrapped).unwrap();
+        assert_eq!(
+            n.ingest_with_local_link(packet.as_slice(), RxMeta::new(IFACE), 1000, Some(&id))
+                .unwrap(),
+            IngestAction::Dropped
+        );
+        assert_eq!(n.stats().validation_failures, 1);
+        for iface in [1, 2] {
+            assert_eq!(
+                n.ingest_with_local_link(wrapped.as_slice(), RxMeta::new(iface), 1000, Some(&id))
+                    .unwrap(),
+                IngestAction::Dropped
+            );
+            assert_eq!(n.stats().validation_failures, 1);
+        }
+        wrapped.as_mut_slice()[3] ^= 1;
+        assert_eq!(
+            n.ingest_with_local_link(wrapped.as_slice(), RxMeta::new(IFACE), 1000, Some(&id))
+                .unwrap(),
+            IngestAction::Dropped
+        );
+        assert_eq!(n.stats().validation_failures, 2);
     }
 
     #[test]
@@ -2810,8 +3475,16 @@ mod tests {
         // Cardputer budget (no PSRAM, ~55 KB free heap): the MICRO node must stay <= 32 KB so
         // cap drift can't silently blow the internal-heap allocation.
         let micro = core::mem::size_of::<MicroNode>();
-        assert_eq!(micro, 31_952, "MicroNode layout changed unexpectedly");
+        assert_eq!(micro, 32_664, "MicroNode layout changed unexpectedly");
         assert!(micro <= 32 * 1024, "MicroNode grew to {micro} B (> 32 KB)");
+        std::println!(
+            "MicroNode={micro} SmallNode={} Esp32PsramNode={} OutboundFrame={} OutboundLifetime={} token={}",
+            core::mem::size_of::<SmallNode>(),
+            core::mem::size_of::<Esp32PsramNode>(),
+            core::mem::size_of::<OutboundFrame>(),
+            core::mem::size_of::<OutboundLifetime>(),
+            OutboundLifetime::TOKEN_BYTES
+        );
         // Profile caps must construct within their node type's const-generic capacities.
         assert!(MicroNode::new(LiteConfig::ESP32_LORA_TRANSPORT_MICRO, TRANSPORT_ID).is_ok());
         assert!(SmallNode::new(LiteConfig::ESP32_LORA_TRANSPORT_SMALL, TRANSPORT_ID).is_ok());
@@ -2908,17 +3581,17 @@ mod tests {
         assert_eq!(node.stats.outbound_dropped, 0);
     }
     #[test]
-    fn queued_and_held_requests_expire_at_discovery_deadline() {
+    fn queued_and_held_requests_have_immutable_wait_deadline() {
         let mut node = node();
         node.request_path(&[0x21; 16], &[0x31; 16], IFACE, 1000)
             .unwrap();
         let held = node.poll_tx().unwrap();
-        assert!(node.outbound_lifetime_is_live(IFACE, held.lifetime, 15_999));
-        assert!(!node.outbound_lifetime_is_live(IFACE, held.lifetime, 16_000));
+        assert!(node.outbound_lifetime_is_live(IFACE, held.lifetime, 120_999));
+        assert!(!node.outbound_lifetime_is_live(IFACE, held.lifetime, 121_000));
         node.request_path(&[0x22; 16], &[0x32; 16], IFACE, 1000)
             .unwrap();
         assert_eq!(node.outbound_oldest_age_ms(2000), 1000);
-        node.tick(16_000);
+        node.tick(121_000);
         assert_eq!(node.outbound_len(), 0);
         assert_eq!(node.stats().outbound_expired, 1);
     }
@@ -2951,7 +3624,7 @@ mod tests {
     }
 
     #[test]
-    fn held_data_expires_when_return_state_is_evicted_or_route_changes() {
+    fn incarnation_held_data_does_not_revive_after_reverse_reinsert() {
         let mut node = node();
         let announce = signed_announce([0x75; 32], "lxmf.delivery", b"route");
         node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
@@ -2964,11 +3637,56 @@ mod tests {
         let reverse = node.reverse.remove(&hash, 1200).unwrap();
         assert!(!node.outbound_lifetime_is_live(IFACE, held.lifetime, 1200));
         node.reverse.insert(reverse, 1200);
-        assert!(node.outbound_lifetime_is_live(IFACE, held.lifetime, 1200));
+        assert!(!node.outbound_lifetime_is_live(IFACE, held.lifetime, 1200));
         let newer = signed_announce_rh([0x75; 32], "lxmf.delivery", b"route", [0xBD; 10]);
         node.ingest(newer.raw.as_slice(), RxMeta::new(2), 1300)
             .unwrap();
         assert!(!node.outbound_lifetime_is_live(IFACE, held.lifetime, 1300));
+    }
+
+    #[test]
+    fn incarnation_path_relearn_from_identical_announce_does_not_revive() {
+        for replacement_interface in [IFACE, 2] {
+            let mut node = node();
+            let announce = signed_announce([0x79; 32], "lxmf.delivery", b"same announce");
+            node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
+                .unwrap();
+            let data = h2_data(announce.destination_hash, b"local pending");
+            let held = node.local_outbound_lifetime(data.as_slice(), 1100).unwrap();
+            assert!(node.outbound_lifetime_is_live(IFACE, held, 1100));
+            assert!(node.drop_path(&announce.destination_hash));
+            assert!(!node.outbound_lifetime_is_live(IFACE, held, 1100));
+            node.ingest(
+                announce.raw.as_slice(),
+                RxMeta::new(replacement_interface),
+                1200,
+            )
+            .unwrap();
+            assert_eq!(
+                node.path(&announce.destination_hash, 1200)
+                    .unwrap()
+                    .interface_id,
+                replacement_interface
+            );
+            assert!(!node.outbound_lifetime_is_live(IFACE, held, 1200));
+        }
+    }
+
+    #[test]
+    fn incarnation_link_same_key_replacement_does_not_revive() {
+        let mut node = node();
+        let announce = signed_announce([0x7A; 32], "lxmf.delivery", b"same link");
+        node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
+            .unwrap();
+        let request = link_request(announce.destination_hash, 0);
+        node.ingest(request.as_slice(), RxMeta::new(9), 1100)
+            .unwrap();
+        let held = node.poll_tx().unwrap();
+        assert!(node.outbound_lifetime_is_live(IFACE, held.lifetime, 1200));
+        let id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
+        let same_entry = *node.links.get(&id, 1200).unwrap();
+        node.links.insert(same_entry, 1200);
+        assert!(!node.outbound_lifetime_is_live(IFACE, held.lifetime, 1200));
     }
 
     #[test]
@@ -3103,5 +3821,325 @@ mod tests {
             assert!(node.outbound_lifetime_is_live(IFACE, held.lifetime, estimated_burst_end_ms));
             assert!(!node.outbound_lifetime_is_live(IFACE, held.lifetime, 121_999));
         }
+    }
+
+    #[test]
+    fn incarnation_forward_generation_exhaustion_drops_before_enqueue() {
+        for is_link in [false, true] {
+            let mut node = node();
+            let announce = signed_announce([0x7C; 32], "lxmf.delivery", b"exhausted");
+            node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
+                .unwrap();
+            node.tick(1500);
+            while node.poll_tx().is_some() {}
+            let packet = if is_link {
+                node.links.last_generation = u64::MAX;
+                link_request(announce.destination_hash, 0)
+            } else {
+                node.reverse.last_generation = u64::MAX;
+                h2_data(announce.destination_hash, b"cannot retain")
+            };
+            let queued = node.stats.queued_outbound;
+            assert_eq!(
+                node.ingest(packet.as_slice(), RxMeta::new(9), 1600)
+                    .unwrap(),
+                IngestAction::Dropped
+            );
+            assert_eq!(node.stats.queued_outbound, queued);
+            assert_eq!(node.outbound_len(), 0);
+            assert!(node.reverse.entries.iter().all(Option::is_none));
+            assert!(node.links.entries.iter().all(Option::is_none));
+        }
+    }
+
+    #[test]
+    fn retained_identity_exhaustion_rejects_forward_before_return_state() {
+        for is_link in [false, true] {
+            let mut node = node();
+            let announce = signed_announce([0x7C; 32], "lxmf.delivery", b"exhausted");
+            node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
+                .unwrap();
+            node.tick(1500);
+            while node.poll_tx().is_some() {}
+            node.last_delivery_identity = u64::MAX;
+            let packet = if is_link {
+                link_request(announce.destination_hash, 0)
+            } else {
+                h2_data(announce.destination_hash, b"cannot retain")
+            };
+            let queued = node.stats.queued_outbound;
+            assert_eq!(
+                node.ingest(packet.as_slice(), RxMeta::new(9), 1600)
+                    .unwrap(),
+                IngestAction::Dropped
+            );
+            assert_eq!(node.stats.queued_outbound, queued);
+            assert_eq!(node.outbound_len(), 0);
+            assert!(node.reverse.entries.iter().all(Option::is_none));
+            assert!(node.links.entries.iter().all(Option::is_none));
+        }
+    }
+
+    #[test]
+    fn incarnation_token_v2_is_fixed_and_rejects_noncanonical_bytes() {
+        assert_eq!(OutboundLifetime::TOKEN_BYTES, 88);
+        for path in [0, 1, u64::MAX] {
+            for state in [
+                OutboundState::Independent,
+                OutboundState::Reverse(1),
+                OutboundState::Link(u64::MAX),
+                OutboundState::Discovery(u64::MAX),
+            ] {
+                let lifetime = OutboundLifetime {
+                    enqueued_ms: 10,
+                    expires_ms: 20,
+                    path,
+                    state,
+                };
+                let token = lifetime.to_token();
+                assert_eq!(OutboundLifetime::from_token(&token), Some(lifetime));
+                for idx in (6..8).chain(40..88) {
+                    let mut invalid = token;
+                    invalid[idx] = 1;
+                    assert!(
+                        OutboundLifetime::from_token(&invalid).is_none(),
+                        "reserved byte {idx}"
+                    );
+                }
+            }
+        }
+        let good = OutboundLifetime {
+            enqueued_ms: 10,
+            expires_ms: 20,
+            path: 1,
+            state: OutboundState::Reverse(1),
+        }
+        .to_token();
+        for (idx, value) in [(3, 1), (4, 2), (4, 0), (5, 4), (5, 0)] {
+            let mut invalid = good;
+            invalid[idx] = value;
+            assert!(OutboundLifetime::from_token(&invalid).is_none());
+        }
+        for field in [24..32, 32..40] {
+            let mut invalid = good;
+            invalid[field].fill(0);
+            assert!(OutboundLifetime::from_token(&invalid).is_none());
+        }
+        for expiry in [9u64, 120_011] {
+            let mut invalid = good;
+            invalid[16..24].copy_from_slice(&expiry.to_le_bytes());
+            assert!(OutboundLifetime::from_token(&invalid).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod retained_queue_tests {
+    use super::*;
+    type Node = LiteNode<4, 8, 2, 2, 2, 2, 4>;
+    fn node() -> Node {
+        Node::new_const(LiteConfig::ESP32_LORA_TRANSPORT_SMALL, [0; 16])
+    }
+    fn enqueue(node: &mut Node, marker: u8, reason: OutboundReason, interface: u8) -> u64 {
+        assert!(node.enqueue(
+            interface,
+            PacketBuffer::from_slice(&[marker]).unwrap(),
+            reason
+        ));
+        node.last_delivery_identity
+    }
+    const GENERATIONS: [u32; 7] = [11, 12, 13, 14, 15, 16, 17];
+
+    #[test]
+    fn every_reason_keeps_existing_fanout_selection() {
+        for (reason, interface, mask) in [
+            (OutboundReason::PathRequest, 2, 0x7f),
+            (OutboundReason::PathRequestForward, 2, 0x7b),
+            (OutboundReason::AnnounceRebroadcast, 2, 0x7b),
+            (OutboundReason::PathResponse, 2, 0x04),
+            (OutboundReason::TransportForward, 2, 0x04),
+            (OutboundReason::ProofReturn, 2, 0x04),
+            (OutboundReason::ProofReturn, 255, 0),
+        ] {
+            let mut n = node();
+            enqueue(&mut n, 42, reason, interface);
+            let selected = n.retained_outbound_select(0, 0, GENERATIONS);
+            assert_eq!(selected.map_or(0, |q| q.delivery.pending_targets), mask);
+        }
+    }
+
+    #[test]
+    fn healthy_target_advances_without_losing_refused_copy_or_renewing_birth() {
+        let mut n = node();
+        n.clock_ms = 100;
+        let first = enqueue(&mut n, 1, OutboundReason::PathRequest, 0);
+        n.clock_ms = 101;
+        let second = enqueue(&mut n, 2, OutboundReason::PathRequest, 0);
+        let a = *n
+            .retained_outbound_select(0, 0, [11, 12, 0, 0, 0, 0, 0])
+            .unwrap();
+        assert_eq!(a.delivery.identity, first);
+        assert!(n.retained_outbound_ack(first, 2));
+        let b = *n
+            .retained_outbound_select(0, 1, [11, 12, 0, 0, 0, 0, 0])
+            .unwrap();
+        assert_eq!(b.delivery.identity, second);
+        assert!(n.retained_outbound_ack(second, 2));
+        assert_eq!(n.outbound_len(), 2);
+        assert!(
+            n.retained_outbound_select(0, 1, [11, 12, 0, 0, 0, 0, 0])
+                .is_none()
+        );
+        n.clock_ms = 500;
+        let remaining = *n
+            .retained_outbound_select(0, 0, [11, 12, 0, 0, 0, 0, 0])
+            .unwrap();
+        assert_eq!(remaining.frame, a.frame);
+        assert_eq!(remaining.delivery.pending_targets, 1);
+        assert_eq!(
+            remaining.delivery.interface_generations,
+            a.delivery.interface_generations
+        );
+        assert!(n.retained_outbound_take(first)); // transfer metadata, not fresh fanout
+        assert!(!n.retained_outbound_ack(first, 1));
+        assert_eq!(n.outbound_len(), 1);
+    }
+
+    #[test]
+    fn retirement_before_first_peek_cannot_bind_replacement_interface() {
+        let mut n = node();
+        let old = enqueue(&mut n, 1, OutboundReason::PathRequest, 0);
+        n.retained_outbound_retire_interface(1);
+        let new = enqueue(&mut n, 2, OutboundReason::PathRequest, 0);
+        let a = *n
+            .retained_outbound_select(0, 0, [11, 99, 0, 0, 0, 0, 0])
+            .unwrap();
+        assert_eq!(a.delivery.identity, old);
+        assert_eq!(a.delivery.pending_targets, 1);
+        let b = *n
+            .retained_outbound_select(old, 0, [11, 99, 0, 0, 0, 0, 0])
+            .unwrap();
+        assert_eq!(b.delivery.identity, new);
+        assert_eq!(b.delivery.pending_targets, 3);
+        n.retained_outbound_retire_interface(0);
+        let b = *n
+            .retained_outbound_select(0, 0, [44, 99, 0, 0, 0, 0, 0])
+            .unwrap();
+        assert_eq!(b.delivery.identity, new);
+        assert_eq!(b.delivery.pending_targets, 2);
+        // A generation change detected at select also retires rather than rebinds.
+        assert!(
+            n.retained_outbound_select(0, 0, [44, 100, 0, 0, 0, 0, 0])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn overflow_and_compaction_cannot_acknowledge_a_reused_slot() {
+        let mut n = node();
+        let first = enqueue(&mut n, 1, OutboundReason::PathRequest, 0);
+        let old = *n.retained_outbound_select(0, 0, GENERATIONS).unwrap();
+        assert_eq!(first, old.delivery.identity);
+        for marker in 2..=5 {
+            enqueue(&mut n, marker, OutboundReason::PathRequest, 0);
+        }
+        assert_eq!(n.outbound_len(), 4);
+        assert_eq!(n.stats.outbound_dropped, 1);
+        assert!(!n.retained_outbound_ack(first, 0x7f));
+        let second = n
+            .retained_outbound_select(0, 0, GENERATIONS)
+            .unwrap()
+            .delivery
+            .identity;
+        assert!(second > first);
+        assert!(n.retained_outbound_ack(second, 0x7f));
+        assert!(!n.retained_outbound_ack(second, 0x7f));
+        assert_eq!(n.outbound_len(), 3);
+        let third = n
+            .retained_outbound_select(0, 0, GENERATIONS)
+            .unwrap()
+            .delivery
+            .identity;
+        assert!(third > second);
+    }
+
+    #[test]
+    fn terminal_target_retirement_is_counted_once_but_acknowledgment_is_not() {
+        let mut n = node();
+        enqueue(&mut n, 1, OutboundReason::PathRequest, 0);
+        assert!(n.retained_outbound_select(0, 0, [0; 7]).is_none());
+        assert_eq!(n.stats.outbound_dropped, 1);
+        assert!(n.retained_outbound_select(0, 0, [0; 7]).is_none());
+        assert_eq!(n.stats.outbound_dropped, 1);
+
+        enqueue(&mut n, 2, OutboundReason::PathRequest, 0);
+        n.retained_outbound_select(0, 0, [11, 0, 0, 0, 0, 0, 0]);
+        n.retained_outbound_retire_interface(0);
+        assert!(n.retained_outbound_select(0, 0, GENERATIONS).is_none());
+        assert_eq!(n.stats.outbound_dropped, 2);
+
+        let sent = enqueue(&mut n, 3, OutboundReason::PathRequest, 0);
+        n.retained_outbound_select(0, 0, GENERATIONS);
+        assert!(n.retained_outbound_ack(sent, 0x7f));
+        assert!(n.retained_outbound_select(0, 0, GENERATIONS).is_none());
+        assert_eq!(n.stats.outbound_dropped, 2);
+
+        enqueue(&mut n, 4, OutboundReason::PathRequest, 0);
+        n.retained_outbound_select(0, 0, [11, 0, 0, 0, 0, 0, 0]);
+        assert!(
+            n.retained_outbound_select(0, 0, [12, 0, 0, 0, 0, 0, 0])
+                .is_none()
+        );
+        assert_eq!(n.stats.outbound_dropped, 3);
+    }
+
+    #[test]
+    fn exclusive_expiry_prunes_all_rows_even_behind_blocked_work() {
+        let mut n = node();
+        n.clock_ms = 100;
+        enqueue(&mut n, 1, OutboundReason::PathRequest, 0);
+        n.clock_ms = 101;
+        enqueue(&mut n, 2, OutboundReason::PathRequest, 0);
+        n.retained_outbound_select(0, 0, GENERATIONS);
+        n.clock_ms = 120100;
+        let q = n.retained_outbound_select(0, 0, GENERATIONS).unwrap();
+        assert_eq!(q.frame.packet.as_slice(), &[2]);
+        assert_eq!(q.frame.lifetime.enqueued_ms, 101);
+        n.clock_ms = 120101;
+        assert!(n.retained_outbound_select(0, 0x7f, GENERATIONS).is_none());
+        assert_eq!(n.outbound_len(), 0);
+        assert_eq!(n.stats.outbound_expired, 2);
+    }
+
+    #[test]
+    fn checked_identity_exhaustion_never_restarts_after_emptying() {
+        let mut n = node();
+        n.last_delivery_identity = u64::MAX - 1;
+        let last = enqueue(&mut n, 1, OutboundReason::PathRequest, 0);
+        assert_eq!(last, u64::MAX);
+        n.retained_outbound_select(0, 0, GENERATIONS);
+        assert!(n.retained_outbound_ack(last, 0x7f));
+        assert!(!n.enqueue(
+            0,
+            PacketBuffer::from_slice(&[2]).unwrap(),
+            OutboundReason::PathRequest
+        ));
+        assert_eq!(n.outbound_len(), 0);
+        assert_eq!(n.stats.queued_outbound, 1);
+        assert_eq!(n.last_delivery_identity, u64::MAX);
+    }
+
+    #[test]
+    fn legacy_poll_is_unchanged_until_exclusive_retained_mode() {
+        let mut n = node();
+        enqueue(&mut n, 1, OutboundReason::PathRequest, 0);
+        let frame: OutboundFrame = n.poll_tx().unwrap();
+        assert_eq!(frame.packet.as_slice(), &[1]);
+        let identity = enqueue(&mut n, 2, OutboundReason::PathRequest, 0);
+        n.retained_outbound_select(0, 0, GENERATIONS);
+        assert!(n.retained_outbound_ack(identity, 1));
+        assert!(n.poll_tx().is_none());
+        assert!(n.outbound_peek_len().is_none());
+        assert_eq!(n.outbound_len(), 1);
     }
 }

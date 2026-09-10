@@ -64,7 +64,7 @@ const MODE_BYTEMASK: u32 = 0x00E0;
 /// buffer. Larger ciphertext is rejected, never allocated. NOTE: this is the receive-buffer ceiling,
 /// NOT the negotiated link plaintext MDU — use [`link_mdu`] / [`LINK_MDU`] for frame plaintext sizing.
 pub const LINK_PADDED_MAX: usize = MDU;
-const _: () = assert!(LINK_PADDED_MAX % 16 == 0);
+const _: () = assert!(LINK_PADDED_MAX.is_multiple_of(16));
 
 /// Negotiated link plaintext MDU for a given MTU: the largest plaintext whose Token frame still
 /// fits one relayed packet, `floor((mtu - IFAC_MIN(1) - HEADER_MINSIZE - TOKEN_OVERHEAD)/16)*16 - 1`

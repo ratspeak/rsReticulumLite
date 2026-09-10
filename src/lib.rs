@@ -18,6 +18,8 @@ pub mod auto;
 pub mod config;
 pub mod constants;
 pub mod crypto;
+#[doc(hidden)]
+pub mod discovery;
 pub mod identity;
 pub mod ifac;
 pub mod known_destinations;

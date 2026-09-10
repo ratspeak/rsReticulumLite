@@ -174,7 +174,7 @@ pub fn token_decrypt<const PAD: usize>(
 
     let iv = &signed_parts[..16];
     let ciphertext = &signed_parts[16..];
-    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 || ciphertext.len() > PAD {
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) || ciphertext.len() > PAD {
         return Err(CryptoError::AuthenticationFailed);
     }
 
@@ -270,7 +270,7 @@ pub fn token_decrypt_in_place(key: &[u8; 64], buf: &mut [u8]) -> Result<usize, C
     }
 
     let ct_len = split - 16;
-    if ct_len % 16 != 0 {
+    if !ct_len.is_multiple_of(16) {
         return Err(CryptoError::AuthenticationFailed);
     }
     let mut iv = [0u8; 16];

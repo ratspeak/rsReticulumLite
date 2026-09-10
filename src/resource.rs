@@ -109,7 +109,7 @@ const _: () = assert!(MAX_PARTS <= hashmap_max_len(LINK_MDU));
 
 /// Largest acceptable transfer (encrypted blob) size: `MAX_PARTS * SDU` = 3712.
 pub const TRANSFER_MAX: usize = MAX_PARTS * SDU;
-const _: () = assert!(TRANSFER_MAX % 16 == 0);
+const _: () = assert!(TRANSFER_MAX.is_multiple_of(16));
 
 /// Largest payload the encrypted blob can carry: padded budget minus the PKCS7 reserve byte and
 /// the embedded random hash = 3659.
