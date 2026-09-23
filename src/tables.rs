@@ -29,6 +29,13 @@ impl<T: Copy, const N: usize> Queue<T, N> {
         }
     }
 
+    /// Empty the queue in place without constructing its storage on the stack.
+    pub fn clear(&mut self) {
+        self.entries.fill(None);
+        self.head = 0;
+        self.len = 0;
+    }
+
     pub const fn len(&self) -> usize {
         self.len
     }
@@ -131,6 +138,11 @@ pub struct PacketHashTable<const N: usize> {
 }
 
 impl<const N: usize> PacketHashTable<N> {
+    /// Clear entries in their final storage, without a capacity-sized temporary.
+    pub fn clear(&mut self) {
+        self.entries.fill(None);
+    }
+
     pub const fn new() -> Self {
         Self { entries: [None; N] }
     }
@@ -210,6 +222,11 @@ pub struct PathTable<const N: usize> {
 }
 
 impl<const N: usize> PathTable<N> {
+    /// Clear entries in their final storage, without a capacity-sized temporary.
+    pub fn clear(&mut self) {
+        self.entries.fill(None);
+    }
+
     pub const fn new() -> Self {
         Self {
             entries: [None; N],
@@ -372,6 +389,11 @@ pub struct AnnounceCache<const N: usize> {
 }
 
 impl<const N: usize> AnnounceCache<N> {
+    /// Clear entries in their final storage, without a capacity-sized temporary.
+    pub fn clear(&mut self) {
+        self.entries.fill(None);
+    }
+
     pub const fn new() -> Self {
         Self { entries: [None; N] }
     }
@@ -444,6 +466,11 @@ pub struct AnnounceSchedule<const N: usize> {
 }
 
 impl<const N: usize> AnnounceSchedule<N> {
+    /// Clear entries in their final storage, without a capacity-sized temporary.
+    pub fn clear(&mut self) {
+        self.entries.fill(None);
+    }
+
     pub const fn new() -> Self {
         Self { entries: [None; N] }
     }
@@ -513,6 +540,11 @@ pub struct ReverseTable<const N: usize> {
 }
 
 impl<const N: usize> ReverseTable<N> {
+    /// Clear entries in their final storage, without a capacity-sized temporary.
+    pub fn clear(&mut self) {
+        self.entries.fill(None);
+    }
+
     pub const fn new() -> Self {
         Self {
             entries: [None; N],
@@ -630,6 +662,11 @@ pub struct LinkTable<const N: usize> {
 }
 
 impl<const N: usize> LinkTable<N> {
+    /// Clear entries in their final storage, without a capacity-sized temporary.
+    pub fn clear(&mut self) {
+        self.entries.fill(None);
+    }
+
     pub const fn new() -> Self {
         Self {
             entries: [None; N],
@@ -754,6 +791,11 @@ pub struct RequestTagTable<const N: usize> {
 }
 
 impl<const N: usize> RequestTagTable<N> {
+    /// Clear entries in their final storage, without a capacity-sized temporary.
+    pub fn clear(&mut self) {
+        self.entries.fill(None);
+    }
+
     pub const fn new() -> Self {
         Self { entries: [None; N] }
     }

@@ -451,6 +451,15 @@ impl<
         self.transport_id
     }
 
+    /// Whether this node owns the packet's next-hop address. Endpoint adapters must
+    /// retain this decision when surfacing a non-forwardable packet for local delivery.
+    /// Announce transport IDs advertise a route rather than name their recipient.
+    pub fn accepts_transport_address(&self, header: &PacketHeader) -> bool {
+        header.flags.packet_type == PacketType::Announce
+            || header.transport_id.is_none()
+            || header.transport_id == Some(self.transport_id)
+    }
+
     /// Register one of this node's OWN destination hashes (e.g. its lxmf.delivery destination)
     /// so a relay-echoed copy of its own announce is never learned as a path or rebroadcast
     /// (trusted rns-transport inbound.rs "dropping own announce" — the phantom self-path hazard
@@ -1105,6 +1114,15 @@ impl<
         // >= PATHFINDER_M for EVERY packet type, checked on the RAW hops byte before the
         // transport increment. Pre-1.3.8 only announces were capped.
         if view.header.hops >= PATHFINDER_M {
+            self.stats.dropped = self.stats.dropped.saturating_add(1);
+            return Ok(IngestAction::Dropped);
+        }
+
+        // The canonical hash omits transport_id: an overheard copy for another
+        // relay must not suppress the later copy routed to us. Check ownership
+        // before hashlist deferral for known Links and repeating contexts too.
+        // Adapted from trusted rsReticulum actor/inbound.rs (62e144e).
+        if !self.accepts_transport_address(&view.header) {
             self.stats.dropped = self.stats.dropped.saturating_add(1);
             return Ok(IngestAction::Dropped);
         }
@@ -2492,6 +2510,142 @@ mod tests {
 
     fn node() -> SmallNode {
         SmallNode::new(LiteConfig::ESP32_LORA_TRANSPORT_SMALL, TRANSPORT_ID).unwrap()
+    }
+
+    #[test]
+    fn overheard_next_hop_does_not_consume_routed_packet_hash() {
+        let announce = signed_announce([0x71; 32], "lxmf.delivery", b"receiver");
+        for packet in [
+            h2_data(announce.destination_hash, b"hidden receiver"),
+            link_request(announce.destination_hash, 0),
+        ] {
+            let mut node = node();
+            node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1_000)
+                .unwrap();
+            let view = PacketView::parse(packet.as_slice()).unwrap();
+            let overheard = build_packet(
+                PacketHeader {
+                    transport_id: Some([0x99; 16]),
+                    ..view.header
+                },
+                view.payload,
+            )
+            .unwrap();
+            let hash = packet_hash(packet.as_slice(), HeaderType::Header2);
+            assert_eq!(hash, packet_hash(overheard.as_slice(), HeaderType::Header2));
+
+            assert_eq!(
+                node.ingest(overheard.as_slice(), RxMeta::new(IFACE), 1_100)
+                    .unwrap(),
+                IngestAction::Dropped
+            );
+            assert!(node.poll_tx().is_none());
+            assert_eq!(
+                node.ingest(packet.as_slice(), RxMeta::new(IFACE), 1_200)
+                    .unwrap(),
+                IngestAction::ForwardedTransport,
+                "overhearing another next hop must not suppress our routed copy"
+            );
+            let forwarded = node.poll_tx().unwrap();
+            let view = PacketView::parse(forwarded.packet.as_slice()).unwrap();
+            assert_eq!(view.header.flags.header_type, HeaderType::Header1);
+            assert_eq!(view.header.transport_id, None);
+            assert_eq!(view.header.hops, 1);
+            assert_eq!(
+                hash,
+                packet_hash(forwarded.packet.as_slice(), HeaderType::Header1)
+            );
+            assert_eq!(node.stats().duplicates, 0);
+        }
+    }
+
+    #[test]
+    fn next_hop_admission_precedes_known_link_and_repeat_context_exceptions() {
+        let announce = signed_announce([0x72; 32], "lxmf.delivery", b"receiver");
+        for context in [
+            PacketContext::None,
+            PacketContext::Channel,
+            PacketContext::Keepalive,
+        ] {
+            let mut node = node();
+            node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1_000)
+                .unwrap();
+            let request = link_request(announce.destination_hash, 0);
+            let link_id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
+            assert_eq!(
+                node.ingest(request.as_slice(), RxMeta::new(IFACE), 1_100)
+                    .unwrap(),
+                IngestAction::ForwardedTransport
+            );
+            node.poll_tx().unwrap();
+            let packet = link_packet(link_id, 0, context);
+            let view = PacketView::parse(packet.as_slice()).unwrap();
+            let overheard = build_packet(
+                PacketHeader {
+                    flags: PacketFlags {
+                        header_type: HeaderType::Header2,
+                        transport_type: TransportType::Transport,
+                        ..view.header.flags
+                    },
+                    transport_id: Some([0x99; 16]),
+                    ..view.header
+                },
+                view.payload,
+            )
+            .unwrap();
+            assert_eq!(
+                node.ingest(overheard.as_slice(), RxMeta::new(IFACE), 1_200)
+                    .unwrap(),
+                IngestAction::Dropped,
+                "known links and repeat contexts do not bypass next-hop ownership"
+            );
+            assert!(node.poll_tx().is_none());
+            assert_eq!(
+                node.ingest(packet.as_slice(), RxMeta::new(IFACE), 1_300)
+                    .unwrap(),
+                IngestAction::ForwardedTransport
+            );
+            assert!(node.poll_tx().is_some());
+        }
+    }
+
+    #[test]
+    fn overheard_next_hop_proof_preserves_reverse_route() {
+        let announce = signed_announce([0x73; 32], "lxmf.delivery", b"receiver");
+        let mut node = node();
+        node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1_000)
+            .unwrap();
+        let data = h2_data(announce.destination_hash, b"proof next hop");
+        node.ingest(data.as_slice(), RxMeta::new(IFACE), 1_100)
+            .unwrap();
+        node.poll_tx().unwrap();
+        let packet = proof(truncated_packet_hash(data.as_slice(), HeaderType::Header2));
+        let view = PacketView::parse(packet.as_slice()).unwrap();
+        let overheard = build_packet(
+            PacketHeader {
+                flags: PacketFlags {
+                    header_type: HeaderType::Header2,
+                    transport_type: TransportType::Transport,
+                    ..view.header.flags
+                },
+                transport_id: Some([0x99; 16]),
+                ..view.header
+            },
+            view.payload,
+        )
+        .unwrap();
+        assert_eq!(
+            node.ingest(overheard.as_slice(), RxMeta::new(IFACE), 1_200)
+                .unwrap(),
+            IngestAction::Dropped
+        );
+        assert!(node.poll_tx().is_none());
+        assert_eq!(
+            node.ingest(packet.as_slice(), RxMeta::new(IFACE), 1_300)
+                .unwrap(),
+            IngestAction::ForwardedProof
+        );
+        assert_eq!(node.poll_tx().unwrap().reason, OutboundReason::ProofReturn);
     }
 
     #[test]
