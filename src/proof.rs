@@ -12,7 +12,7 @@
 //! Ed25519 public key (and, for an explicit proof, checks the prepended hash). The sender maps a
 //! valid proof → DELIVERED. `no_std`, no-alloc.
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 use crate::constants::{PACKET_HASH_LENGTH, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use crate::identity::LocalIdentity;
@@ -26,6 +26,26 @@ pub const PROOF_EXPLICIT_LEN: usize = PACKET_HASH_LENGTH + SIGNATURE_LENGTH;
 pub enum ProofError {
     /// Caller's `out` buffer is too small for the requested proof form.
     OutputTooSmall,
+}
+
+/// Explicit Link packet proof signed by the initiator's retained ephemeral
+/// Ed25519 seed, as in `rns-link::Link::prove_packet_with_local_signer`.
+/// This seed is the one used to build THIS Link request, never the destination
+/// identity key. The owner checks Link role/state and wipes its seed on close.
+/// `SigningKey` wipes its temporary copy on drop (dalek's `zeroize` feature).
+pub fn build_initiator_proof(
+    signing_seed: &[u8; 32],
+    packet_hash: &[u8; PACKET_HASH_LENGTH],
+    out: &mut [u8],
+) -> Result<usize, ProofError> {
+    if out.len() < PROOF_EXPLICIT_LEN {
+        return Err(ProofError::OutputTooSmall);
+    }
+    let signer = SigningKey::from_bytes(signing_seed);
+    out[..PACKET_HASH_LENGTH].copy_from_slice(packet_hash);
+    out[PACKET_HASH_LENGTH..PROOF_EXPLICIT_LEN]
+        .copy_from_slice(&signer.sign(packet_hash).to_bytes());
+    Ok(PROOF_EXPLICIT_LEN)
 }
 
 /// Build a proof of receipt for a packet whose full 32-byte hash is `packet_hash`, signed by
@@ -167,6 +187,26 @@ impl<const N: usize> Default for SeenMessages<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initiator_proof_uses_transient_signer_and_checks_capacity() {
+        let seed = [0x32; 32];
+        let hash = [0xa7; 32];
+        let mut proof = [0; PROOF_EXPLICIT_LEN];
+        assert_eq!(build_initiator_proof(&seed, &hash, &mut proof), Ok(96));
+        let mut public = [0; PUBLIC_KEY_LENGTH];
+        public[32..].copy_from_slice(&SigningKey::from_bytes(&seed).verifying_key().to_bytes());
+        assert!(validate_proof(&public, &hash, &proof));
+        assert!(!validate_proof(&public, &[0; 32], &proof));
+        let identity = LocalIdentity::from_private_key(&[0x19; 64]);
+        assert!(!validate_proof(identity.public_key(), &hash, &proof));
+        let mut small = [0x55; 95];
+        assert_eq!(
+            build_initiator_proof(&seed, &hash, &mut small),
+            Err(ProofError::OutputTooSmall)
+        );
+        assert_eq!(small, [0x55; 95]);
+    }
 
     #[test]
     fn membership_does_not_reserve_or_evict() {
