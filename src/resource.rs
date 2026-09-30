@@ -34,7 +34,8 @@
 //!   honest no-bz2 behaviour (a bz2-less peer would fail the transfer at assembly; lite fails it
 //!   up front instead of accepting parts it can never decode). The sender never sets the flag.
 //! - Single segment only (`split`/multi-segment and metadata-prefixed resources rejected), plain
-//!   transfers only (request/response resources rejected), encrypted-only (Python link resources
+//!   transfers by default. A response is accepted only through the explicit
+//!   pending-request-bound constructor; requests are rejected. Encrypted-only (Python link resources
 //!   always set `encrypted`; a plaintext ADV is refused).
 //! - `random_hash` and the Token IV are caller-supplied entropy. On a map-hash collision the
 //!   builder returns [`ResourceError::MapHashCollision`]; the caller retries with fresh
@@ -62,8 +63,7 @@ pub const HASHMAP_IS_EXHAUSTED: u8 = 0xFF;
 pub const ADV_OVERHEAD: usize = 134;
 /// Delivery proof length: `resource_hash(32) || proof(32)`.
 pub const PROOF_LEN: usize = 64;
-/// Cap on a parsed ADV `q` (request id) field. Request/response resources are rejected anyway;
-/// this only bounds the parse buffer.
+/// Cap on a parsed ADV `q` field. The response constructor requires exactly 16 bytes.
 pub const REQUEST_ID_MAX: usize = 32;
 
 // Flow-control window constants (Python Resource.*, rns-protocol resource.rs — parity values).
@@ -906,6 +906,7 @@ impl InboundResource {
     /// num_parts)`. Shared by [`from_advertisement`] and [`from_advertisement_into`].
     fn validate_adv(
         adv: &ResourceAdv,
+        expected_response: Option<&[u8; 16]>,
     ) -> Result<([[u8; MAPHASH_LEN]; MAX_PARTS], usize), ResourceError> {
         if adv.flags.compressed {
             return Err(ResourceError::CompressedUnsupported);
@@ -916,7 +917,16 @@ impl InboundResource {
         if adv.flags.split || adv.total_segments != 1 || adv.segment_index != 1 {
             return Err(ResourceError::SplitUnsupported);
         }
-        if adv.flags.is_request || adv.flags.is_response || adv.request_id_len != 0 {
+        let purpose_valid = match expected_response {
+            None => !adv.flags.is_request && !adv.flags.is_response && adv.request_id_len == 0,
+            Some(id) => {
+                !adv.flags.is_request
+                    && adv.flags.is_response
+                    && adv.request_id_len == 16
+                    && adv.request_id[..16] == id[..]
+            }
+        };
+        if !purpose_valid {
             return Err(ResourceError::RequestResponseUnsupported);
         }
         if !adv.flags.encrypted {
@@ -955,7 +965,28 @@ impl InboundResource {
     /// Accept an advertisement IN PLACE into `self` (typically heap-resident — the ~3.7 KiB
     /// `buf` would otherwise be a by-value stack temp that pressures the MCU task stack).
     pub fn from_advertisement_into(&mut self, adv: &ResourceAdv) -> Result<(), ResourceError> {
-        let (map_hashes, num_parts) = Self::validate_adv(adv)?;
+        self.accept_into(adv, None)
+    }
+
+    /// Accept a response on the authenticated Link owning `expected_request_id`.
+    /// The caller binds the Link, interface incarnation and live request lifetime;
+    /// this verifies the response flag and exact 16-byte ADV request ID before
+    /// replacing any state. All ordinary size/compression/crypto limits still apply.
+    /// The assembled response envelope must independently match the same ID.
+    pub fn from_response_into(
+        &mut self,
+        adv: &ResourceAdv,
+        expected_request_id: &[u8; 16],
+    ) -> Result<(), ResourceError> {
+        self.accept_into(adv, Some(expected_request_id))
+    }
+
+    fn accept_into(
+        &mut self,
+        adv: &ResourceAdv,
+        expected: Option<&[u8; 16]>,
+    ) -> Result<(), ResourceError> {
+        let (map_hashes, num_parts) = Self::validate_adv(adv, expected)?;
         self.buf.fill(0);
         self.resource_hash = adv.resource_hash;
         self.random_hash = adv.random_hash;
@@ -973,7 +1004,7 @@ impl InboundResource {
     }
 
     pub fn from_advertisement(adv: &ResourceAdv) -> Result<Self, ResourceError> {
-        let (map_hashes, num_parts) = Self::validate_adv(adv)?;
+        let (map_hashes, num_parts) = Self::validate_adv(adv, None)?;
         Ok(Self {
             buf: [0u8; TRANSFER_MAX],
             resource_hash: adv.resource_hash,

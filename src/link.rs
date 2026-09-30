@@ -55,6 +55,26 @@ pub const DEFAULT_MODE: u8 = MODE_AES256_CBC;
 /// AES-256 derived key length: cipher(32) || HMAC(32).
 pub const LINK_KEY_LENGTH: usize = 64;
 
+/// Build the plaintext for LINKIDENTIFY, adapted from `rns-link::Link::identify`.
+/// The host must use this only on an ACTIVE initiator Link, encrypt it with that
+/// Link's session key and send with context 0xFB. This does not authenticate the
+/// receiver; the normal Link proof must already have done that.
+pub fn build_identification(
+    identity: &LocalIdentity,
+    link_id: &[u8; DESTINATION_LENGTH],
+    out: &mut [u8],
+) -> Result<usize, LinkError> {
+    if out.len() < 128 {
+        return Err(LinkError::OutputTooSmall);
+    }
+    let mut signed = [0u8; 80];
+    signed[..16].copy_from_slice(link_id);
+    signed[16..].copy_from_slice(identity.public_key());
+    out[..64].copy_from_slice(identity.public_key());
+    out[64..128].copy_from_slice(&identity.sign(&signed));
+    Ok(128)
+}
+
 const MTU_BYTEMASK: u32 = 0x001F_FFFF;
 const MODE_BYTEMASK: u32 = 0x00E0;
 
