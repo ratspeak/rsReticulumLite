@@ -427,6 +427,19 @@ impl ResourceAdv {
         Ok(Self::parse_bounded(data)?.resource_hash)
     }
 
+    /// Inspect a response's request binding without admitting its transfer. Oversized or
+    /// compressed responses still identify the waiting request so the host can fail it
+    /// explicitly. Malformed maps and other resource purposes never expose an ID.
+    pub fn response_id(data: &[u8]) -> Result<[u8; 16], ResourceError> {
+        let adv = Self::parse_bounded(data)?;
+        if !adv.flags.is_response || adv.flags.is_request || adv.request_id_len != 16 {
+            return Err(ResourceError::InvalidAdvertisement);
+        }
+        let mut id = [0; 16];
+        id.copy_from_slice(&adv.request_id[..16]);
+        Ok(id)
+    }
+
     // Parse the entire map before exposing its hash. Large hashmaps are validated as slices,
     // not copied; this private intermediate must not be passed to the transfer implementation.
     fn parse_bounded(data: &[u8]) -> Result<Self, ResourceError> {
@@ -1359,6 +1372,52 @@ mod tests {
         let mut malformed = bytes.clone();
         malformed[2] = b'd'; // Duplicate field: no partial hash may escape.
         assert!(ResourceAdv::rejection_hash(&malformed).is_err());
+    }
+
+    #[test]
+    fn response_id_inspects_full_rust_oversized_response_without_admission() {
+        use rns_protocol::resource::ResourceFlags as FullFlags;
+        use rns_protocol::resource_adv::ResourceAdvertisement;
+        let mut adv = ResourceAdvertisement::new(
+            12_000,
+            11_936,
+            26,
+            [0x45; 32],
+            std::vec![0x22; 4],
+            FullFlags {
+                encrypted: true,
+                is_response: true,
+                ..Default::default()
+            },
+            &[[0x13; 4]; 26],
+            LINK_MDU,
+        );
+        adv.request_id = Some(std::vec![0x42; 16]);
+        for compressed in [false, true] {
+            adv.flags.compressed = compressed;
+            let bytes = adv.pack();
+            assert!(bytes.len() > ADV_PACKED_MAX && bytes.len() <= LINK_MDU);
+            assert_eq!(ResourceAdv::parse(&bytes), Err(ResourceError::TooLarge));
+            assert_eq!(ResourceAdv::response_id(&bytes), Ok([0x42; 16]));
+            for cut in 0..bytes.len() {
+                assert!(ResourceAdv::response_id(&bytes[..cut]).is_err());
+            }
+            let mut malformed = bytes;
+            malformed[2] = b'd';
+            assert!(ResourceAdv::response_id(&malformed).is_err());
+        }
+        for length in [0, 15, 17, 32] {
+            adv.request_id = Some(std::vec![0x42; length]);
+            assert!(ResourceAdv::response_id(&adv.pack()).is_err());
+        }
+        adv.request_id = None;
+        assert!(ResourceAdv::response_id(&adv.pack()).is_err());
+        adv.request_id = Some(std::vec![0x42; 16]);
+        adv.flags.is_request = true;
+        assert!(ResourceAdv::response_id(&adv.pack()).is_err());
+        adv.flags.is_request = false;
+        adv.flags.is_response = false;
+        assert!(ResourceAdv::response_id(&adv.pack()).is_err());
     }
 
     #[test]
