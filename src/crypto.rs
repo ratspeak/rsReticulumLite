@@ -32,6 +32,9 @@ pub const TOKEN_OVERHEAD: usize = 16 + 32;
 /// Non-plaintext ECIES bytes: ephemeral_pub(32) + Token overhead.
 pub const ECIES_FIXED_OVERHEAD: usize = 32 + TOKEN_OVERHEAD;
 
+/// Plaintext/ciphertext offset inside an in-place ECIES buffer (ephemeral + IV).
+pub const ECIES_PLAINTEXT_OFFSET: usize = 32 + 16;
+
 /// Largest plaintext the SINGLE-dest ECIES token can wrap and still fit the Reticulum MDU — the
 /// FORWARDABLE per-packet budget (MDU already reserves HEADER_MAXSIZE + IFAC so a relayed Header2
 /// packet fits MTU). Matches Python `RNS.Packet.ENCRYPTED_MDU`:
@@ -337,6 +340,69 @@ pub fn ecies_encrypt(
     };
     token_key.zeroize();
     Ok(32 + token_len)
+}
+
+/// Exact ECIES length including the mandatory PKCS7 block padding. This helper
+/// does not relax packet limits; large callers must supply their own fixed bound.
+pub fn ecies_ciphertext_len(plaintext_len: usize) -> Result<usize, CryptoError> {
+    plaintext_len
+        .checked_add(16 - plaintext_len % 16)
+        .and_then(|n| n.checked_add(ECIES_FIXED_OVERHEAD))
+        .ok_or(CryptoError::PlaintextTooLong)
+}
+
+/// Large, caller-bounded ECIES using the same key derivation and Token as
+/// [`ecies_encrypt`], without a plaintext-sized stack copy. On entry plaintext
+/// occupies `buf[ECIES_PLAINTEXT_OFFSET..ECIES_PLAINTEXT_OFFSET + plaintext_len]`.
+/// On success `buf[..returned_length]` is the full encrypted blob.
+///
+/// Fresh ephemeral key and IV requirements are identical to [`ecies_encrypt`].
+/// Packet callers must continue using that function's 383-byte admission limit.
+pub fn ecies_encrypt_in_place(
+    target_x25519_pub: &[u8; 32],
+    recipient_identity_hash: &[u8; 16],
+    ephemeral_priv: &[u8; 32],
+    iv: &[u8; 16],
+    buf: &mut [u8],
+    plaintext_len: usize,
+) -> Result<usize, CryptoError> {
+    let total = ecies_ciphertext_len(plaintext_len)?;
+    if buf.len() < total {
+        return Err(CryptoError::OutputTooSmall);
+    }
+    let secret = StaticSecret::from(*ephemeral_priv);
+    let ephemeral_pub = PublicKey::from(&secret);
+    let shared = secret.diffie_hellman(&PublicKey::from(*target_x25519_pub));
+    let mut token_key = derive_token_key(shared.as_bytes(), recipient_identity_hash);
+    buf[..32].copy_from_slice(ephemeral_pub.as_bytes());
+    let result = token_encrypt_in_place(&token_key, iv, &mut buf[32..total], plaintext_len);
+    token_key.zeroize();
+    result.map(|n| 32 + n)
+}
+
+/// Inverse of [`ecies_encrypt_in_place`]. Pass exactly one bounded encrypted
+/// blob, without unused buffer capacity. The authenticated plaintext remains at
+/// `buf[ECIES_PLAINTEXT_OFFSET..ECIES_PLAINTEXT_OFFSET + returned_length]`.
+/// HMAC failure leaves ciphertext intact, allowing retained-key attempts. After
+/// any error no bytes may be consumed as plaintext; invalid authenticated padding
+/// clears the decrypted region. Keys and buffers remain caller-owned.
+pub fn ecies_decrypt_in_place(
+    my_x25519_priv: &[u8; 32],
+    my_identity_hash: &[u8; 16],
+    buf: &mut [u8],
+) -> Result<usize, CryptoError> {
+    if buf.len() < ECIES_FIXED_OVERHEAD + 16
+        || !(buf.len() - ECIES_FIXED_OVERHEAD).is_multiple_of(16)
+    {
+        return Err(CryptoError::AuthenticationFailed);
+    }
+    let ephemeral_pub: [u8; 32] = buf[..32].try_into().unwrap();
+    let secret = StaticSecret::from(*my_x25519_priv);
+    let shared = secret.diffie_hellman(&PublicKey::from(ephemeral_pub));
+    let mut token_key = derive_token_key(shared.as_bytes(), my_identity_hash);
+    let result = token_decrypt_in_place(&token_key, &mut buf[32..]);
+    token_key.zeroize();
+    result
 }
 
 /// ECIES-decrypt a payload addressed to us into `out`; returns the plaintext length.
