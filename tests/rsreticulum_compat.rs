@@ -990,3 +990,67 @@ fn lite_link_encryption_interops_with_rsreticulum() {
     let pn = rns_lite_core::link::link_decrypt(&lite_keys, &trusted_ct, &mut pt).unwrap();
     assert_eq!(&pt[..pn], plaintext);
 }
+
+// Exact donor: TRUSTED_REF's Link::handle_identification. Signature covers the
+// Link ID as well as both public keys; ciphertext/session ownership is separate.
+#[test]
+fn lite_link_identification_matches_trusted_peer_and_rejects_replay() {
+    use rns_crypto::ed25519::Ed25519PrivateKey;
+    use rns_link::link::Link;
+    use rns_lite_core::identity::LocalIdentity;
+    use rns_lite_core::link::{build_identification, verify_identification};
+
+    let destination_key = Ed25519PrivateKey::from_bytes(&[0x31; 32]);
+    let destination_public = destination_key.public_key();
+    let (mut initiator, request) = Link::new_initiator([0x51; 16], 1);
+    let (mut responder, proof) =
+        Link::new_responder(&request, &destination_key, [0x51; 16], 1).unwrap();
+    let rtt = initiator
+        .validate_proof(&proof, &destination_public, &destination_public.to_bytes())
+        .unwrap();
+    responder.receive_rtt_packet(&rtt).unwrap();
+    let link_id = initiator.link_id;
+    let private = [0x61; 64];
+    let lite = LocalIdentity::from_private_key(&private);
+    let trusted = rns_identity::identity::Identity::from_private_key(&private).unwrap();
+    let mut plaintext = [0; 128];
+    assert_eq!(
+        build_identification(&lite, &link_id, &mut plaintext),
+        Ok(128)
+    );
+    assert_eq!(&plaintext[..64], trusted.get_public_key());
+    let mut signed = link_id.to_vec();
+    signed.extend_from_slice(&trusted.get_public_key());
+    assert_eq!(&plaintext[64..], trusted.sign(&signed).unwrap());
+    let encrypted = initiator.encrypt(&plaintext).unwrap();
+    assert_eq!(
+        responder.handle_identification(&encrypted).unwrap(),
+        *lite.public_key()
+    );
+    assert_eq!(
+        verify_identification(&link_id, &responder.decrypt(&encrypted).unwrap()),
+        Some(*lite.public_key())
+    );
+    let signing = Ed25519PrivateKey::from_bytes(&[0x61; 32]);
+    let reverse = initiator
+        .identify(&trusted.get_public_key(), &signing)
+        .unwrap();
+    assert_eq!(
+        verify_identification(&link_id, &responder.decrypt(&reverse).unwrap()),
+        Some(*lite.public_key())
+    );
+    for index in 0..plaintext.len() {
+        let mut corrupt = plaintext;
+        corrupt[index] ^= 1;
+        assert_eq!(verify_identification(&link_id, &corrupt), None);
+    }
+    for length in 0..128 {
+        assert_eq!(verify_identification(&link_id, &plaintext[..length]), None);
+    }
+    let mut too_long = plaintext.to_vec();
+    too_long.push(0);
+    assert_eq!(verify_identification(&link_id, &too_long), None);
+    let mut other_link = link_id;
+    other_link[0] ^= 1;
+    assert_eq!(verify_identification(&other_link, &plaintext), None);
+}

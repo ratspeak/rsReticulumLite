@@ -75,6 +75,35 @@ pub fn build_identification(
     Ok(128)
 }
 
+/// Verify exactly one decrypted LINKIDENTIFY public-key/signature payload.
+/// Adapted from the pinned trusted `rns-link::Link::handle_identification`.
+///
+/// The owner must first authenticate/decrypt on the exact ACTIVE Link and then
+/// enforce first-identity-wins. A later valid identification must never replace
+/// an already recorded peer or trigger a second identity callback. This stateless
+/// primitive does not activate a Link, admit a caller, or mutate peer state.
+pub fn verify_identification(
+    link_id: &[u8; DESTINATION_LENGTH],
+    plaintext: &[u8],
+) -> Option<[u8; PUBLIC_KEY_LENGTH]> {
+    if plaintext.len() != PUBLIC_KEY_LENGTH + SIGNATURE_LENGTH {
+        return None;
+    }
+    let mut public_key = [0; PUBLIC_KEY_LENGTH];
+    public_key.copy_from_slice(&plaintext[..PUBLIC_KEY_LENGTH]);
+    let mut ed_public = [0; KEYSIZE];
+    ed_public.copy_from_slice(&public_key[KEYSIZE..]);
+    let key = VerifyingKey::from_bytes(&ed_public).ok()?;
+    let mut signed = [0; DESTINATION_LENGTH + PUBLIC_KEY_LENGTH];
+    signed[..DESTINATION_LENGTH].copy_from_slice(link_id);
+    signed[DESTINATION_LENGTH..].copy_from_slice(&public_key);
+    let mut signature = [0; SIGNATURE_LENGTH];
+    signature.copy_from_slice(&plaintext[PUBLIC_KEY_LENGTH..]);
+    key.verify(&signed, &Signature::from_bytes(&signature))
+        .ok()?;
+    Some(public_key)
+}
+
 const MTU_BYTEMASK: u32 = 0x001F_FFFF;
 const MODE_BYTEMASK: u32 = 0x00E0;
 
