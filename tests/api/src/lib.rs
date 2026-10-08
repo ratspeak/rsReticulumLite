@@ -17,7 +17,6 @@ pub fn roaming_ingress(interface_id: u8) -> RxMeta {
     RxMeta::with_mode(interface_id, InterfaceMode::Roaming)
 }
 
-
 pub fn verified_link_peer(link_id: &[u8; 16], plaintext: &[u8]) -> Option<[u8; 64]> {
     rns_lite_core::link::verify_identification(link_id, plaintext)
 }
