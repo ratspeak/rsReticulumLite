@@ -37,12 +37,12 @@ hkdf = { version = "0.12", default-features = false }
 subtle = { version = "2", default-features = false }
 
 [dev-dependencies]
-rns-identity = { path = "../rsReticulum/crates/rns-identity", version = "1.2.0" }
-rns-wire = { path = "../rsReticulum/crates/rns-wire", version = "1.2.0" }
-rns-crypto = { path = "../rsReticulum/crates/rns-crypto", version = "1.2.0" }
-rns-link = { path = "../rsReticulum/crates/rns-link", version = "1.2.0" }
+rns-identity = { path = "../rsReticulum/crates/rns-identity", version = "~1.4.0" }
+rns-wire = { path = "../rsReticulum/crates/rns-wire", version = "~1.4.0" }
+rns-crypto = { path = "../rsReticulum/crates/rns-crypto", version = "~1.4.0" }
+rns-link = { path = "../rsReticulum/crates/rns-link", version = "~1.4.0" }
 # Trusted IFAC wrap/verify lives in rns-transport; dev-only, so the host deps it
 # pulls (tokio et al.) never touch the no_std MCU build path.
-rns-transport = { path = "../rsReticulum/crates/rns-transport", version = "1.2.0" }
+rns-transport = { path = "../rsReticulum/crates/rns-transport", version = "~1.4.0" }
 # Resource transfer reference for byte-exact cross-checks; dev-only.
-rns-protocol = { path = "../rsReticulum/crates/rns-protocol", version = "1.2.0" }
+rns-protocol = { path = "../rsReticulum/crates/rns-protocol", version = "~1.4.0" }

@@ -141,6 +141,8 @@ pub enum LinkError {
     /// Requested encryption mode is not enabled (rsDeck enables AES-256-CBC only). Mirrors Python
     /// `Link.signalling_bytes` raising for a mode outside `ENABLED_MODES`.
     UnsupportedMode,
+    /// MTU is outside the checked protocol domain or fixed 500-byte endpoint budget.
+    InvalidMtu,
 }
 
 /// MTU + encryption-mode signalling, packed into 3 big-endian bytes:
@@ -153,11 +155,45 @@ pub struct SignallingData {
 }
 
 impl SignallingData {
+    /// Low-level masking representation; admission must use `try_new` or checked parsers.
     pub fn new(mode: u8, mtu: u32) -> Self {
         Self {
             mode: mode & 0x07,
             mtu: mtu & MTU_BYTEMASK,
         }
+    }
+
+    /// Checked construction adapted from trusted `rns-wire::link_signalling`.
+    /// Zero normalizes to the base contract; no input is masked or truncated.
+    pub fn try_new(mode: u8, mtu: u32) -> Result<Self, LinkError> {
+        if mode > 7 {
+            return Err(LinkError::UnsupportedMode);
+        }
+        let checked = Self { mode, mtu };
+        Ok(Self {
+            mode,
+            mtu: checked.effective_mtu()?,
+        })
+    }
+
+    /// Checked effective MTU while preserving original trailer bytes for signatures.
+    pub fn effective_mtu(self) -> Result<u32, LinkError> {
+        match self.mtu {
+            0 => Ok(crate::constants::MTU as u32),
+            500..=MTU_BYTEMASK => Ok(self.mtu),
+            _ => Err(LinkError::InvalidMtu),
+        }
+    }
+
+    fn fixed_endpoint(self) -> Result<Self, LinkError> {
+        if self.mode != MODE_AES256_CBC {
+            return Err(LinkError::UnsupportedMode);
+        }
+        let checked = Self::try_new(self.mode, self.mtu)?;
+        if checked.mtu != crate::constants::MTU as u32 {
+            return Err(LinkError::InvalidMtu);
+        }
+        Ok(checked)
     }
 
     /// The default AES-256 / MTU=500 signalling used when a peer sends a legacy (key-only) payload.
@@ -215,9 +251,7 @@ pub fn build_link_request(
     signalling: SignallingData,
     out: &mut [u8],
 ) -> Result<usize, LinkError> {
-    if signalling.mode != MODE_AES256_CBC {
-        return Err(LinkError::UnsupportedMode);
-    }
+    let signalling = signalling.fixed_endpoint()?;
     if out.len() < LINK_REQUEST_LEN {
         return Err(LinkError::OutputTooSmall);
     }
@@ -255,6 +289,7 @@ impl LinkRequestView {
         } else {
             SignallingData::default_signalling()
         };
+        signalling.effective_mtu()?;
         Ok(Self {
             peer_x25519_pub,
             peer_ed25519_pub,
@@ -277,9 +312,7 @@ pub fn build_link_proof(
     signalling: SignallingData,
     out: &mut [u8],
 ) -> Result<usize, LinkError> {
-    if signalling.mode != MODE_AES256_CBC {
-        return Err(LinkError::UnsupportedMode);
-    }
+    let signalling = signalling.fixed_endpoint()?;
     if out.len() < LINK_PROOF_LEN {
         return Err(LinkError::OutputTooSmall);
     }
@@ -313,6 +346,8 @@ pub struct LinkProofView {
     pub signature: [u8; SIGNATURE_LENGTH],
     pub responder_x25519_pub: [u8; KEYSIZE],
     pub signalling: SignallingData,
+    /// Legacy proofs omit the trailer from the signed bytes.
+    pub signalling_present: bool,
 }
 
 impl LinkProofView {
@@ -331,10 +366,12 @@ impl LinkProofView {
         } else {
             SignallingData::default_signalling()
         };
+        signalling.effective_mtu()?;
         Ok(Self {
             signature,
             responder_x25519_pub,
             signalling,
+            signalling_present: data.len() == LINK_PROOF_LEN,
         })
     }
 
@@ -351,7 +388,7 @@ impl LinkProofView {
         identity_public_key: &[u8; PUBLIC_KEY_LENGTH],
         link_id: &[u8; DESTINATION_LENGTH],
     ) -> bool {
-        if self.signalling.mode != MODE_AES256_CBC {
+        if self.signalling.fixed_endpoint().is_err() {
             return false;
         }
         let mut ed_pub = [0u8; 32];
@@ -369,8 +406,10 @@ impl LinkProofView {
         s += KEYSIZE;
         signed[s..s + KEYSIZE].copy_from_slice(&ed_pub);
         s += KEYSIZE;
-        signed[s..s + LINK_MTU_SIZE].copy_from_slice(&sig_bytes);
-        s += LINK_MTU_SIZE;
+        if self.signalling_present {
+            signed[s..s + LINK_MTU_SIZE].copy_from_slice(&sig_bytes);
+            s += LINK_MTU_SIZE;
+        }
         let signature = Signature::from_bytes(&self.signature);
         key.verify(&signed[..s], &signature).is_ok()
     }
@@ -627,5 +666,78 @@ mod tests {
         let view = LinkProofView::parse(&proof).unwrap();
         assert_eq!(view.signalling.mode, 0);
         assert!(!view.validate(identity.public_key(), &link_id)); // rejected on the mode gate
+    }
+    #[test]
+    fn checked_signalling_domain_and_builders_do_not_mask() {
+        for mtu in 1..500 {
+            assert_eq!(SignallingData::try_new(1, mtu), Err(LinkError::InvalidMtu));
+            let mut request = [0u8; LINK_REQUEST_LEN];
+            request[64..].copy_from_slice(&SignallingData::new(1, mtu).pack());
+            assert_eq!(LinkRequestView::parse(&request), Err(LinkError::InvalidMtu));
+            let mut proof = [0u8; LINK_PROOF_LEN];
+            proof[96..].copy_from_slice(&request[64..]);
+            assert_eq!(LinkProofView::parse(&proof), Err(LinkError::InvalidMtu));
+        }
+        for mtu in [0, 500, 501, MTU_BYTEMASK] {
+            assert!(SignallingData::try_new(1, mtu).is_ok());
+        }
+        for mtu in [MTU_BYTEMASK + 1, u32::MAX] {
+            assert!(SignallingData::try_new(1, mtu).is_err());
+        }
+        assert!(SignallingData::try_new(8, 500).is_err());
+        let identity = LocalIdentity::from_private_key(&[7; 64]);
+        for signalling in [
+            SignallingData { mode: 1, mtu: 499 },
+            SignallingData { mode: 1, mtu: 501 },
+            SignallingData {
+                mode: 1,
+                mtu: u32::MAX,
+            },
+            SignallingData { mode: 9, mtu: 500 },
+        ] {
+            let mut out = [0xAB; LINK_PROOF_LEN];
+            assert!(build_link_request(&[1; 32], &[2; 32], signalling, &mut out).is_err());
+            assert_eq!(out, [0xAB; LINK_PROOF_LEN]);
+            assert!(build_link_proof(&identity, &[3; 32], &[4; 16], signalling, &mut out).is_err());
+            assert_eq!(out, [0xAB; LINK_PROOF_LEN]);
+        }
+    }
+
+    #[test]
+    fn signed_legacy_zero_and_base_proof_shapes_are_authenticated_exactly() {
+        let identity = LocalIdentity::from_private_key(&[7; 64]);
+        let id = [8; 16];
+        for mtu in [None, Some(0), Some(500), Some(501)] {
+            let mut signed = [0u8; 83];
+            signed[..16].copy_from_slice(&id);
+            signed[16..48].copy_from_slice(&[9; 32]);
+            signed[48..80].copy_from_slice(&identity.public_key()[32..]);
+            let n = if let Some(mtu) = mtu {
+                signed[80..].copy_from_slice(&SignallingData::new(1, mtu).pack());
+                83
+            } else {
+                80
+            };
+            let mut proof = [0u8; 99];
+            proof[..64].copy_from_slice(&identity.sign(&signed[..n]));
+            proof[64..96].copy_from_slice(&[9; 32]);
+            proof[96..].copy_from_slice(&signed[80..]);
+            let n = if mtu.is_some() { 99 } else { 96 };
+            let parsed = LinkProofView::parse(&proof[..n]).unwrap();
+            assert_eq!(
+                parsed.validate(identity.public_key(), &id),
+                mtu != Some(501)
+            );
+            proof[0] ^= 1;
+            assert!(
+                !LinkProofView::parse(&proof[..n])
+                    .unwrap()
+                    .validate(identity.public_key(), &id)
+            );
+        }
+        for len in [0, 63, 65, 66, 68, 95, 97, 98, 100] {
+            assert!(LinkRequestView::parse(&[0u8; 100][..len]).is_err());
+            assert!(LinkProofView::parse(&[0u8; 100][..len]).is_err());
+        }
     }
 }

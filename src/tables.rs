@@ -646,6 +646,8 @@ pub struct LinkEntry {
     pub next_hop: Option<Hash16>,
     pub remaining_hops: u8,
     pub taken_hops: u8,
+    pub requested_mode: u8,
+    pub accepted_mtu_ceiling: u16,
     pub validated: bool,
     pub expires_ms: u64,
 }
@@ -732,6 +734,16 @@ impl<const N: usize> LinkTable<N> {
             .iter()
             .flatten()
             .find(|entry| &entry.link_id == link_id && now_ms < entry.expires_ms)
+    }
+
+    pub fn remove_interface(&mut self, interface: InterfaceId) {
+        for entry in &mut self.entries {
+            if entry.is_some_and(|link| {
+                link.receiving_interface == interface || link.outbound_interface == interface
+            }) {
+                *entry = None;
+            }
+        }
     }
 
     pub fn contains_live(&self, link_id: &Hash16, now_ms: u64) -> bool {
@@ -1065,6 +1077,8 @@ mod tests {
                 next_hop: Some([0x11; 16]),
                 remaining_hops: 1,
                 taken_hops: 1,
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
                 validated: true,
                 expires_ms: 100,
             },
@@ -1079,6 +1093,8 @@ mod tests {
                 next_hop: Some([0x22; 16]),
                 remaining_hops: 1,
                 taken_hops: 1,
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
                 validated: true,
                 expires_ms: 200,
             },
@@ -1093,6 +1109,8 @@ mod tests {
                 next_hop: Some([0x33; 16]),
                 remaining_hops: 1,
                 taken_hops: 1,
+                requested_mode: 1,
+                accepted_mtu_ceiling: 500,
                 validated: true,
                 expires_ms: 300,
             },
@@ -1152,6 +1170,8 @@ mod tests {
             next_hop: None,
             remaining_hops: 1,
             taken_hops: 1,
+            requested_mode: 1,
+            accepted_mtu_ceiling: 500,
             validated: false,
             expires_ms,
         }

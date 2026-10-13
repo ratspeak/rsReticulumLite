@@ -1054,3 +1054,42 @@ fn lite_link_identification_matches_trusted_peer_and_rejects_replay() {
     other_link[0] ^= 1;
     assert_eq!(verify_identification(&other_link, &plaintext), None);
 }
+
+#[test]
+fn checked_link_signalling_matches_current_trusted_rust_domain() {
+    use rns_lite_core::link::{LinkProofView, LinkRequestView, SignallingData};
+    use rns_wire::link_signalling::{parse_proof_signalling, parse_request_signalling};
+    for mode in 0..=7 {
+        for mtu in (0..=501).chain([0x1fffff]) {
+            let mut request = [0u8; 67];
+            request[64..].copy_from_slice(&SignallingData::new(mode, mtu).pack());
+            let trusted = parse_request_signalling(&request);
+            let lite = LinkRequestView::parse(&request);
+            assert_eq!(lite.is_ok(), trusted.is_ok());
+            if let (Ok(lite), Ok(trusted)) = (lite, trusted) {
+                assert_eq!(lite.signalling.mode, trusted.mode);
+                assert_eq!(lite.signalling.effective_mtu().unwrap(), trusted.mtu.get());
+            }
+            let mut proof = [0u8; 99];
+            proof[96..].copy_from_slice(&request[64..]);
+            assert_eq!(
+                LinkProofView::parse(&proof).is_ok(),
+                parse_proof_signalling(&proof).is_ok()
+            );
+        }
+    }
+    for (legacy, modern) in [(64, 67), (96, 99)] {
+        for len in 0..=100 {
+            let bytes = [0u8; 100];
+            let success = if legacy == 64 {
+                LinkRequestView::parse(&bytes[..len]).is_ok()
+            } else {
+                LinkProofView::parse(&bytes[..len]).is_ok()
+            };
+            assert_eq!(success, len == legacy || len == modern);
+        }
+    }
+    for mtu in [0x200000, u32::MAX] {
+        assert!(SignallingData::try_new(1, mtu).is_err());
+    }
+}

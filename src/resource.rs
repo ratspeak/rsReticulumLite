@@ -1061,6 +1061,26 @@ impl InboundResource {
         }
     }
 
+    /// Recognize a current-window part or a matching already-received duplicate.
+    /// Uses the trusted full Rust receiver's map-hash/window admission; duplicates
+    /// may credit Link liveness without back-filling the receiver's completed slots.
+    pub fn matches_part(&self, part: &[u8]) -> bool {
+        if !matches!(
+            self.state,
+            InboundState::Transferring | InboundState::Assembled
+        ) {
+            return false;
+        }
+        let start = self.consecutive_completed as usize;
+        let end = (start + self.window.window).min(self.num_parts as usize);
+        let hash = get_map_hash(part, &self.random_hash);
+        (0..self.num_parts as usize).any(|i| {
+            (self.received[i] || (i >= start && i < end))
+                && self.map_hashes[i] == hash
+                && part.len() == self.expected_part_len(i)
+        })
+    }
+
     /// Slot a received part (raw ciphertext chunk) by map hash within the current receive window.
     /// Returns true when it filled a previously-empty slot; duplicates, tampered parts and
     /// out-of-window arrivals return false (rns-protocol's replay-guarded scan, plus an exact
@@ -1619,18 +1639,22 @@ mod tests {
         let mut inb = InboundResource::from_advertisement(&adv).unwrap();
 
         // Window: part 4 is outside the initial window of 4 and must be refused for now.
+        assert!(!inb.matches_part(out.part(4).unwrap()));
         assert!(!inb.receive_part(out.part(4).unwrap()));
 
         // First window of parts, with a duplicate and a tampered copy rejected.
         for i in 0..4 {
             let part = out.part(i).unwrap();
+            assert!(inb.matches_part(part));
             assert!(inb.receive_part(part));
+            assert!(inb.matches_part(part));
             assert!(!inb.receive_part(part)); // duplicate
         }
         let p4 = out.part(4).unwrap();
         let mut tampered = [0u8; SDU];
         tampered[..p4.len()].copy_from_slice(p4);
         tampered[0] ^= 0xFF;
+        assert!(!inb.matches_part(&tampered[..p4.len()]));
         assert!(!inb.receive_part(&tampered[..p4.len()]));
 
         // Receiver requests the remainder; sender serves it.

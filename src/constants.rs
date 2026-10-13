@@ -28,7 +28,7 @@ pub const ROAMING_PATH_TIME_SECS: u32 = 21_600;
 pub const REVERSE_TIMEOUT_SECS: u32 = 480;
 pub const LINK_TIMEOUT_SECS: u32 = 900;
 // Matches upstream ESTABLISHMENT_TIMEOUT_PER_HOP / DEFAULT_PER_HOP_TIMEOUT (6s).
-// (The per-MTU extra_link_proof_timeout term is omitted as a deliberate simplification.)
+// discovery::link_deadline adds the sampled outbound bitrate serialization allowance.
 pub const LINK_PROOF_TIMEOUT_PER_HOP_SECS: u32 = 6;
 pub const PATH_REQUEST_TIMEOUT_SECS: u32 = 15;
 pub const PATH_REQUEST_DUPLICATE_GATE_SECS: u32 = 120;

@@ -239,6 +239,13 @@ pub struct TransportStats {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportError {
     InvalidConfig,
+    LinkCapacityUnavailable {
+        interface_id: InterfaceId,
+        clear_mtu: usize,
+        required: usize,
+    },
+    InvalidLinkSignalling,
+    UnsupportedTransitModeTransform,
     CapacityTooSmall,
     Wire(WireError),
     Buffer(BufferError),
@@ -284,6 +291,7 @@ impl From<KnownDestinationError> for TransportError {
 pub struct InterfaceFacts {
     pub generation: u32,
     pub bitrate_bps: u32,
+    pub clear_mtu: u16,
     pub id: u8,
     pub mode: InterfaceMode,
     // occupied1, outbound2, explicit host registration4, local client8.
@@ -293,6 +301,7 @@ impl InterfaceFacts {
     pub const EMPTY: Self = Self {
         generation: 0,
         bitrate_bps: 0,
+        clear_mtu: 500,
         id: 0,
         mode: InterfaceMode::Full,
         flags: 0,
@@ -785,7 +794,9 @@ impl<
             return false;
         };
         let previous = self.interface_facts[slot];
-        if previous.flags & 1 != 0 && (previous.generation != generation || !outbound) {
+        if previous.flags & 1 != 0
+            && (previous.generation != generation || previous.mode != mode || !outbound)
+        {
             self.retained_outbound_retire_interface(id);
         }
         self.interface_facts[slot] = InterfaceFacts {
@@ -793,6 +804,11 @@ impl<
             generation,
             mode,
             bitrate_bps,
+            clear_mtu: if previous.flags & 1 != 0 {
+                previous.clear_mtu
+            } else {
+                self.default_clear_mtu() as u16
+            },
             flags: 1
                 | 4
                 | if outbound && generation != 0 { 2 } else { 0 }
@@ -812,8 +828,60 @@ impl<
                 generation: 1,
                 mode: meta.interface_mode.unwrap_or(self.config.mode),
                 bitrate_bps: 0,
+                clear_mtu: self.default_clear_mtu() as u16,
                 flags: 1 | 2,
             };
+        }
+    }
+
+    fn default_clear_mtu(&self) -> usize {
+        // Conservative default for the fixed radio profile. Host interfaces with
+        // a different proven wire budget publish it explicitly below.
+        let tag = self.config.ifac.map_or(0, |ifac| usize::from(ifac.size));
+        crate::constants::MTU
+            .min(crate::constants::LORA_SPLIT_FRAME_PAYLOAD_MAX.saturating_sub(tag))
+    }
+
+    pub fn interface_clear_mtu(&self, id: InterfaceId) -> usize {
+        self.interface_slot(id).map_or_else(
+            || self.default_clear_mtu(),
+            |slot| usize::from(self.interface_facts[slot].clear_mtu),
+        )
+    }
+
+    /// Publish the host's measured clear-packet budget after IFAC/framing.
+    /// A changed capability retires existing Links before any new handshake.
+    pub fn update_interface_packet_capacity(
+        &mut self,
+        id: InterfaceId,
+        generation: u32,
+        clear_mtu: usize,
+    ) -> bool {
+        let Some(slot) = self.interface_slot(id) else {
+            return false;
+        };
+        if generation == 0 || self.interface_facts[slot].generation != generation {
+            return false;
+        }
+        let clear_mtu = clear_mtu.min(crate::constants::MTU) as u16;
+        if self.interface_facts[slot].clear_mtu != clear_mtu {
+            self.links.remove_interface(id);
+            self.interface_facts[slot].clear_mtu = clear_mtu;
+            self.expire_outbound(self.clock_ms);
+        }
+        true
+    }
+
+    pub fn require_link_capacity(&self, interface_id: InterfaceId) -> Result<(), TransportError> {
+        let clear_mtu = self.interface_clear_mtu(interface_id);
+        if clear_mtu < 500 {
+            Err(TransportError::LinkCapacityUnavailable {
+                interface_id,
+                clear_mtu,
+                required: 500,
+            })
+        } else {
+            Ok(())
         }
     }
 
@@ -997,6 +1065,7 @@ impl<
     /// this physical interface cannot bind its replacement to old queued bytes.
     #[doc(hidden)]
     pub fn retained_outbound_retire_interface(&mut self, interface: u8) {
+        self.links.remove_interface(interface);
         if let Some(slot) = self.interface_slot(interface) {
             self.discoveries.retire_requester(slot);
             self.interface_facts[slot].flags &= !2;
@@ -1107,7 +1176,16 @@ impl<
             raw
         };
 
+        if raw.len() > self.interface_clear_mtu(meta.interface_id) {
+            return Ok(IngestAction::Dropped);
+        }
         let view = PacketView::parse(raw)?;
+        if view.header.flags.packet_type == PacketType::LinkRequest {
+            crate::link::LinkRequestView::parse(view.payload)
+                .map_err(|_| TransportError::InvalidLinkSignalling)?;
+            self.require_link_capacity(meta.interface_id)?;
+        }
+
         self.stats.accepted = self.stats.accepted.saturating_add(1);
 
         // Python 1.3.8 (Packet.py:247) / trusted actor/inbound.rs: reject an on-wire hop count
@@ -1158,6 +1236,7 @@ impl<
         let defer_hashlist = self
             .links
             .contains_live(&view.header.destination_hash, now_ms)
+            || view.header.flags.packet_type == PacketType::LinkRequest
             || view.header.context == PacketContext::Lrproof
             || (view.header.flags.destination_type == DestinationType::Link
                 && local_link == Some(&view.header.destination_hash));
@@ -1550,11 +1629,29 @@ impl<
             return Ok(IngestAction::Dropped);
         }
 
-        let Some((target_interface, forwarded)) =
+        let Some((target_interface, mut forwarded)) =
             self.rewrite_forwarded_transport_packet(raw, original_header, header, now_ms)?
         else {
             return Ok(IngestAction::Dropped);
         };
+
+        self.require_link_capacity(meta.interface_id)?;
+        self.require_link_capacity(target_interface)?;
+        let request = crate::link::LinkRequestView::parse(&raw[original_header.size()..])
+            .map_err(|_| TransportError::InvalidLinkSignalling)?;
+        request
+            .signalling
+            .effective_mtu()
+            .map_err(|_| TransportError::InvalidLinkSignalling)?;
+        if request.signalling.mode == crate::link::DEFAULT_MODE {
+            // Fixed-capacity boundary: remove only a default-mode trailer. The
+            // Link ID excludes it and legacy mode/MTU remain AES256/500.
+            if raw.len() - original_header.size() == crate::link::LINK_REQUEST_LEN {
+                forwarded.set_len(forwarded.len() - crate::link::LINK_MTU_SIZE)?;
+            }
+        } else if request.signalling.mtu != 500 {
+            return Err(TransportError::UnsupportedTransitModeTransform);
+        }
 
         let entry = self
             .paths
@@ -1569,6 +1666,8 @@ impl<
                     next_hop: path.next_hop,
                     remaining_hops: path.hops,
                     taken_hops: header.hops,
+                    requested_mode: request.signalling.mode,
+                    accepted_mtu_ceiling: 500,
                     validated: false,
                     expires_ms: link_deadline(
                         now_ms,
@@ -1705,6 +1804,15 @@ impl<
             return Ok(false);
         };
 
+        if raw.len() > usize::from(link.accepted_mtu_ceiling)
+            || self
+                .require_link_capacity(link.receiving_interface)
+                .is_err()
+            || self.require_link_capacity(link.outbound_interface).is_err()
+        {
+            return Ok(true);
+        }
+
         let target_interface = if link.outbound_interface == link.receiving_interface {
             if header.hops == link.remaining_hops || header.hops == link.taken_hops {
                 link.outbound_interface
@@ -1766,6 +1874,22 @@ impl<
 
         let proof = &raw[payload_offset..];
         if proof.len() != 96 && proof.len() != 99 {
+            return false;
+        }
+
+        let Ok(parsed) = crate::link::LinkProofView::parse(proof) else {
+            return false;
+        };
+        if parsed.signalling.mode != link.requested_mode
+            || parsed
+                .signalling
+                .effective_mtu()
+                .map_or(true, |mtu| mtu > u32::from(link.accepted_mtu_ceiling))
+            || self
+                .require_link_capacity(link.receiving_interface)
+                .is_err()
+            || self.require_link_capacity(link.outbound_interface).is_err()
+        {
             return false;
         }
 
@@ -1946,6 +2070,10 @@ impl<
         reason: OutboundReason,
         lifetime: OutboundLifetime,
     ) -> bool {
+        if packet.len() > self.interface_clear_mtu(interface_id) {
+            self.stats.outbound_dropped = self.stats.outbound_dropped.saturating_add(1);
+            return false;
+        }
         let mut wire = WireBuffer::new();
         if let Some(ifac) = self.config.ifac {
             if ifac_sign_into(packet.as_slice(), &ifac.key, ifac.size, &mut wire).is_err() {
@@ -2292,17 +2420,20 @@ mod tests {
             action,
             IngestAction::LearnedAnnounce | IngestAction::ScheduledAnnounce
         ));
-        // Non-announce packets are NOT subject to the post-increment gate: a link request
-        // at raw M - 1 still reaches processing (dedup on re-ingest proves it).
-        let lr = link_request([0x36u8; 16], PATHFINDER_M - 1);
-        let first = node
-            .ingest(lr.as_slice(), RxMeta::new(IFACE), 1000)
-            .unwrap();
-        assert_ne!(first, IngestAction::Duplicate);
-        let second = node
-            .ingest(lr.as_slice(), RxMeta::new(IFACE), 1000)
-            .unwrap();
-        assert_eq!(second, IngestAction::Duplicate);
+        // Non-announce DATA still reaches the ordinary hashlist at raw M-1.
+        // Rejected Link requests deliberately do not consume duplicate state.
+        let mut data = h2_data([0x36; 16], b"boundary");
+        data.as_mut_slice()[1] = PATHFINDER_M - 1;
+        assert_ne!(
+            node.ingest(data.as_slice(), RxMeta::new(IFACE), 1000)
+                .unwrap(),
+            IngestAction::Duplicate
+        );
+        assert_eq!(
+            node.ingest(data.as_slice(), RxMeta::new(IFACE), 1000)
+                .unwrap(),
+            IngestAction::Duplicate
+        );
     }
 
     #[test]
@@ -2461,7 +2592,7 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&signing_seed);
         let identity_ed25519 = signing_key.verifying_key();
         let responder_x25519 = [0xD1; 32];
-        let signalling = [0x00, 0x01, 0xF4];
+        let signalling = [0x20, 0x01, 0xF4];
 
         let mut signed = Vec::new();
         signed.extend_from_slice(&link_id);
@@ -3629,7 +3760,7 @@ mod tests {
         // Cardputer budget (no PSRAM, ~55 KB free heap): the MICRO node must stay <= 32 KB so
         // cap drift can't silently blow the internal-heap allocation.
         let micro = core::mem::size_of::<MicroNode>();
-        assert_eq!(micro, 32_664, "MicroNode layout changed unexpectedly");
+        assert_eq!(micro, 32_728, "MicroNode layout changed unexpectedly");
         assert!(micro <= 32 * 1024, "MicroNode grew to {micro} B (> 32 KB)");
         std::println!(
             "MicroNode={micro} SmallNode={} Esp32PsramNode={} OutboundFrame={} OutboundLifetime={} token={}",
@@ -3715,11 +3846,8 @@ mod tests {
 
     #[test]
     fn enqueue_wraps_max_ifac_at_exact_wire_budget() {
-        // WIRE_MTU_MAX = MTU + IFAC_KEY_LENGTH: the worst case (full-MTU clear packet,
-        // maximum 64-byte tag) fits exactly, so enqueue's failure branch is currently
-        // unreachable — the fallible signature exists for canon-shape parity with the
-        // rsNode copy (per-interface budgets) and for any future tighter wire budget.
-        // Callers must keep the send-before-record ordering regardless.
+        // A proven wide host interface can use all564 wire bytes; the radio
+        // default remains508 and is tested separately below.
         let mut config = LiteConfig::ESP32_LORA_TRANSPORT_SMALL;
         config.ifac = Some(crate::config::IfacConfig {
             key: [0x11; 64],
@@ -3727,6 +3855,8 @@ mod tests {
         });
         let mut node = SmallNode::new(config, TRANSPORT_ID).unwrap();
 
+        assert!(node.update_interface(1, 1, InterfaceMode::Full, 0, true, false));
+        assert!(node.update_interface_packet_capacity(1, 1, 500));
         let full = PacketBuffer::from_slice(&[0x5A; crate::constants::MTU]).unwrap();
         assert!(node.enqueue(1, full, OutboundReason::TransportForward));
         assert_eq!(node.outbound_len(), 1);
@@ -4084,6 +4214,168 @@ mod tests {
             invalid[16..24].copy_from_slice(&expiry.to_le_bytes());
             assert!(OutboundLifetime::from_token(&invalid).is_none());
         }
+    }
+    #[test]
+    fn general_link_radio_ifac_boundary_preserves_fitting_non_link_traffic() {
+        for size in 0..=64 {
+            let mut config = LiteConfig::ESP32_LORA_TRANSPORT_SMALL;
+            if size > 0 {
+                config.ifac = Some(crate::config::IfacConfig {
+                    key: [0x11; 64],
+                    size,
+                });
+            }
+            let mut n = SmallNode::new(config, TRANSPORT_ID).unwrap();
+            let tag = usize::from(size);
+            let clear = 500usize.min(508 - tag);
+            assert_eq!(n.require_link_capacity(IFACE).is_ok(), size <= 8);
+            let data = h2_data([0x55; 16], b"fitting non-Link packet");
+            assert!(n.enqueue(IFACE, data, OutboundReason::TransportForward));
+            let frame = n.poll_tx().unwrap();
+            assert_eq!(frame.packet.len(), data.len() + tag);
+            let request = link_request([0x66; 16], 0);
+            let mut wire = WireBuffer::new();
+            if size > 0 {
+                ifac_sign_into(request.as_slice(), &[0x11; 64], size, &mut wire).unwrap();
+            } else {
+                wire.extend_from_slice(request.as_slice()).unwrap();
+            }
+            let hashes = n.packet_hashes;
+            let result = n.ingest(wire.as_slice(), RxMeta::new(IFACE), 1000);
+            if size > 8 {
+                assert_eq!(
+                    result,
+                    Err(TransportError::LinkCapacityUnavailable {
+                        interface_id: IFACE,
+                        clear_mtu: clear,
+                        required: 500
+                    })
+                );
+                assert_eq!(n.packet_hashes, hashes);
+                assert_eq!(n.outbound_len(), 0);
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+    #[test]
+    fn capacity_revisions_retire_links_and_reject_stale_host_updates() {
+        let mut n = node();
+        assert!(n.update_interface(IFACE, 7, InterfaceMode::Full, 1000, true, false));
+        let ann = signed_announce([0x71; 32], "lxmf.delivery", b"receiver");
+        n.ingest(ann.raw.as_slice(), RxMeta::new(IFACE), 1000)
+            .unwrap();
+        while n.poll_tx().is_some() {}
+        let request = link_request(ann.destination_hash, 0);
+        let id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
+        n.ingest(request.as_slice(), RxMeta::new(9), 1100).unwrap();
+        assert!(n.links.get(&id, 1100).is_some());
+        assert!(!n.update_interface_packet_capacity(IFACE, 6, 499));
+        assert!(n.links.get(&id, 1100).is_some());
+        assert!(n.update_interface_packet_capacity(IFACE, 7, 499));
+        assert!(n.links.get(&id, 1100).is_none());
+        assert!(n.poll_tx().is_none());
+        assert!(n.update_interface_packet_capacity(IFACE, 7, 500));
+        n.ingest(request.as_slice(), RxMeta::new(9), 1200).unwrap();
+        assert!(n.links.get(&id, 1200).is_some());
+        assert!(n.update_interface(IFACE, 8, InterfaceMode::Full, 1000, true, false));
+        assert!(n.links.get(&id, 1200).is_none());
+        assert!(!n.update_interface_packet_capacity(IFACE, 7, 444));
+        assert_eq!(n.interface_clear_mtu(IFACE), 500);
+    }
+
+    #[test]
+    fn checked_transit_clamps_only_default_requests_without_changing_link_id() {
+        for mode in 0..=7 {
+            for mtu in [0, 499, 500, 501, 0x1fffff] {
+                let mut n = node();
+                let ann = signed_announce([0x71; 32], "lxmf.delivery", b"receiver");
+                n.ingest(ann.raw.as_slice(), RxMeta::new(IFACE), 1000)
+                    .unwrap();
+                while n.poll_tx().is_some() {}
+                let mut request = link_request(ann.destination_hash, 0);
+                request
+                    .extend_from_slice(&crate::link::SignallingData::new(mode, mtu).pack())
+                    .unwrap();
+                let id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
+                let before = n.packet_hashes;
+                let result = n.ingest(request.as_slice(), RxMeta::new(9), 1100);
+                if mtu == 499 || (mode != 1 && mtu != 500) {
+                    assert!(result.is_err());
+                    assert!(n.links.get(&id, 1100).is_none());
+                    assert_eq!(n.outbound_len(), 0);
+                    assert_eq!(n.packet_hashes, before);
+                } else {
+                    assert_eq!(result, Ok(IngestAction::ForwardedTransport));
+                    let forwarded = n.poll_tx().unwrap();
+                    let view = PacketView::parse(forwarded.packet.as_slice()).unwrap();
+                    assert_eq!(
+                        link_id_from_raw(
+                            forwarded.packet.as_slice(),
+                            view.header.flags.header_type
+                        ),
+                        id
+                    );
+                    assert_eq!(view.payload.len(), if mode == 1 { 64 } else { 67 });
+                    if mode != 1 {
+                        assert_eq!(
+                            &view.payload[64..],
+                            &request.as_slice()[request.len() - 3..]
+                        );
+                    }
+                    let pending = *n.links.get(&id, 1100).unwrap();
+                    assert_eq!(pending.requested_mode, mode);
+                    assert_eq!(pending.accepted_mtu_ceiling, 500);
+                    // Same ID with a different suffix cannot replace ownership/deadline.
+                    let _ = n.ingest(request.as_slice(), RxMeta::new(9), 1200);
+                    assert_eq!(*n.links.get(&id, 1200).unwrap(), pending);
+                    assert!(n.poll_tx().is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn signed_transit_proof_mode_and_mtu_gate_preserves_pending_owner() {
+        let mut n = node();
+        let seed = [0x71; 32];
+        let ann = signed_announce(seed, "lxmf.delivery", b"receiver");
+        n.ingest(ann.raw.as_slice(), RxMeta::new(IFACE), 1000)
+            .unwrap();
+        while n.poll_tx().is_some() {}
+        let request = link_request(ann.destination_hash, 0);
+        let id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
+        n.ingest(request.as_slice(), RxMeta::new(9), 1100).unwrap();
+        while n.poll_tx().is_some() {}
+        let pending = *n.links.get(&id, 1100).unwrap();
+        for (mode, mtu) in [(0, 500), (7, 500), (1, 499), (1, 501)] {
+            let mut proof = lrproof(id, 0, seed);
+            let offset = PacketView::parse(proof.as_slice()).unwrap().header.size();
+            let trailer = crate::link::SignallingData::new(mode, mtu).pack();
+            proof.as_mut_slice()[offset + 96..offset + 99].copy_from_slice(&trailer);
+            let signer = SigningKey::from_bytes(&seed);
+            let mut signed = Vec::new();
+            signed.extend_from_slice(&id);
+            signed.extend_from_slice(&proof.as_slice()[offset + 64..offset + 96]);
+            signed.extend_from_slice(signer.verifying_key().as_bytes());
+            signed.extend_from_slice(&trailer);
+            proof.as_mut_slice()[offset..offset + 64]
+                .copy_from_slice(&signer.sign(&signed).to_bytes());
+            assert_eq!(
+                n.ingest(proof.as_slice(), RxMeta::new(IFACE), 1200)
+                    .unwrap(),
+                IngestAction::Dropped
+            );
+            assert_eq!(*n.links.get(&id, 1200).unwrap(), pending);
+            assert!(n.poll_tx().is_none());
+        }
+        let valid = lrproof(id, 0, seed);
+        assert_eq!(
+            n.ingest(valid.as_slice(), RxMeta::new(IFACE), 1300)
+                .unwrap(),
+            IngestAction::ForwardedProof
+        );
+        assert!(n.links.get(&id, 1300).unwrap().validated);
     }
 }
 
