@@ -22,7 +22,7 @@ if RNS.__version__ != target:
     sys.exit(1)
 EOF
 
-out="$(cargo test --manifest-path "$repo/Cargo.toml" -p rns-lite-core --test resource_vectors \
+out="$(cargo +1.89.0 test --locked --manifest-path "$repo/Cargo.toml" -p rns-lite-core --test resource_vectors \
     emit_resource_transfer_for_python -- --exact --nocapture)"
 echo "$out" | grep -c "^test .* ok$" >/dev/null
 echo "$out" | python3 "$here/verify_rust_resource.py"

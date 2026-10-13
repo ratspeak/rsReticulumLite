@@ -10,12 +10,12 @@ permissions:
   contents: read
 
 env:
-  RSLITE_RSRETICULUM_COMMIT: 4bba059d9343bd1296e5524a1c644a5137356dd7
+  RSLITE_RSRETICULUM_COMMIT: 817a640ed1e11e3ff3e0ff048d8de13662bfdd78
   RSLITE_PYTHON_RNS_VERSION: "1.4.2"
 
 jobs:
   quality:
-    name: Full no_std matrix (Rust 1.87)
+    name: MCU 1.87 and host parity 1.89 matrix
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -35,6 +35,10 @@ jobs:
           toolchain: 1.87.0
           components: clippy, rustfmt
           targets: thumbv7em-none-eabihf,riscv32imc-unknown-none-elf
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: 1.89.0
+          components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rsReticulumLite -> target
@@ -94,7 +98,7 @@ jobs:
           path: rsReticulum
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
-          toolchain: 1.87.0
+          toolchain: 1.89.0
       - name: Install exact Python validator
         run: python3 -m pip install --disable-pip-version-check "rns==$RSLITE_PYTHON_RNS_VERSION"
       - run: ./vectors/run.sh

@@ -30,13 +30,15 @@ For LXMF messages, use [rsLXMFLite](https://github.com/ratspeak/rsLXMFLite).
 
 ## Build and test
 
-Install Rust through `rustup`; the repository selects Rust 1.87 and the
-bare-metal check targets. From a new working directory:
+Install Rust through `rustup`; the production library and bare-metal checks
+use Rust 1.87. Host compatibility tests also require Rust 1.89 because they
+compile the full rsReticulum reference. From a new working directory:
 
 ```sh
 git clone https://github.com/ratspeak/rsReticulumLite.git
 git clone https://github.com/ratspeak/rsReticulum.git
 cd rsReticulumLite
+rustup toolchain install 1.89.0 --component clippy
 while read -r repository revision; do
   git -C "../$repository" checkout --detach "$revision"
 done < TRUSTED_REF
