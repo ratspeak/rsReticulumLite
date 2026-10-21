@@ -78,7 +78,8 @@ pub fn build_identification(
 /// Verify exactly one decrypted LINKIDENTIFY public-key/signature payload.
 /// Adapted from the pinned trusted `rns-link::Link::handle_identification`.
 ///
-/// The owner must first authenticate/decrypt on the exact ACTIVE Link and then
+/// The owner must first authenticate/decrypt on the exact responder Link, from the
+/// handshake on (an initiator may identify before its RTT packet arrives), and then
 /// enforce first-identity-wins. A later valid identification must never replace
 /// an already recorded peer or trigger a second identity callback. This stateless
 /// primitive does not activate a Link, admit a caller, or mutate peer state.
