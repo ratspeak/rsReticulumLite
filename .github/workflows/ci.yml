@@ -71,14 +71,14 @@ jobs:
           path: rsReticulum
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
-          toolchain: stable
+          toolchain: 1.96.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: rsReticulumLite -> target
           cache-bin: false
-      - run: cargo +stable test --workspace --locked
+      - run: cargo +1.96.0 test --workspace --locked
         working-directory: rsReticulumLite
-      - run: cargo +stable check --manifest-path tests/api/Cargo.toml --locked
+      - run: cargo +1.96.0 check --manifest-path tests/api/Cargo.toml --locked
         working-directory: rsReticulumLite
 
   python-vectors:
