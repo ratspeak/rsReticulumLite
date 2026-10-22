@@ -748,6 +748,13 @@ impl<const N: usize> LinkTable<N> {
         }
     }
 
+    /// Room for another Link without evicting a live one (trusted refuses new
+    /// transit Links at capacity).
+    pub fn has_free_slot(&mut self, now_ms: u64) -> bool {
+        self.expire(now_ms);
+        self.entries.iter().any(Option::is_none)
+    }
+
     pub fn get(&self, link_id: &Hash16, now_ms: u64) -> Option<&LinkEntry> {
         self.entries
             .iter()

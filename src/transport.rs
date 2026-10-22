@@ -1665,6 +1665,11 @@ impl<
         if self.links.contains_live(&link_id, now_ms) {
             return Ok(IngestAction::Dropped);
         }
+        // Trusted inbound.rs: a full transit table refuses the request instead
+        // of evicting a Link that may still carry traffic.
+        if !self.links.has_free_slot(now_ms) {
+            return Ok(IngestAction::Dropped);
+        }
 
         let Some((target_interface, mut forwarded)) =
             self.rewrite_forwarded_transport_packet(raw, original_header, header, now_ms)?
@@ -3636,6 +3641,44 @@ mod tests {
         let view = PacketView::parse(out.packet.as_slice()).unwrap();
         assert_eq!(view.header.flags.packet_type, PacketType::Proof);
         assert_eq!(view.header.destination_hash, proof_hash);
+    }
+
+    #[test]
+    fn full_transit_link_table_refuses_instead_of_evicting() {
+        let announce = signed_announce([0x1A; 32], "lxmf.delivery", b"node");
+        let mut node = node();
+        node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
+            .unwrap();
+        let _rebroadcast = node.poll_tx();
+        let request = |seed: u8| {
+            let mut request = link_request(announce.destination_hash, 0);
+            let last = request.len() - 1;
+            request.as_mut_slice()[last] = seed;
+            request
+        };
+        let first = request(0);
+        for seed in 0..32u8 {
+            assert_eq!(
+                node.ingest(request(seed).as_slice(), RxMeta::new(9), 1100)
+                    .unwrap(),
+                IngestAction::ForwardedTransport,
+                "link {seed}"
+            );
+            let _ = node.poll_tx();
+        }
+        assert_eq!(
+            node.ingest(request(32).as_slice(), RxMeta::new(9), 1100)
+                .unwrap(),
+            IngestAction::Dropped
+        );
+        // The oldest Link still owns its route.
+        let link_id = link_id_from_raw(first.as_slice(), HeaderType::Header2);
+        let packet = link_packet(link_id, 0, PacketContext::Channel);
+        assert_eq!(
+            node.ingest(packet.as_slice(), RxMeta::new(9), 1200)
+                .unwrap(),
+            IngestAction::ForwardedTransport
+        );
     }
 
     #[test]
