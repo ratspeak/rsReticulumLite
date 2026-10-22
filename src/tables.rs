@@ -457,6 +457,10 @@ pub struct ScheduledAnnounce {
     pub due_ms: u64,
     pub expires_ms: u64,
     pub block_rebroadcast: bool,
+    /// Post-increment hops of the learned announce (trusted `AnnounceEntry::hops`).
+    pub hops: u8,
+    pub retries: u8,
+    pub local_rebroadcasts: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -503,6 +507,21 @@ impl<const N: usize> AnnounceSchedule<N> {
             .iter()
             .position(|entry| entry.is_some_and(|entry| now_ms >= entry.due_ms))?;
         self.entries[idx].take()
+    }
+
+    pub fn get_mut(&mut self, destination_hash: &Hash16) -> Option<&mut ScheduledAnnounce> {
+        self.entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.destination_hash == *destination_hash)
+    }
+
+    pub fn remove(&mut self, destination_hash: &Hash16) {
+        for slot in &mut self.entries {
+            if slot.is_some_and(|entry| entry.destination_hash == *destination_hash) {
+                *slot = None;
+            }
+        }
     }
 
     pub fn expire(&mut self, now_ms: u64) {
@@ -903,6 +922,9 @@ mod tests {
             due_ms,
             expires_ms,
             block_rebroadcast: false,
+            hops: 1,
+            retries: 0,
+            local_rebroadcasts: 0,
         }
     }
 

@@ -22,6 +22,9 @@ pub const LORA_SPLIT_FRAME_PAYLOAD_MAX: usize = LORA_FRAME_PAYLOAD_MAX * 2;
 pub const WIRE_MTU_MAX: usize = MTU + SIGNATURE_LENGTH;
 
 pub const PATHFINDER_M: u8 = 128;
+pub const PATHFINDER_R: u8 = 1;
+pub const PATHFINDER_G_SECS: u32 = 5;
+pub const LOCAL_REBROADCASTS_MAX: u8 = 2;
 pub const PATHFINDER_E_SECS: u32 = 604_800;
 pub const AP_PATH_TIME_SECS: u32 = 86_400;
 pub const ROAMING_PATH_TIME_SECS: u32 = 21_600;
@@ -46,6 +49,9 @@ mod tests {
         // Timing
         assert_eq!(LINK_PROOF_TIMEOUT_PER_HOP_SECS, 6); // DEFAULT_PER_HOP_TIMEOUT
         assert_eq!(PATHFINDER_E_SECS, 604_800); // PATHFINDER_E (7d)
+        assert_eq!(PATHFINDER_R, 1); // PATHFINDER_R (one retransmit retry)
+        assert_eq!(PATHFINDER_G_SECS, 5); // PATHFINDER_G (retry grace)
+        assert_eq!(LOCAL_REBROADCASTS_MAX, 2); // LOCAL_REBROADCASTS_MAX
         assert_eq!(AP_PATH_TIME_SECS, 86_400); // AP_PATH_TIME (24h)
         assert_eq!(ROAMING_PATH_TIME_SECS, 21_600); // ROAMING_PATH_TIME (6h)
         // Wire lengths

@@ -3,8 +3,9 @@ use ed25519_dalek::Verifier;
 use crate::announce_admission::AnnounceAdmission;
 use crate::config::{InterfaceMode, LiteConfig};
 use crate::constants::{
-    AP_PATH_TIME_SECS, LINK_TIMEOUT_SECS, PATH_REQUEST_DUPLICATE_GATE_SECS, PATHFINDER_E_SECS,
-    PATHFINDER_M, QUEUED_ANNOUNCE_LIFE_SECS, REVERSE_TIMEOUT_SECS, ROAMING_PATH_TIME_SECS,
+    AP_PATH_TIME_SECS, LINK_TIMEOUT_SECS, LOCAL_REBROADCASTS_MAX, PATH_REQUEST_DUPLICATE_GATE_SECS,
+    PATHFINDER_E_SECS, PATHFINDER_G_SECS, PATHFINDER_M, PATHFINDER_R, QUEUED_ANNOUNCE_LIFE_SECS,
+    REVERSE_TIMEOUT_SECS, ROAMING_PATH_TIME_SECS,
 };
 use crate::discovery::{
     BeginDiscovery, Discoveries, REQUEST_GATE_MS, REQUESTERS, discovery_timeout, link_deadline,
@@ -41,7 +42,7 @@ pub const OWN_DESTINATIONS_MAX: usize = 4;
 
 const HASHLIST_LIFETIME_MS: u64 = 120_000;
 // Upstream PATHFINDER_RW = 0.5s: announce rebroadcast jitter window is [0,500)ms.
-// (The deterministic packet-hash-derived selection is a sound no-RNG MCU adaptation.)
+// (No RNG on MCUs: the offset mixes the packet hash with the node's transport ID.)
 const DEFAULT_ANNOUNCE_JITTER_MS: u64 = 500;
 // Sized to the full single-packet announce signed_data (incl. wire-max app_data), shared with the
 // endpoint path so the relay can't reject a long-display-name announce the endpoint would accept.
@@ -1098,14 +1099,15 @@ impl<
         self.request_tags.expire(now_ms);
         self.expire_outbound(now_ms);
 
-        while let Some(announce) = self.announce_schedule.pop_due(now_ms) {
+        while let Some(mut announce) = self.announce_schedule.pop_due(now_ms) {
             let Some(path) = self.paths.get_live(&announce.destination_hash, now_ms) else {
                 continue;
             };
+            let path_hash = path.packet_hash;
             if !announce.block_rebroadcast
                 && PacketView::parse(announce.packet.as_slice()).map_or(true, |view| {
                     packet_hash(announce.packet.as_slice(), view.header.flags.header_type)
-                        != path.packet_hash
+                        != path_hash
                 })
             {
                 continue;
@@ -1119,6 +1121,18 @@ impl<
                     OutboundReason::AnnounceRebroadcast
                 },
             );
+            // Trusted maintenance.rs: count the send, retry once PATHFINDER_G later.
+            announce.retries = announce.retries.saturating_add(1);
+            if !announce.block_rebroadcast && announce.retries <= PATHFINDER_R {
+                announce.due_ms = now_ms
+                    .saturating_add(u64::from(PATHFINDER_G_SECS) * 1000)
+                    .saturating_add(announce_jitter_ms(
+                        &path_hash,
+                        &self.transport_id,
+                        announce.retries,
+                    ));
+                self.announce_schedule.insert(announce, now_ms);
+            }
         }
     }
 
@@ -1338,6 +1352,26 @@ impl<
             announce.validate(&header.destination_hash, known_public_key, &mut scratch)?;
 
         let packet_hash = packet_hash(raw, view.header.flags.header_type);
+        // Trusted inbound.rs: a neighbour carrying our queued rebroadcast cancels its retry. A
+        // same-hop copy counts toward LOCAL_REBROADCASTS_MAX; a hops+1 copy before the retry is
+        // due was passed on. Runs before the path update, which may replace the entry.
+        if self.config.transport_enabled {
+            let wire_hops = view.header.hops;
+            let mut cancel = false;
+            if let Some(entry) = self.announce_schedule.get_mut(&header.destination_hash) {
+                if entry.retries > 0 {
+                    if wire_hops == entry.hops {
+                        entry.local_rebroadcasts = entry.local_rebroadcasts.saturating_add(1);
+                        cancel = entry.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX;
+                    } else if wire_hops == entry.hops.saturating_add(1) && now_ms < entry.due_ms {
+                        cancel = true;
+                    }
+                }
+            }
+            if cancel {
+                self.announce_schedule.remove(&header.destination_hash);
+            }
+        }
         // Path expiry belongs to the receiving interface (trusted PathEntry::new), not the
         // node as a whole. Hosts predating the interface-scoped metadata retain the configured
         // node-wide mode as a compatibility fallback.
@@ -1402,7 +1436,7 @@ impl<
                     header.hops,
                     PacketContext::None,
                 ) {
-                    let jitter = announce_jitter_ms(&packet_hash);
+                    let jitter = announce_jitter_ms(&packet_hash, &self.transport_id, 0);
                     self.announce_schedule.insert(
                         ScheduledAnnounce {
                             destination_hash: header.destination_hash,
@@ -1412,6 +1446,9 @@ impl<
                             expires_ms: now_ms
                                 .saturating_add((QUEUED_ANNOUNCE_LIFE_SECS as u64) * 1000),
                             block_rebroadcast: false,
+                            hops: header.hops,
+                            retries: 0,
+                            local_rebroadcasts: 0,
                         },
                         now_ms,
                     );
@@ -2118,8 +2155,13 @@ pub fn path_request_destination() -> Hash16 {
     destination_hash_from_name("rnstransport.path.request", None)
 }
 
-fn announce_jitter_ms(packet_hash: &[u8; 32]) -> u64 {
-    let raw = u16::from_be_bytes([packet_hash[0], packet_hash[1]]) as u64;
+// Distinct per node and per retry round, so co-located relays do not collide repeatedly.
+fn announce_jitter_ms(packet_hash: &[u8; 32], transport_id: &Hash16, round: u8) -> u64 {
+    let i = usize::from(round.min(PATHFINDER_R)) * 2;
+    let raw = u16::from_be_bytes([
+        packet_hash[i] ^ transport_id[i],
+        packet_hash[i + 1] ^ transport_id[i + 1],
+    ]) as u64;
     raw % DEFAULT_ANNOUNCE_JITTER_MS
 }
 
@@ -2959,6 +3001,117 @@ mod tests {
         assert_eq!(view.header.transport_id, Some(TRANSPORT_ID));
         assert_eq!(view.header.flags.packet_type, PacketType::Announce);
         assert_eq!(view.header.hops, 1);
+    }
+
+    // A neighbouring relay's actual rebroadcast of `raw`: Header2, its transport ID, hops + 1.
+    fn relay_copy(raw: &[u8], relay: [u8; 16], now_ms: u64) -> WireBuffer {
+        let mut relay_node = SmallNode::new(LiteConfig::ESP32_LORA_TRANSPORT_SMALL, relay).unwrap();
+        assert_eq!(
+            relay_node.ingest(raw, RxMeta::new(IFACE), now_ms).unwrap(),
+            IngestAction::ScheduledAnnounce
+        );
+        relay_node.tick(now_ms + 500);
+        relay_node.poll_tx().expect("relay rebroadcast").packet
+    }
+
+    #[test]
+    fn announce_rebroadcast_retries_once_after_pathfinder_g() {
+        let announce = signed_announce([0x13; 32], "lxmf.delivery", b"retry");
+        let mut node = node();
+        assert_eq!(
+            node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
+                .unwrap(),
+            IngestAction::ScheduledAnnounce
+        );
+
+        node.tick(1500);
+        let first = node.poll_tx().expect("first rebroadcast");
+        assert_eq!(first.reason, OutboundReason::AnnounceRebroadcast);
+
+        node.tick(6499);
+        assert!(node.poll_tx().is_none(), "the retry waits PATHFINDER_G");
+        node.tick(7000);
+        let retry = node.poll_tx().expect("one retry");
+        assert_eq!(retry.reason, OutboundReason::AnnounceRebroadcast);
+        assert_eq!(retry.packet, first.packet);
+
+        node.tick(60_000);
+        assert!(node.poll_tx().is_none(), "PATHFINDER_R allows one retry");
+        assert_eq!(node.announce_schedule.entries.iter().flatten().count(), 0);
+    }
+
+    #[test]
+    fn local_rebroadcasts_cancel_the_pending_retry() {
+        let announce = signed_announce([0x14; 32], "lxmf.delivery", b"local");
+        let neighbour = relay_copy(announce.raw.as_slice(), [0x43; 16], 1000);
+        let mut node = node();
+        node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
+            .unwrap();
+
+        // Trusted counts neighbour copies only after our own first send.
+        assert_eq!(
+            node.ingest(neighbour.as_slice(), RxMeta::new(IFACE), 1100)
+                .unwrap(),
+            IngestAction::AnnounceIgnored
+        );
+        node.tick(1500);
+        assert!(node.poll_tx().is_some());
+
+        node.ingest(neighbour.as_slice(), RxMeta::new(IFACE), 2000)
+            .unwrap();
+        assert_eq!(
+            node.announce_schedule.entries.iter().flatten().count(),
+            1,
+            "one local copy stays below LOCAL_REBROADCASTS_MAX"
+        );
+        node.ingest(neighbour.as_slice(), RxMeta::new(IFACE), 2100)
+            .unwrap();
+        node.tick(10_000);
+        assert!(
+            node.poll_tx().is_none(),
+            "LOCAL_REBROADCASTS_MAX copies cancel the retry"
+        );
+    }
+
+    #[test]
+    fn passed_on_rebroadcast_cancels_the_pending_retry() {
+        let announce = signed_announce([0x15; 32], "lxmf.delivery", b"passed");
+        let first_hop = relay_copy(announce.raw.as_slice(), [0x43; 16], 1000);
+        let second_hop = relay_copy(first_hop.as_slice(), [0x44; 16], 1000);
+        let mut node = node();
+        node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
+            .unwrap();
+        node.tick(1500);
+        assert!(node.poll_tx().is_some());
+
+        assert_eq!(
+            node.ingest(second_hop.as_slice(), RxMeta::new(IFACE), 2000)
+                .unwrap(),
+            IngestAction::AnnounceIgnored
+        );
+        node.tick(10_000);
+        assert!(
+            node.poll_tx().is_none(),
+            "a hops+1 copy before the retry means it was passed on"
+        );
+    }
+
+    #[test]
+    fn rebroadcast_jitter_differs_between_relays() {
+        let announce = signed_announce([0x17; 32], "lxmf.delivery", b"jitter");
+        let due = |relay: [u8; 16]| {
+            let mut n = SmallNode::new(LiteConfig::ESP32_LORA_TRANSPORT_SMALL, relay).unwrap();
+            n.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
+                .unwrap();
+            n.announce_schedule
+                .entries
+                .iter()
+                .flatten()
+                .next()
+                .unwrap()
+                .due_ms
+        };
+        assert_ne!(due([0x42; 16]), due([0x43; 16]));
     }
 
     #[test]
