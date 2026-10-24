@@ -1115,3 +1115,82 @@ fn announce_cap_spacing_matches_rsreticulum() {
         }
     }
 }
+
+#[test]
+fn link_session_serves_a_trusted_initiator_end_to_end() {
+    use rns_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
+    use rns_link::link::{CloseReason, Link};
+    use rns_lite_core::identity::LocalIdentity;
+    use rns_lite_core::link_session::{KEEPALIVE_REQUEST, Received, ResponderSession};
+    use rns_lite_core::wire::PacketContext;
+
+    let responder = LocalIdentity::from_private_key(&[0x41; 64]);
+    let destination = responder.destination_hash("rsnode.manage");
+    let responder_ed: [u8; 32] = responder.public_key()[32..].try_into().unwrap();
+    let verify = Ed25519PublicKey::from_bytes(&responder_ed).unwrap();
+    let owner = LocalIdentity::from_private_key(&[0x71; 64]);
+    let owner_seed: [u8; 32] = owner.private_key()[32..].try_into().unwrap();
+    let mut buf = [0u8; 512];
+    let mut out = [0u8; 512];
+
+    let open = |hops| {
+        let (mut initiator, request) = Link::new_initiator(destination, hops);
+        let mut proof = [0u8; 99];
+        let (mut session, len) = ResponderSession::accept(
+            &responder,
+            &destination,
+            &request,
+            hops,
+            &[0x55; 32],
+            0,
+            &mut proof,
+        )
+        .unwrap();
+        assert_eq!(session.link_id(), initiator.link_id);
+        let rtt = initiator
+            .validate_proof(&proof[..len], &verify, &responder_ed)
+            .unwrap();
+        let mut scratch = [0u8; 64];
+        assert_eq!(
+            session.receive(PacketContext::Lrrtt, &rtt, 40, &mut scratch),
+            Ok(Received::Activated)
+        );
+        (initiator, session)
+    };
+
+    let (mut initiator, mut session) = open(2);
+    let identify = initiator
+        .identify(
+            owner.public_key(),
+            &Ed25519PrivateKey::from_bytes(&owner_seed),
+        )
+        .unwrap();
+    assert_eq!(
+        session.receive(PacketContext::LinkIdentify, &identify, 50, &mut buf),
+        Ok(Received::Identified(*owner.public_key()))
+    );
+    assert_eq!(session.remote_identity_hash(), Some(*owner.identity_hash()));
+
+    let request = initiator.encrypt(b"status").unwrap();
+    assert_eq!(
+        session.receive(PacketContext::None, &request, 60, &mut buf),
+        Ok(Received::Data(6))
+    );
+    assert_eq!(&buf[..6], b"status");
+    let len = session.seal(b"reply", &[3; 16], &mut out, 70).unwrap();
+    assert_eq!(initiator.decrypt(&out[..len]).unwrap(), b"reply");
+    assert_eq!(
+        session.receive(PacketContext::Keepalive, &[KEEPALIVE_REQUEST], 80, &mut buf),
+        Ok(Received::Keepalive { respond: false })
+    );
+
+    let len = session.teardown(&[4; 16], &mut out).unwrap();
+    assert!(initiator.receive_teardown(&out[..len]));
+
+    let (mut initiator, mut session) = open(1);
+    let close = initiator.teardown(CloseReason::InitiatorClosed).unwrap();
+    assert_eq!(
+        session.receive(PacketContext::LinkClose, &close, 90, &mut buf),
+        Ok(Received::Closed)
+    );
+}

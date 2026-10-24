@@ -25,6 +25,7 @@ pub mod identity;
 pub mod ifac;
 pub mod known_destinations;
 pub mod link;
+pub mod link_session;
 pub mod lora;
 pub mod packet_buffer;
 pub mod proof;
