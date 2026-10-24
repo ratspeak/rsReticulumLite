@@ -1,3 +1,4 @@
+use crate::announce_cap::release_precedes;
 use crate::constants::{PACKET_HASH_LENGTH, PUBLIC_KEY_LENGTH, RANDOM_HASH_LENGTH};
 use crate::packet_buffer::PacketBuffer;
 
@@ -202,6 +203,9 @@ pub struct PathEntry {
     pub packet_hash: Hash32,
     pub random_hash: [u8; RANDOM_HASH_LENGTH],
     pub public_key: [u8; PUBLIC_KEY_LENGTH],
+    /// Learned from an unsolicited announce on a bulk interface (an uplink to a busy hub):
+    /// evicted before any other path, and never displaces one.
+    pub bulk: bool,
 }
 
 impl PathEntry {
@@ -341,7 +345,7 @@ impl<const N: usize> PathTable<N> {
             .entries
             .iter()
             .position(Option::is_none)
-            .or_else(|| oldest_index(&self.entries, |entry| entry.expires_ms));
+            .or_else(|| class_victim(&self.entries, entry.bulk, |e| e.bulk, |e| e.expires_ms));
         if let Some(idx) = replacement {
             self.replace_entry(idx, entry)
         } else {
@@ -380,6 +384,8 @@ pub struct CachedAnnounce {
     pub raw: PacketBuffer,
     pub hops: u8,
     pub expires_ms: u64,
+    /// Follows [`PathEntry::bulk`].
+    pub bulk: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -419,7 +425,7 @@ impl<const N: usize> AnnounceCache<N> {
             .entries
             .iter()
             .position(Option::is_none)
-            .or_else(|| oldest_index(&self.entries, |entry| entry.expires_ms));
+            .or_else(|| class_victim(&self.entries, entry.bulk, |e| e.bulk, |e| e.expires_ms));
         if let Some(idx) = replacement {
             self.entries[idx] = Some(entry);
         }
@@ -461,6 +467,18 @@ pub struct ScheduledAnnounce {
     pub hops: u8,
     pub retries: u8,
     pub local_rebroadcasts: u8,
+    /// Registry interface slots still owed this rebroadcast, each waiting on its announce gate
+    /// (trusted per-interface announce queue). Zero for hosts without a registry.
+    pub pending_targets: u8,
+}
+
+impl ScheduledAnnounce {
+    /// `due_ms` of an entry with no send left to schedule, kept only for its pending targets.
+    pub const PENDING_ONLY: u64 = u64::MAX;
+
+    const fn pending_only(&self) -> bool {
+        self.due_ms == Self::PENDING_ONLY
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -479,6 +497,8 @@ impl<const N: usize> AnnounceSchedule<N> {
         Self { entries: [None; N] }
     }
 
+    /// A full schedule gives up the waiting entry trusted would release last (most hops, then
+    /// newest), so a flood churns only the tail of the queue; with none, the oldest entry.
     pub fn insert(&mut self, entry: ScheduledAnnounce, now_ms: u64) {
         self.expire(now_ms);
         if let Some(slot) = self
@@ -494,9 +514,63 @@ impl<const N: usize> AnnounceSchedule<N> {
             .entries
             .iter()
             .position(Option::is_none)
+            .or_else(|| self.last_released_pending())
             .or_else(|| oldest_index(&self.entries, |entry| entry.expires_ms));
         if let Some(idx) = replacement {
             self.entries[idx] = Some(entry);
+        }
+    }
+
+    fn last_released_pending(&self) -> Option<usize> {
+        let mut last: Option<(usize, ScheduledAnnounce)> = None;
+        for (idx, entry) in self.entries.iter().enumerate() {
+            let Some(entry) = entry.filter(ScheduledAnnounce::pending_only) else {
+                continue;
+            };
+            if last.is_none_or(|(_, worst)| {
+                release_precedes(worst.hops, worst.expires_ms, entry.hops, entry.expires_ms)
+            }) {
+                last = Some((idx, entry));
+            }
+        }
+        last.map(|(idx, _)| idx)
+    }
+
+    /// Release the announce owed to registry `slot` that trusted's order sends first, clearing
+    /// its pending bit. The queue time is the learn time, which `expires_ms` encodes.
+    pub fn release_pending(&mut self, slot: usize, now_ms: u64) -> Option<ScheduledAnnounce> {
+        self.expire(now_ms);
+        let bit = 1u8.checked_shl(u32::try_from(slot).ok()?)?;
+        let mut first: Option<(usize, ScheduledAnnounce)> = None;
+        for (idx, entry) in self.entries.iter().enumerate() {
+            let Some(entry) = entry.filter(|entry| entry.pending_targets & bit != 0) else {
+                continue;
+            };
+            if first.is_none_or(|(_, best)| {
+                release_precedes(entry.hops, entry.expires_ms, best.hops, best.expires_ms)
+            }) {
+                first = Some((idx, entry));
+            }
+        }
+        let (idx, mut released) = first?;
+        released.pending_targets &= !bit;
+        self.entries[idx] =
+            (released.pending_targets != 0 || !released.pending_only()).then_some(released);
+        Some(released)
+    }
+
+    /// Forget every rebroadcast still owed to registry `slot`.
+    pub fn clear_target(&mut self, slot: usize) {
+        let Some(bit) = u32::try_from(slot).ok().and_then(|s| 1u8.checked_shl(s)) else {
+            return;
+        };
+        for entry in &mut self.entries {
+            if let Some(scheduled) = entry {
+                scheduled.pending_targets &= !bit;
+                if scheduled.pending_targets == 0 && scheduled.pending_only() {
+                    *entry = None;
+                }
+            }
         }
     }
 
@@ -877,6 +951,30 @@ fn announce_emitted(random_hash: &[u8; RANDOM_HASH_LENGTH]) -> u64 {
     u64::from_be_bytes(buf)
 }
 
+/// Eviction victim for bounded tables with bulk entries: the oldest bulk entry, else, for a
+/// newcomer that is not itself bulk, the oldest entry. A bulk newcomer never displaces others.
+fn class_victim<T: Copy>(
+    entries: &[Option<T>],
+    newcomer_bulk: bool,
+    bulk: impl Fn(T) -> bool,
+    age: impl Fn(T) -> u64,
+) -> Option<usize> {
+    let mut oldest_bulk: Option<(usize, u64)> = None;
+    for (idx, entry) in entries.iter().enumerate() {
+        if let Some(entry) = entry.filter(|entry| bulk(*entry)) {
+            let value = age(entry);
+            if oldest_bulk.is_none_or(|(_, old_value)| value < old_value) {
+                oldest_bulk = Some((idx, value));
+            }
+        }
+    }
+    oldest_bulk.map(|(idx, _)| idx).or_else(|| {
+        (!newcomer_bulk)
+            .then(|| oldest_index(entries, age))
+            .flatten()
+    })
+}
+
 fn oldest_index<T: Copy, F: Fn(T) -> u64>(entries: &[Option<T>], age: F) -> Option<usize> {
     let mut oldest: Option<(usize, u64)> = None;
     for (idx, entry) in entries.iter().enumerate() {
@@ -909,6 +1007,7 @@ mod tests {
             packet_hash: hash(destination),
             random_hash: [destination; RANDOM_HASH_LENGTH],
             public_key: [destination; PUBLIC_KEY_LENGTH],
+            bulk: false,
         }
     }
 
@@ -918,6 +1017,7 @@ mod tests {
             raw: PacketBuffer::new(),
             hops: 1,
             expires_ms,
+            bulk: false,
         }
     }
 
@@ -932,7 +1032,134 @@ mod tests {
             hops: 1,
             retries: 0,
             local_rebroadcasts: 0,
+            pending_targets: 0,
         }
+    }
+
+    fn pending(destination: u8, hops: u8, learned_ms: u64, targets: u8) -> ScheduledAnnounce {
+        ScheduledAnnounce {
+            hops,
+            pending_targets: targets,
+            ..scheduled_announce(destination, ScheduledAnnounce::PENDING_ONLY, learned_ms)
+        }
+    }
+
+    #[test]
+    fn bulk_paths_only_displace_bulk_paths() {
+        let bulk = |destination, expires_ms| PathEntry {
+            bulk: true,
+            ..path(destination, expires_ms)
+        };
+        let present =
+            |table: &PathTable<3>, destination: u8| table.get(&[destination; 16]).is_some();
+        let mut table: PathTable<3> = PathTable::new();
+        assert!(table.insert_or_update(path(1, 100), 0));
+        assert!(table.insert_or_update(bulk(2, 150), 0));
+        assert!(table.insert_or_update(path(3, 300), 0));
+
+        assert!(table.insert_or_update(bulk(4, 400), 0));
+        assert!(!present(&table, 2) && present(&table, 1));
+        assert!(table.insert_or_update(path(5, 500), 0));
+        assert!(!present(&table, 4) && present(&table, 1));
+        assert!(!table.insert_or_update(bulk(6, 600), 0));
+        assert!(!present(&table, 6));
+        assert!(table.insert_or_update(path(7, 700), 0));
+        assert!(!present(&table, 1) && present(&table, 3) && present(&table, 5));
+    }
+
+    #[test]
+    fn bulk_announces_only_displace_bulk_announces() {
+        let mut cache: AnnounceCache<1> = AnnounceCache::new();
+        cache.insert(cached_announce(1, 100), 0);
+        let bulk = CachedAnnounce {
+            bulk: true,
+            ..cached_announce(2, 200)
+        };
+        cache.insert(bulk, 0);
+        assert!(cache.get(&[1; 16], 0).is_some() && cache.get(&[2; 16], 0).is_none());
+        cache.insert(cached_announce(3, 300), 0);
+        cache.insert(bulk, 0);
+        assert!(cache.get(&[3; 16], 0).is_some());
+    }
+
+    #[test]
+    fn pending_announces_release_fewest_hops_then_oldest_per_target() {
+        let mut schedule: AnnounceSchedule<4> = AnnounceSchedule::new();
+        schedule.insert(pending(1, 3, 100, 0b01), 0);
+        schedule.insert(pending(2, 2, 300, 0b11), 0);
+        schedule.insert(pending(3, 2, 200, 0b10), 0);
+        schedule.insert(scheduled_announce(4, 50, 400), 0);
+
+        let order = |schedule: &mut AnnounceSchedule<4>, slot| {
+            let mut released = [0u8; 4];
+            let mut count = 0;
+            while let Some(entry) = schedule.release_pending(slot, 0) {
+                released[count] = entry.destination_hash[0];
+                count += 1;
+            }
+            (released, count)
+        };
+        assert_eq!(order(&mut schedule, 1), ([3, 2, 0, 0], 2));
+        assert!(schedule.get_mut(&[2; 16]).is_some());
+        assert!(schedule.get_mut(&[3; 16]).is_none());
+        assert_eq!(order(&mut schedule, 0), ([2, 1, 0, 0], 2));
+        assert!(schedule.get_mut(&[2; 16]).is_none());
+        assert!(schedule.get_mut(&[4; 16]).is_some());
+        assert!(schedule.release_pending(8, 0).is_none());
+    }
+
+    #[test]
+    fn released_bit_on_an_entry_with_a_send_due_keeps_the_entry() {
+        let mut schedule: AnnounceSchedule<1> = AnnounceSchedule::new();
+        let entry = ScheduledAnnounce {
+            pending_targets: 0b1,
+            ..scheduled_announce(1, 500, 1_000)
+        };
+        schedule.insert(entry, 0);
+        assert!(schedule.release_pending(0, 0).is_some());
+        assert_eq!(schedule.pop_due(500).map(|e| e.pending_targets), Some(0));
+    }
+
+    #[test]
+    fn full_schedule_drops_the_pending_entry_released_last() {
+        let mut schedule: AnnounceSchedule<3> = AnnounceSchedule::new();
+        schedule.insert(pending(1, 1, 100, 1), 0);
+        schedule.insert(pending(2, 3, 100, 1), 0);
+        schedule.insert(pending(3, 3, 200, 1), 0);
+        schedule.insert(pending(4, 4, 300, 1), 0);
+        assert!(schedule.get_mut(&[3; 16]).is_none());
+        assert!(schedule.get_mut(&[1; 16]).is_some() && schedule.get_mut(&[2; 16]).is_some());
+
+        let mut active: AnnounceSchedule<2> = AnnounceSchedule::new();
+        active.insert(scheduled_announce(1, 10, 100), 0);
+        active.insert(pending(2, 9, 50, 1), 0);
+        active.insert(scheduled_announce(3, 10, 300), 0);
+        assert!(active.get_mut(&[2; 16]).is_none() && active.get_mut(&[1; 16]).is_some());
+    }
+
+    #[test]
+    fn clearing_a_target_forgets_its_waiting_rebroadcasts() {
+        let mut schedule: AnnounceSchedule<3> = AnnounceSchedule::new();
+        schedule.insert(pending(1, 1, 100, 0b01), 0);
+        schedule.insert(pending(2, 1, 100, 0b11), 0);
+        schedule.insert(
+            ScheduledAnnounce {
+                pending_targets: 0b01,
+                ..scheduled_announce(3, 10, 100)
+            },
+            0,
+        );
+        schedule.clear_target(0);
+        assert!(schedule.get_mut(&[1; 16]).is_none());
+        assert_eq!(
+            schedule.get_mut(&[2; 16]).map(|e| e.pending_targets),
+            Some(0b10)
+        );
+        assert_eq!(
+            schedule.get_mut(&[3; 16]).map(|e| e.pending_targets),
+            Some(0)
+        );
+        schedule.clear_target(9);
     }
 
     #[test]

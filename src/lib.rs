@@ -13,6 +13,7 @@
 extern crate std;
 
 pub mod announce_admission;
+pub mod announce_cap;
 pub mod announce_state;
 pub mod auto;
 pub mod config;

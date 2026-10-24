@@ -1093,3 +1093,25 @@ fn checked_link_signalling_matches_current_trusted_rust_domain() {
         assert!(SignallingData::try_new(1, mtu).is_err());
     }
 }
+
+#[test]
+fn announce_cap_spacing_matches_rsreticulum() {
+    use rns_lite_core::announce_cap::{ANNOUNCE_CAP_PERMILLE, bitrate_spacing_ms};
+    use rns_transport::constants::ANNOUNCE_CAP;
+
+    assert_eq!(
+        f64::from(ANNOUNCE_CAP_PERMILLE),
+        (ANNOUNCE_CAP * 1000.0).round()
+    );
+    // Trusted maintenance.rs: next release after `raw_len * 8 / bitrate / announce_cap`.
+    for len in [67usize, 167, 231, 500, 508] {
+        for bitrate in [183u64, 335, 1_074, 3_515, 10_000_000] {
+            let trusted_ms = (len as f64 * 8.0) / bitrate as f64 / ANNOUNCE_CAP * 1000.0;
+            let lite_ms = bitrate_spacing_ms(len, bitrate, ANNOUNCE_CAP_PERMILLE).unwrap() as f64;
+            assert!(
+                (0.0..1.0).contains(&(lite_ms - trusted_ms)),
+                "len {len} bitrate {bitrate}: lite {lite_ms} trusted {trusted_ms}"
+            );
+        }
+    }
+}

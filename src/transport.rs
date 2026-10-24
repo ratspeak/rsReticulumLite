@@ -1387,6 +1387,8 @@ impl<
             packet_hash,
             random_hash: announce.random_hash,
             public_key: announce.public_key,
+            // Lite hosts register no bulk interfaces; rsNode's registry marks its uplink.
+            bulk: false,
         };
 
         let learned = self.paths.insert_or_update(path_entry, now_ms);
@@ -1413,6 +1415,7 @@ impl<
                     raw: PacketBuffer::from_slice(raw)?,
                     hops: header.hops,
                     expires_ms: path_entry.expires_ms,
+                    bulk: path_entry.bulk,
                 },
                 now_ms,
             );
@@ -1449,6 +1452,7 @@ impl<
                             hops: header.hops,
                             retries: 0,
                             local_rebroadcasts: 0,
+                            pending_targets: 0,
                         },
                         now_ms,
                     );
@@ -3956,7 +3960,8 @@ mod tests {
         // Cardputer budget (no PSRAM, ~55 KB free heap): the MICRO node must stay <= 32 KB so
         // cap drift can't silently blow the internal-heap allocation.
         let micro = core::mem::size_of::<MicroNode>();
-        assert_eq!(micro, 32_728, "MicroNode layout changed unexpectedly");
+        // 32,664 since the bulk flag gave cached announces a niche for their `Option` tag.
+        assert_eq!(micro, 32_664, "MicroNode layout changed unexpectedly");
         assert!(micro <= 32 * 1024, "MicroNode grew to {micro} B (> 32 KB)");
         std::println!(
             "MicroNode={micro} SmallNode={} Esp32PsramNode={} OutboundFrame={} OutboundLifetime={} token={}",
