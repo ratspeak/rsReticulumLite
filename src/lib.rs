@@ -33,6 +33,7 @@ pub mod ratchet;
 pub mod resource;
 pub mod tables;
 pub mod transport;
+pub mod tunnel;
 pub mod wire;
 
 pub use announce_admission::{AnnounceAdmission, AnnounceAdmissionConfig};

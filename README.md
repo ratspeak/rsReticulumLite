@@ -13,7 +13,8 @@ supplies clocks, entropy, storage and interface I/O.
 
 ## Scope
 
-- Packet encoding, signed announces, path discovery and transport forwarding.
+- Packet encoding, signed announces, path discovery, transport forwarding and
+  the tunnel synthesis a TCP client sends on connect.
 - Link handshake, session encryption, identity verification, proofs and optional IFAC.
 - Bounded Resource transfers and persistent ratchet/known-destination encodings.
 - LoRa split framing, airtime limiting and carrier-sense backoff.

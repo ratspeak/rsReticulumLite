@@ -1337,3 +1337,42 @@ fn plain_and_group_filter_matches_trusted_transport() {
         let _ = actor_tx.send(TransportMessage::Shutdown).await;
     });
 }
+
+// Byte for byte the trusted rns-transport builder (tunnel.rs): same identity, interface hash and
+// random hash, the last read back from the trusted packet; Ed25519 is deterministic.
+#[test]
+fn tunnel_synthesis_matches_rsreticulum() {
+    use rns_lite_core::constants::HEADER_MINSIZE;
+    use rns_lite_core::tunnel::{
+        TUNNEL_SYNTHESIS_LEN, TUNNEL_SYNTHESIS_PACKET_LEN, build_tunnel_synthesis_packet,
+        interface_hash,
+    };
+
+    let private = [0x63u8; 64];
+    let trusted = rns_identity::identity::Identity::from_private_key(&private).unwrap();
+    let lite = LocalIdentity::from_private_key(&private);
+    for name in [
+        "TCPInterface[Golden Uplink/127.0.0.1:4242]",
+        "TCPInterface[Backbone/[fd00::1]:4242]",
+    ] {
+        let hash = interface_hash(name);
+        assert_eq!(hash, rns_transport::tunnel::interface_hash(name));
+        for _ in 0..4 {
+            let reference =
+                rns_transport::tunnel::build_tunnel_synthesis_packet(&trusted, hash).unwrap();
+            let random: [u8; 16] = reference[HEADER_MINSIZE + 96..HEADER_MINSIZE + 112]
+                .try_into()
+                .unwrap();
+            let mut out = [0u8; TUNNEL_SYNTHESIS_PACKET_LEN];
+            let len = build_tunnel_synthesis_packet(&lite, &hash, &random, &mut out).unwrap();
+            assert_eq!(&out[..len], reference.as_slice(), "{name}");
+            assert_eq!(len - HEADER_MINSIZE, TUNNEL_SYNTHESIS_LEN);
+            assert_eq!(TUNNEL_SYNTHESIS_LEN, 176);
+            let parsed =
+                rns_transport::tunnel::TunnelSynthesisData::unpack(&out[HEADER_MINSIZE..len])
+                    .unwrap();
+            assert_eq!(&parsed.public_key, lite.public_key());
+            assert_eq!(parsed.interface_hash, hash);
+        }
+    }
+}
