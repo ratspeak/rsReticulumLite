@@ -1219,29 +1219,15 @@ impl<
             return Ok(IngestAction::Dropped);
         }
 
-        // Upstream packet_filter (Transport.py:1397-1410): PLAIN and GROUP
-        // announces are invalid and must not be learned or rebroadcast.
-        if view.header.flags.packet_type == PacketType::Announce
+        // Upstream packet_filter (Transport.py:1635-1666), as trusted actor/inbound.rs: after the
+        // repeating contexts, PLAIN and GROUP packets are never announced and travel one hop at
+        // most. Checked on wire hops before the hashlist, so a dropped copy reserves no hash.
+        if !view.header.context.skip_hashlist()
             && matches!(
                 view.header.flags.destination_type,
                 DestinationType::Plain | DestinationType::Group
             )
-        {
-            self.stats.dropped = self.stats.dropped.saturating_add(1);
-            return Ok(IngestAction::Dropped);
-        }
-
-        // Upstream packet_filter (Transport.py:1340-1357): PLAIN/GROUP non-announce packets may
-        // travel at most one hop, so a copy that has already been forwarded (wire hops >= 1, i.e.
-        // upstream's post-increment hops > 1) is dropped. Path requests are PLAIN DATA, so this
-        // bounds their propagation reach to match upstream; SINGLE/LINK packets route by
-        // transport_id and are not subject to it.
-        if view.header.flags.packet_type != PacketType::Announce
-            && matches!(
-                view.header.flags.destination_type,
-                DestinationType::Plain | DestinationType::Group
-            )
-            && view.header.hops >= 1
+            && (view.header.flags.packet_type == PacketType::Announce || view.header.hops > 1)
         {
             self.stats.dropped = self.stats.dropped.saturating_add(1);
             return Ok(IngestAction::Dropped);
@@ -2557,18 +2543,75 @@ mod tests {
         assert!(!node.register_own_destination([0x99u8; 16]));
     }
 
+    fn retyped(packet: PacketBuffer, destination_type: DestinationType, hops: u8) -> PacketBuffer {
+        let mut raw = packet;
+        raw.as_mut_slice()[0] =
+            (packet.as_slice()[0] & !(0b11 << 2)) | ((destination_type as u8) << 2);
+        raw.as_mut_slice()[1] = hops;
+        raw
+    }
+
     #[test]
-    fn plain_path_request_with_prior_hop_is_dropped() {
-        // Upstream packet_filter drops a PLAIN non-announce packet that has already been forwarded
-        // (wire hops >= 1). A fresh (hops 0) path request is still answered/forwarded.
-        let mut node =
-            SmallNode::new(LiteConfig::ESP32_LORA_TRANSPORT_SMALL, TRANSPORT_ID).unwrap();
-        let mut pkt = path_request([0x11; 16], [0x22; 16]);
-        pkt.as_mut_slice()[1] = 1; // header hops byte -> already forwarded once
-        let action = node
-            .ingest(pkt.as_slice(), RxMeta::new(IFACE), 1000)
-            .unwrap();
-        assert_eq!(action, IngestAction::Dropped);
+    fn plain_and_group_packets_travel_one_wire_hop() {
+        // RNS 1.5.5 packet_filter (Transport.py:1642-1666), on wire hops as trusted inbound.rs.
+        for destination_type in [DestinationType::Plain, DestinationType::Group] {
+            let mut node = node();
+            let one = retyped(path_request([0x11; 16], [0x22; 16]), destination_type, 1);
+            for expected in [IngestAction::ForwardedPathRequest, IngestAction::Duplicate] {
+                assert_eq!(
+                    node.ingest(one.as_slice(), RxMeta::new(IFACE), 1000)
+                        .unwrap(),
+                    expected,
+                    "{destination_type:?}"
+                );
+            }
+
+            let request = path_request([0x33; 16], [0x44; 16]);
+            let two = retyped(request, destination_type, 2);
+            assert_eq!(
+                node.ingest(two.as_slice(), RxMeta::new(IFACE), 1000)
+                    .unwrap(),
+                IngestAction::Dropped,
+                "{destination_type:?}"
+            );
+            let direct = retyped(request, destination_type, 0);
+            assert_eq!(
+                node.ingest(direct.as_slice(), RxMeta::new(IFACE), 1000)
+                    .unwrap(),
+                IngestAction::ForwardedPathRequest,
+                "{destination_type:?}: the dropped copy reserved no hash"
+            );
+        }
+    }
+
+    #[test]
+    fn repeating_contexts_bypass_the_plain_hop_rule() {
+        // Python admits these contexts before the PLAIN rule (Transport.py:1635-1640).
+        for (index, context) in [
+            PacketContext::Keepalive,
+            PacketContext::Resource,
+            PacketContext::ResourceReq,
+            PacketContext::ResourcePrf,
+            PacketContext::CacheRequest,
+            PacketContext::Channel,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut node = node();
+            let mut request = retyped(
+                path_request([index as u8; 16], [0x55; 16]),
+                DestinationType::Plain,
+                3,
+            );
+            request.as_mut_slice()[crate::constants::HEADER_MINSIZE - 1] = context.to_byte();
+            assert_eq!(
+                node.ingest(request.as_slice(), RxMeta::new(IFACE), 1000)
+                    .unwrap(),
+                IngestAction::ForwardedPathRequest,
+                "{context:?}"
+            );
+        }
     }
 
     fn h2_data(destination_hash: [u8; 16], payload: &[u8]) -> PacketBuffer {

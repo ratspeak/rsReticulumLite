@@ -1194,3 +1194,146 @@ fn link_session_serves_a_trusted_initiator_end_to_end() {
         Ok(Received::Closed)
     );
 }
+
+// RNS 1.5.5 packet_filter as trusted rns-transport runs it (actor/inbound.rs): after the
+// repeating contexts, PLAIN and GROUP packets are dropped when announced or beyond one wire hop.
+// The trusted actor records packet metrics only for packets past that filter, so a metrics
+// lookup reads its verdict; Lite's is any action but Dropped on a path request or announce.
+#[test]
+fn plain_and_group_filter_matches_trusted_transport() {
+    use rns_transport::InterfaceTransportSender;
+    use rns_transport::actor::TransportActor;
+    use rns_transport::constants::{InterfaceDirection, InterfaceMode};
+    use rns_transport::messages::{
+        InboundPacket, InterfaceEntry, TransportMessage, TransportQuery, TransportQueryResponse,
+    };
+
+    let identity = rns_identity::identity::Identity::from_private_key(&[0x52; 64]).unwrap();
+    let app_name = "lxmf.delivery";
+    let announced = rns_identity::destination::Destination::hash_from_name_and_identity(
+        app_name,
+        Some(&identity.hash),
+    );
+    let packet = |packet_type, destination_type, context, hops, case: u8| {
+        let (destination_hash, payload) = if packet_type == PacketType::Announce {
+            let announce = rns_identity::announce::AnnounceData::create(
+                &identity,
+                app_name,
+                Some(&[case]),
+                None,
+            )
+            .unwrap();
+            (announced, announce.pack())
+        } else {
+            let mut request = vec![case; 16];
+            request.extend_from_slice(&[!case; 16]);
+            (rns_lite_core::path_request_destination(), request)
+        };
+        let header = PacketHeader {
+            flags: PacketFlags {
+                header_type: HeaderType::Header1,
+                context_flag: false,
+                transport_type: TransportType::Broadcast,
+                destination_type,
+                packet_type,
+            },
+            hops,
+            transport_id: None,
+            destination_hash,
+            context,
+        };
+        build_packet(header, &payload).unwrap()
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (actor, actor_tx) = TransportActor::new();
+        tokio::spawn(actor.run());
+        let (frames, _frames) = tokio::sync::mpsc::channel(256);
+        let entry = InterfaceEntry::new(
+            "lite-compat".into(),
+            InterfaceMode::Full,
+            InterfaceDirection::bidirectional(),
+            115_200,
+            500,
+            frames,
+        );
+        let interface = InterfaceTransportSender::bind(1, entry.owner.clone(), actor_tx.clone());
+        actor_tx
+            .send(TransportMessage::RegisterInterface { id: 1, entry })
+            .await
+            .unwrap();
+
+        let mut case = 0u8;
+        for packet_type in [PacketType::Data, PacketType::Announce] {
+            for destination_type in [
+                DestinationType::Single,
+                DestinationType::Group,
+                DestinationType::Plain,
+                DestinationType::Link,
+            ] {
+                for context in [
+                    PacketContext::None,
+                    PacketContext::Keepalive,
+                    PacketContext::Resource,
+                    PacketContext::ResourceReq,
+                    PacketContext::ResourcePrf,
+                    PacketContext::CacheRequest,
+                    PacketContext::Channel,
+                ] {
+                    for hops in 0..=3 {
+                        case += 1;
+                        let raw = packet(packet_type, destination_type, context, hops, case);
+                        interface
+                            .send(TransportMessage::Inbound(InboundPacket {
+                                raw: raw.as_slice().to_vec().into(),
+                                interface_id: 1,
+                                rssi: Some(-40.0),
+                                snr: None,
+                                q: None,
+                            }))
+                            .await
+                            .unwrap();
+                        let (response_tx, response) = tokio::sync::oneshot::channel();
+                        actor_tx
+                            .send(TransportMessage::Rpc {
+                                query: TransportQuery::GetPacketRssi {
+                                    packet_hash: packet_hash(raw.as_slice(), HeaderType::Header1),
+                                },
+                                response_tx,
+                            })
+                            .await
+                            .unwrap();
+                        let trusted = matches!(
+                            response.await.unwrap(),
+                            TransportQueryResponse::FloatResult(Some(_))
+                        );
+
+                        let mut node =
+                            SmallNode::new(LiteConfig::ESP32_LORA_TRANSPORT_SMALL, [0xAA; 16])
+                                .unwrap();
+                        let lite = !matches!(
+                            node.ingest(raw.as_slice(), RxMeta::new(1), 1000),
+                            Ok(IngestAction::Dropped)
+                        );
+
+                        let filtered = !context.skip_hashlist()
+                            && matches!(
+                                destination_type,
+                                DestinationType::Plain | DestinationType::Group
+                            )
+                            && (packet_type == PacketType::Announce || hops > 1);
+                        let label =
+                            format!("{packet_type:?} {destination_type:?} {context:?} hops {hops}");
+                        assert_eq!(trusted, !filtered, "trusted verdict: {label}");
+                        assert_eq!(lite, trusted, "lite verdict: {label}");
+                    }
+                }
+            }
+        }
+        let _ = actor_tx.send(TransportMessage::Shutdown).await;
+    });
+}

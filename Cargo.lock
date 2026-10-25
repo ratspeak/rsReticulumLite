@@ -508,6 +508,7 @@ dependencies = [
  "rns-wire",
  "sha2",
  "subtle",
+ "tokio",
  "x25519-dalek",
  "zeroize",
 ]

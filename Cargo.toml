@@ -46,3 +46,5 @@ rns-link = { path = "../rsReticulum/crates/rns-link", version = "~1.4.0" }
 rns-transport = { path = "../rsReticulum/crates/rns-transport", version = "~1.4.0" }
 # Resource transfer reference for byte-exact cross-checks; dev-only.
 rns-protocol = { path = "../rsReticulum/crates/rns-protocol", version = "~1.4.0" }
+# Runs the trusted transport actor for decision cross-checks; dev-only.
+tokio = { version = "1", features = ["rt", "sync", "time"] }
