@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = "https://github.com/ratspeak/rsReticulumLite"
 EXPECTED_VERSION = "0.1.0"
 EXPECTED_RUST_VERSION = "1.87"
-EXPECTED_RNS_VALIDATOR = "1.4.2"
+EXPECTED_RNS_VALIDATOR = "1.5.5"
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 LINK_PATTERN = re.compile(r"\[[^]]+\]\(([^)]+)\)")
 

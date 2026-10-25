@@ -1,6 +1,6 @@
 {
-  "rns_version": "1.4.2",
-  "note": "Resource transfer parity vectors from the REAL RNS 1.4.2 Resource classes (fixed entropy, headless link). Regenerate only via gen_resource_vectors.py.",
+  "rns_version": "1.5.5",
+  "note": "Resource transfer parity vectors from the REAL RNS 1.5.5 Resource classes (fixed entropy, headless link). Regenerate only via gen_resource_vectors.py.",
   "init_x25519_priv": "3333333333333333333333333333333333333333333333333333333333333333",
   "resp_x25519_priv": "5555555555555555555555555555555555555555555555555555555555555555",
   "resp_x25519_pub": "38ab664bd86f77d7e66bdd9ae0792913a94fd8b33a1260027e4b46c1f4884c67",
