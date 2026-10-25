@@ -211,7 +211,8 @@ pub enum IngestAction {
     Duplicate,
     LearnedAnnounce,
     /// Signature-valid announce rejected by path freshness/quality policy.
-    /// Hosts must not commit its peer ratchet or mutate a KeyMap from it.
+    /// Hosts must not commit its peer ratchet or mutate a KeyMap from it; the node
+    /// still learns its delivery identity, as every validated announce teaches one.
     AnnounceIgnored,
     ScheduledAnnounce,
     AnsweredPathRequest,
@@ -1308,13 +1309,6 @@ impl<
             self.stats.dropped = self.stats.dropped.saturating_add(1);
             return Ok(IngestAction::Dropped);
         }
-        // Trusted inbound.rs announce gate on POST-INCREMENT hops (fix-registry S138-F01,
-        // a deliberate 1.3.8 tightening beyond Python's `< M+1`): a path stored at
-        // PATHFINDER_M hops is provably dead under the parse cap every 1.3.8 peer applies.
-        if header.hops >= PATHFINDER_M {
-            self.stats.dropped = self.stats.dropped.saturating_add(1);
-            return Ok(IngestAction::Dropped);
-        }
         if !self.announce_admission.admit(
             self.config.announce_admission,
             header.context == PacketContext::PathResponse,
@@ -1336,6 +1330,19 @@ impl<
         let mut scratch = [0u8; ANNOUNCE_SCRATCH_MAX];
         let identity_hash =
             announce.validate(&header.destination_hash, known_public_key, &mut scratch)?;
+        // Python remembers every validated announce, replays and path responses included,
+        // before it decides the path (Transport.py:2172, Identity.py:589), as trusted inbound.rs.
+        if announce.name_hash == name_hash(LXMF_DELIVERY_NAME) {
+            self.known_destinations
+                .learn(header.destination_hash, announce.public_key, now_ms)?;
+        }
+        // Trusted inbound.rs announce gate on POST-INCREMENT hops, a deliberate tightening beyond
+        // Python's `< M+1`: a path stored at PATHFINDER_M hops is provably dead under the parse
+        // cap every peer applies.
+        if header.hops >= PATHFINDER_M {
+            self.stats.dropped = self.stats.dropped.saturating_add(1);
+            return Ok(IngestAction::Dropped);
+        }
 
         let packet_hash = packet_hash(raw, view.header.flags.header_type);
         // Trusted inbound.rs: a neighbour carrying our queued rebroadcast cancels its retry. A
@@ -1381,13 +1388,6 @@ impl<
 
         if learned {
             let _ = identity_hash;
-            if announce.name_hash == name_hash(LXMF_DELIVERY_NAME) {
-                self.known_destinations.learn(
-                    header.destination_hash,
-                    announce.public_key,
-                    now_ms,
-                )?;
-            }
             self.stats.learned_announces = self.stats.learned_announces.saturating_add(1);
 
             // Cache the announce only when the path was actually learned/replaced. Upstream caches
@@ -3498,6 +3498,63 @@ mod tests {
             IngestAction::Dropped
         );
         assert!(node.poll_tx().is_none());
+    }
+
+    fn announced_key(raw: &PacketBuffer) -> [u8; 64] {
+        let start = crate::constants::HEADER_MINSIZE;
+        raw.as_slice()[start..start + 64].try_into().unwrap()
+    }
+
+    #[test]
+    fn a_replayed_announce_still_teaches_its_identity() {
+        // Python remembers every validated announce before it decides the path (Transport.py:2172,
+        // Identity.py:511-589), as trusted inbound.rs does; the replay leaves the path alone.
+        let announce = signed_announce([0x5D; 32], "lxmf.delivery", b"peer");
+        let public_key = announced_key(&announce.raw);
+        let mut node = node();
+        assert!(matches!(
+            node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
+                .unwrap(),
+            IngestAction::LearnedAnnounce | IngestAction::ScheduledAnnounce
+        ));
+        let path = *node.paths.get(&announce.destination_hash).unwrap();
+        node.known_destinations = KnownDestinations::new();
+
+        let mut replay = announce.raw;
+        replay.as_mut_slice()[crate::constants::HEADER_MINSIZE - 1] =
+            PacketContext::PathResponse.to_byte();
+        assert_eq!(
+            node.ingest(replay.as_slice(), RxMeta::new(IFACE), 2000)
+                .unwrap(),
+            IngestAction::AnnounceIgnored
+        );
+        assert_eq!(
+            node.known_destination_recall(&announce.destination_hash),
+            Some(public_key)
+        );
+        assert_eq!(
+            node.paths.get(&announce.destination_hash),
+            Some(&path),
+            "a replay must not refresh the path"
+        );
+    }
+
+    #[test]
+    fn an_announce_at_the_hop_limit_teaches_its_identity_but_no_path() {
+        let announce = signed_announce([0x5E; 32], "lxmf.delivery", b"far");
+        let mut far = announce.raw;
+        far.as_mut_slice()[1] = PATHFINDER_M - 1;
+        let mut node = node();
+        assert_eq!(
+            node.ingest(far.as_slice(), RxMeta::new(IFACE), 1000)
+                .unwrap(),
+            IngestAction::Dropped
+        );
+        assert!(!node.has_path(&announce.destination_hash, 1000));
+        assert_eq!(
+            node.known_destination_recall(&announce.destination_hash),
+            Some(announced_key(&announce.raw))
+        );
     }
 
     #[test]
