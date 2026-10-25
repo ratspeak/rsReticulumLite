@@ -1373,6 +1373,7 @@ fn tunnel_synthesis_matches_rsreticulum() {
                     .unwrap();
             assert_eq!(&parsed.public_key, lite.public_key());
             assert_eq!(parsed.interface_hash, hash);
+            assert!(parsed.is_signed(), "the trusted hub verifies it");
         }
     }
 }
