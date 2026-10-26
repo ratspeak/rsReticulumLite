@@ -8,6 +8,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 use crate::constants::{MTU, SIGNATURE_LENGTH, WIRE_MTU_MAX};
 use crate::packet_buffer::{BufferError, PacketBuffer, WireBuffer};
@@ -42,7 +43,7 @@ pub fn derive_ifac_key(
     network_name: Option<&str>,
     passphrase: Option<&str>,
 ) -> Result<[u8; IFAC_KEY_LENGTH], IfacError> {
-    let mut origin = [0u8; 64];
+    let mut origin = Zeroizing::new([0u8; 64]);
     let mut origin_len = 0;
 
     if let Some(name) = network_name {
@@ -54,8 +55,8 @@ pub fn derive_ifac_key(
         origin_len += 32;
     }
 
-    let origin_hash = sha256(&origin[..origin_len]);
-    let hkdf = Hkdf::<Sha256>::new(Some(&IFAC_SALT), &origin_hash);
+    let origin_hash = Zeroizing::new(sha256(&origin[..origin_len]));
+    let hkdf = Hkdf::<Sha256>::new(Some(&IFAC_SALT), &*origin_hash);
     let mut key = [0u8; IFAC_KEY_LENGTH];
     hkdf.expand(&[], &mut key).map_err(|_| IfacError::Hkdf)?;
     Ok(key)
@@ -81,7 +82,7 @@ pub fn ifac_sign_into(
 
     let signature = sign_packet(packet, ifac_key);
     let tag = &signature[SIGNATURE_LENGTH - ifac_size..];
-    let mut mask = [0u8; WIRE_MTU_MAX];
+    let mut mask = Zeroizing::new([0u8; WIRE_MTU_MAX]);
     derive_mask(tag, ifac_key, &mut mask[..wrapped_len])?;
 
     out.clear();
@@ -119,7 +120,7 @@ pub fn ifac_verify_into(
     }
 
     let tag = &raw[2..2 + ifac_size];
-    let mut mask = [0u8; WIRE_MTU_MAX];
+    let mut mask = Zeroizing::new([0u8; WIRE_MTU_MAX]);
     derive_mask(tag, ifac_key, &mut mask[..raw.len()])?;
 
     out.clear();
@@ -152,11 +153,10 @@ fn validate_size(ifac_size: u8) -> Result<usize, IfacError> {
 }
 
 fn sign_packet(packet: &[u8], ifac_key: &[u8; IFAC_KEY_LENGTH]) -> [u8; SIGNATURE_LENGTH] {
-    let mut signing_seed = [0u8; 32];
-    signing_seed.copy_from_slice(&ifac_key[32..64]);
-    SigningKey::from_bytes(&signing_seed)
-        .sign(packet)
-        .to_bytes()
+    let signing_seed: &[u8; 32] = ifac_key[32..64]
+        .try_into()
+        .expect("ifac_key is [u8; 64]; slice [32..64] is always 32 bytes");
+    SigningKey::from_bytes(signing_seed).sign(packet).to_bytes()
 }
 
 fn derive_mask(
