@@ -85,10 +85,18 @@ impl TableCaps {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct IfacConfig {
     pub key: [u8; IFAC_KEY_LENGTH],
     pub size: u8,
+}
+
+impl core::fmt::Debug for IfacConfig {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("IfacConfig")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
 }
 
 impl IfacConfig {
@@ -212,5 +220,14 @@ mod tests {
         });
 
         assert_eq!(config.validate(), Err(ConfigError::InvalidIfacSize));
+    }
+
+    #[test]
+    fn debug_output_never_shows_the_ifac_key() {
+        let mut config = LiteConfig::ESP32_LORA_TRANSPORT_SMALL;
+        config.ifac = Some(IfacConfig::lora_default([0x42; IFAC_KEY_LENGTH]));
+        let text = std::format!("{config:?}");
+        assert!(!text.contains("66, 66"), "{text}");
+        assert!(text.contains("size: 8"), "{text}");
     }
 }
