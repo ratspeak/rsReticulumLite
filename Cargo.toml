@@ -30,8 +30,8 @@ x25519-dalek = { version = "2", default-features = false, features = ["static_se
 zeroize = { version = "1", default-features = false }
 # Endpoint LXMF single-frame: SINGLE-destination encryption (Token/ECIES). Same RustCrypto
 # primitives rns-crypto builds on; no_std + no-alloc (fixed-buffer / in-place APIs only).
-aes = { version = "0.8", default-features = false }
-cbc = { version = "0.1", default-features = false, features = ["block-padding"] }
+aes = { version = "0.8", default-features = false, features = ["zeroize"] }
+cbc = { version = "0.1", default-features = false, features = ["block-padding", "zeroize"] }
 hmac = { version = "0.12", default-features = false }
 hkdf = { version = "0.12", default-features = false }
 subtle = { version = "2", default-features = false }

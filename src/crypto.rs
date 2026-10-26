@@ -25,6 +25,13 @@ use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
+// AES round keys and CBC state are wiped on drop (the `zeroize` features of `aes` and `cbc`).
+const _: fn() = || {
+    fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    wiped_on_drop::<Encryptor<Aes256>>();
+    wiped_on_drop::<Decryptor<Aes256>>();
+};
+
 /// Raw Token overhead: IV(16) + HMAC-SHA256(32). The full token is this plus the PKCS7-padded
 /// ciphertext (≥ one 16-byte block). Matches rns-wire `TOKEN_OVERHEAD` / Python `Identity.TOKEN_OVERHEAD`.
 pub const TOKEN_OVERHEAD: usize = 16 + 32;
