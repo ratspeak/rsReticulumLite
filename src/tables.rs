@@ -303,6 +303,15 @@ impl<const N: usize> PathTable<N> {
         }
     }
 
+    /// Drop every path via a replaced interface (trusted `drop_all_via`).
+    pub fn remove_interface(&mut self, interface: InterfaceId) {
+        for slot in &mut self.entries {
+            if slot.is_some_and(|entry| entry.interface_id == interface) {
+                *slot = None;
+            }
+        }
+    }
+
     pub fn live_count(&self, now_ms: u64) -> usize {
         self.entries
             .iter()
@@ -598,6 +607,14 @@ impl<const N: usize> AnnounceSchedule<N> {
         }
     }
 
+    pub fn remove_interface(&mut self, interface: InterfaceId) {
+        for slot in &mut self.entries {
+            if slot.is_some_and(|entry| entry.interface_id == interface) {
+                *slot = None;
+            }
+        }
+    }
+
     pub fn expire(&mut self, now_ms: u64) {
         for slot in &mut self.entries {
             if slot.is_some_and(|entry| now_ms >= entry.expires_ms) {
@@ -713,6 +730,16 @@ impl<const N: usize> ReverseTable<N> {
             .iter()
             .position(|slot| slot.is_some_and(|entry| &entry.proof_hash == proof_hash))?;
         self.entries[idx].take()
+    }
+
+    pub fn remove_interface(&mut self, interface: InterfaceId) {
+        for slot in &mut self.entries {
+            if slot.is_some_and(|entry| {
+                entry.receiving_interface == interface || entry.outbound_interface == interface
+            }) {
+                *slot = None;
+            }
+        }
     }
 
     pub fn expire(&mut self, now_ms: u64) {

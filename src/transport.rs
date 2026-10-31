@@ -776,9 +776,9 @@ impl<
             .position(|f| f.flags & 1 != 0 && f.id == id)
     }
 
-    /// Private owner metadata. Call before ingest/tick; generation changes or
-    /// loss of outbound availability retire requester bits before slot reuse.
-    /// Rates are sampled only when a new operation begins, never on retry/join.
+    /// Private owner metadata. Call before ingest/tick. A generation change or loss of
+    /// outbound availability is a reconnect: queued permission retires, routes stay. A mode
+    /// change is a replacement. Rates are sampled only when a new operation begins.
     #[doc(hidden)]
     pub fn update_interface(
         &mut self,
@@ -796,11 +796,14 @@ impl<
             return false;
         };
         let previous = self.interface_facts[slot];
-        if previous.flags & 1 != 0
-            && (previous.generation != generation || previous.mode != mode || !outbound)
-        {
-            self.retained_outbound_retire_interface(id);
+        if previous.flags & 1 != 0 {
+            if previous.mode != mode {
+                self.retire_replaced_interface(id);
+            } else if previous.generation != generation || !outbound {
+                self.retained_outbound_retire_interface(id);
+            }
         }
+        let previous = self.interface_facts[slot];
         self.interface_facts[slot] = InterfaceFacts {
             id,
             generation,
@@ -1067,9 +1070,7 @@ impl<
     /// this physical interface cannot bind its replacement to old queued bytes.
     #[doc(hidden)]
     pub fn retained_outbound_retire_interface(&mut self, interface: u8) {
-        self.links.remove_interface(interface);
         if let Some(slot) = self.interface_slot(interface) {
-            self.discoveries.retire_requester(slot);
             self.interface_facts[slot].flags &= !2;
         }
         if interface >= 7 {
@@ -1078,6 +1079,23 @@ impl<
         for queued in self.outbound.iter_mut() {
             queued.delivery.pending_targets &= !(1u8 << interface);
         }
+    }
+
+    /// The interface behind `interface` was replaced or removed: drop every route through
+    /// it and forget its facts, as trusted does on re-registration. A reconnect keeps them.
+    #[doc(hidden)]
+    pub fn retire_replaced_interface(&mut self, interface: u8) {
+        self.retained_outbound_retire_interface(interface);
+        if let Some(slot) = self.interface_slot(interface) {
+            self.discoveries.retire_requester(slot);
+            self.interface_facts[slot] = InterfaceFacts::EMPTY;
+        }
+        self.paths.remove_interface(interface);
+        self.announce_schedule.remove_interface(interface);
+        self.reverse.remove_interface(interface);
+        self.links.remove_interface(interface);
+        self.announce_cache.retain_paths(&self.paths, self.clock_ms);
+        self.expire_outbound(self.clock_ms);
     }
 
     pub const fn outbound_len(&self) -> usize {
@@ -4579,10 +4597,70 @@ mod tests {
         assert!(n.update_interface_packet_capacity(IFACE, 7, 500));
         n.ingest(request.as_slice(), RxMeta::new(9), 1200).unwrap();
         assert!(n.links.get(&id, 1200).is_some());
+        // A reconnect keeps the Link (trusted keeps the owner); stale host updates still fail.
         assert!(n.update_interface(IFACE, 8, InterfaceMode::Full, 1000, true, false));
-        assert!(n.links.get(&id, 1200).is_none());
+        assert!(n.links.get(&id, 1200).is_some());
         assert!(!n.update_interface_packet_capacity(IFACE, 7, 444));
         assert_eq!(n.interface_clear_mtu(IFACE), 500);
+    }
+
+    #[test]
+    fn reconnect_keeps_routes_and_replacement_drops_them() {
+        let learn = |n: &mut SmallNode, now: u64| {
+            assert!(n.update_interface(IFACE, 7, InterfaceMode::Full, 1000, true, false));
+            assert!(n.update_interface_packet_capacity(IFACE, 7, 500));
+            let ann = signed_announce([0x71; 32], "lxmf.delivery", b"receiver");
+            n.ingest(ann.raw.as_slice(), RxMeta::new(IFACE), now)
+                .unwrap();
+            while n.poll_tx().is_some() {}
+            let request = link_request(ann.destination_hash, 0);
+            let link = link_id_from_raw(request.as_slice(), HeaderType::Header2);
+            n.ingest(request.as_slice(), RxMeta::new(9), now).unwrap();
+            n.reverse.insert(
+                ReverseEntry {
+                    proof_hash: [0x55; 16],
+                    receiving_interface: 9,
+                    outbound_interface: IFACE,
+                    expires_ms: now + 60_000,
+                },
+                now,
+            );
+            let request = path_request([0x66; 16], [0x67; 16]);
+            assert_eq!(
+                n.ingest(request.as_slice(), RxMeta::new(IFACE), now)
+                    .unwrap(),
+                IngestAction::ForwardedPathRequest
+            );
+            while n.poll_tx().is_some() {}
+            (ann.destination_hash, link)
+        };
+        let routes = |n: &SmallNode, destination: &Hash16, link: &Hash16, now: u64| {
+            [
+                n.path(destination, now).is_some(),
+                n.links.get(link, now).is_some(),
+                n.reverse.get(&[0x55; 16], now).is_some(),
+                n.discoveries
+                    .entries
+                    .iter()
+                    .any(|entry| entry.requesters != 0),
+            ]
+        };
+
+        let mut n = node();
+        let (destination, link) = learn(&mut n, 1000);
+        assert_eq!(routes(&n, &destination, &link, 1100), [true; 4]);
+        assert!(n.update_interface(IFACE, 7, InterfaceMode::Full, 1000, false, false));
+        assert!(n.update_interface(IFACE, 8, InterfaceMode::Full, 1000, true, false));
+        assert_eq!(routes(&n, &destination, &link, 1100), [true; 4]);
+
+        n.retire_replaced_interface(IFACE);
+        assert_eq!(routes(&n, &destination, &link, 1100), [false; 4]);
+        assert!(n.interface_slot(IFACE).is_none());
+
+        let mut n = node();
+        let (destination, link) = learn(&mut n, 1000);
+        assert!(n.update_interface(IFACE, 7, InterfaceMode::Roaming, 1000, true, false));
+        assert_eq!(routes(&n, &destination, &link, 1100), [false; 4]);
     }
 
     #[test]
