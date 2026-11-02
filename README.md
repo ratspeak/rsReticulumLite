@@ -59,8 +59,10 @@ rns-lite-core = { git = "https://github.com/ratspeak/rsReticulumLite", rev = "<c
 ```
 
 The crate is distributed from source, not crates.io.
-See the [path-request example](examples/path_request.rs).
-Build API documentation with `cargo doc --workspace --no-deps --open`.
+See the [path-request example](examples/path_request.rs). Run it on the host
+with `cargo +1.89.0 run --example path_request --locked`; it queues and drains
+a packet in memory without transmitting it.
+Build API documentation with `cargo +1.87.0 doc --workspace --no-deps --locked --open`.
 
 ## License
 

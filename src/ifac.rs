@@ -1,8 +1,10 @@
 //! Reticulum Interface Access Control (IFAC) for no-std transports.
 //!
-//! IFAC wraps packets as `[flags|0x80, hops, tag, masked payload...]`. The tag
-//! is the trailing bytes of an Ed25519 signature over the original packet, and
-//! the mask is HKDF-SHA256 keyed by the tag and full 64-byte IFAC key.
+//! IFAC inserts a truncated Ed25519 tag after the two header bytes and masks
+//! the header and payload with HKDF output; only the IFAC flag bit and tag stay
+//! unmasked. Peers share the same key. This checks interface membership, not
+//! individual sender identity, and does not replace end-to-end encryption.
+//! The caller chooses a tag length appropriate for the interface and policy.
 
 use ed25519_dalek::{Signer, SigningKey};
 use hkdf::Hkdf;
@@ -39,6 +41,11 @@ impl From<BufferError> for IfacError {
     }
 }
 
+/// Derive the shared IFAC key from the network name and/or passphrase.
+/// `None` omits an input; `Some("")` hashes the empty string. Supplying neither
+/// still produces a deterministic key; it does not disable IFAC or provide a
+/// secret. The caller protects the returned key and chooses secret input when
+/// access must be restricted.
 pub fn derive_ifac_key(
     network_name: Option<&str>,
     passphrase: Option<&str>,
@@ -62,6 +69,10 @@ pub fn derive_ifac_key(
     Ok(key)
 }
 
+/// Wrap and mask a plain packet using a 1..=64-byte IFAC tag.
+/// Checks the two-byte minimum and MTU, but does not parse packet semantics.
+/// Supply a packet with the IFAC flag clear; transport/device limits may be
+/// smaller than the resulting `packet.len() + ifac_size` frame.
 pub fn ifac_sign_into(
     packet: &[u8],
     ifac_key: &[u8; IFAC_KEY_LENGTH],
@@ -102,6 +113,10 @@ pub fn ifac_sign_into(
     Ok(())
 }
 
+/// Unmask a frame and check its IFAC tag, writing the plain packet to `out`.
+/// Use `out` only on success: an authentication error leaves unverified bytes
+/// in it. Success checks shared-key membership, not packet semantics, sender
+/// identity or replay. The caller must parse and validate the recovered packet.
 pub fn ifac_verify_into(
     raw: &[u8],
     ifac_key: &[u8; IFAC_KEY_LENGTH],

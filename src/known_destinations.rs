@@ -85,6 +85,8 @@ impl<const N: usize> KnownDestinations<N> {
 
     /// Learn a delivery destination. Returns `true` only when the table changed.
     /// Re-observing the same key is a strict no-op; a conflicting key is rejected.
+    /// A new key must derive the supplied delivery hash, but authenticating its
+    /// announcement belongs to the caller. A full table evicts the least recent entry.
     pub fn learn(
         &mut self,
         destination_hash: [u8; DESTINATION_LENGTH],
@@ -151,6 +153,8 @@ impl<const N: usize> KnownDestinations<N> {
 
     /// Import a complete v1 blob. Validation is non-mutating: every entry is
     /// destination-bound and duplicate-free before live state is replaced.
+    /// Stored recency values are clamped to `now`. Hash binding does not prove
+    /// announcement authenticity; use trusted stored input.
     pub fn import(&mut self, blob: &[u8], now: u64) -> Result<(), KnownDestinationError> {
         if blob.len() < BLOB_HEADER_LEN || blob[..4] != BLOB_MAGIC {
             return Err(KnownDestinationError::InvalidHeader);

@@ -2,7 +2,7 @@
 //!
 //! The crate is unconditionally `no_std`, performs no allocation, and leaves
 //! clocks, entropy, persistence, and interface I/O to the embedding runtime.
-//! [`MicroNode`] and [`SmallNode`] provide reviewed capacity profiles; the
+//! [`MicroNode`] and [`SmallNode`] provide fixed capacity profiles; the
 //! const-generic [`LiteNode`] remains available for deliberate custom budgets.
 
 #![no_std]

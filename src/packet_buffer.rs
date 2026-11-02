@@ -24,6 +24,7 @@ impl<const CAP: usize> PacketBuffer<CAP> {
         Ok(out)
     }
 
+    /// Set the visible length to zero without erasing the backing bytes.
     pub fn clear(&mut self) {
         self.len = 0;
     }
@@ -62,6 +63,9 @@ impl<const CAP: usize> PacketBuffer<CAP> {
         Ok(())
     }
 
+    /// Change visible length within capacity without filling or erasing bytes.
+    /// Growing the length exposes existing backing contents, including bytes
+    /// retained by a previous [`Self::clear`].
     pub fn set_len(&mut self, len: usize) -> Result<(), BufferError> {
         if len > CAP {
             return Err(BufferError::InsufficientCapacity);

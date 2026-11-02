@@ -1,10 +1,10 @@
 //! Per-interface announce cap, from trusted rns-transport (`constants.rs` `ANNOUNCE_CAP`,
 //! `actor/maintenance.rs` `process_announce_queues`).
 //!
-//! Releasing a rebroadcast closes its interface's gate for `tx_time / cap`. LoRa cost is the
-//! modem airtime of the framed burst, the figure a host's duty limiter charges, instead of
-//! trusted's `len * 8 / bitrate`. Hosts with an interface registry keep one [`AnnounceGate`]
-//! per interface and release queued announces in [`release_precedes`] order.
+//! The host charges a gate for `tx_time / cap` after releasing an announce.
+//! LoRa helpers estimate the framed burst from the supplied modem settings;
+//! bitrate interfaces use `len * 8 / bitrate`. Keep one [`AnnounceGate`] per
+//! interface and release queued announces in [`release_precedes`] order.
 
 use crate::constants::LORA_FRAME_PAYLOAD_MAX;
 use crate::lora::LoraModemConfig;
@@ -22,12 +22,14 @@ const fn cap_floor(cap_permille: u16) -> u64 {
 }
 
 /// Gate interval after releasing an announce that occupies its interface for `tx_ms`.
+/// A zero cap means 0.1%, not unlimited; the result is rounded up to milliseconds.
 pub const fn spacing_ms(tx_ms: u32, cap_permille: u16) -> u64 {
     (tx_ms as u64 * 1000).div_ceil(cap_floor(cap_permille))
 }
 
 /// Trusted spacing on a bitrate interface, `len * 8 / bitrate / cap`, in whole milliseconds
-/// rounded up. An interface without a bitrate is ungated.
+/// rounded up, with saturating intermediate arithmetic. Zero bitrate returns
+/// `None` (ungated); zero cap uses 0.1%.
 pub const fn bitrate_spacing_ms(
     wire_len: usize,
     bitrate_bps: u64,
@@ -45,8 +47,9 @@ pub fn lora_spacing_ms(wire_len: usize, modem: LoraModemConfig, cap_permille: u1
     spacing_ms(lora_tx_ms(wire_len, modem), cap_permille)
 }
 
-/// Airtime of one packet as `LoraFramer` sends it: one frame up to 254 bytes, else two, each
-/// with its one-byte header.
+/// Estimate a valid `LoraFramer` packet's airtime: one frame through 254 bytes,
+/// otherwise two, each with its one-byte header. The caller must first enforce
+/// the framer's 508-byte packet limit and supply valid modem settings.
 pub fn lora_tx_ms(wire_len: usize, modem: LoraModemConfig) -> u32 {
     if wire_len <= LORA_FRAME_PAYLOAD_MAX {
         modem.frame_airtime_ms(wire_len + 1)
@@ -57,7 +60,8 @@ pub fn lora_tx_ms(wire_len: usize, modem: LoraModemConfig) -> u32 {
     }
 }
 
-/// Trusted release order: fewest hops first, then the longest queued.
+/// Release fewest hops first, then the oldest enqueue timestamp.
+/// `queued_ms` values are timestamps, not elapsed queue ages.
 pub const fn release_precedes(
     hops: u8,
     queued_ms: u64,
@@ -80,7 +84,9 @@ impl AnnounceGate {
         now_ms >= self.allowed_at_ms
     }
 
-    /// Close the gate for `spacing_ms` after a release.
+    /// Replace the deadline with `now_ms + spacing_ms`, saturating at `u64::MAX`.
+    /// The caller checks [`Self::is_open`] before release; this does not preserve
+    /// a later existing deadline.
     pub fn charge(&mut self, now_ms: u64, spacing_ms: u64) {
         self.allowed_at_ms = now_ms.saturating_add(spacing_ms);
     }

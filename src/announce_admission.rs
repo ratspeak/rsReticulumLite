@@ -37,7 +37,8 @@ impl AnnounceAdmission {
 
     /// Admit one announce through a bounded token bucket. PATH_RESPONSE announces
     /// are protocol-critical and always exempt. A zero rate means unlimited in
-    /// that phase, preserving the disabled default.
+    /// that phase, preserving the disabled default. `now_ms` is elapsed runtime
+    /// time: the grace interval is measured from zero, not the first call.
     pub fn admit(
         &mut self,
         config: AnnounceAdmissionConfig,

@@ -53,11 +53,10 @@ impl TableCaps {
         tx_queue_depth: 4,
     };
 
-    /// Cardputer-class endpoint profile (no PSRAM, ~55 KB free heap): caps mirror the donor
-    /// cardputer micro config (KNOWN_DESTINATIONS 48, HASHLIST 32 -> 64 margin,
-    /// QUEUED_ANNOUNCES 8, PR_TAGS 8, LoRa TX queue 4). Pairs with [`crate::MicroNode`]
-    /// (whole node asserted <= 32 KB). `recent_announces`/`random_blobs_per_path` are
-    /// vestigial for `LiteNode` (no const generic consumes them) — documentation values only.
+    /// Capacity preset paired with [`crate::MicroNode`]: 48 paths, 64 packet
+    /// hashes, eight queued announces and path-request tags, and TX depth four.
+    /// This does not measure a device's free memory. `recent_announces` and
+    /// `random_blobs_per_path` are retained fields with no `LiteNode` consumer.
     pub const ESP32_LORA_TRANSPORT_MICRO: Self = Self {
         path_entries: 48,
         announce_entries: 8,

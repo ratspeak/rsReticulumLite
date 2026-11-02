@@ -1,10 +1,10 @@
-//! Responder side of a Reticulum Link: accept, activate, identify, echo keepalives, go stale and
-//! close.
+//! Responder-side Reticulum Link state and packet helpers.
 //!
-//! Adapted from trusted rns-link (`Link::new_responder`, `receive_rtt_packet`,
-//! `handle_identification`, `tick`, `teardown`), byte-exact with Python `RNS.Link`. Entropy,
-//! clocks and packet I/O belong to the host; a session holds only its keys and timers. Endpoints
-//! accept the base 500-byte MTU whatever the initiator offers, as trusted does.
+//! The host supplies monotonic millisecond time, entropy and packet I/O. Accepted
+//! requests use AES-256 and are answered with MTU 500; malformed signalling and
+//! unsupported modes are rejected. Call [`ResponderSession::tick`] to advance
+//! timeouts and act on its result. No method starts a timer or transmits packets.
+//! Application authorization remains separate from Link establishment and identity proof.
 
 use crate::constants::{DESTINATION_LENGTH, MTU, PUBLIC_KEY_LENGTH};
 use crate::crypto::CryptoError;
@@ -72,9 +72,10 @@ pub enum Received {
     Data(usize),
     /// A keepalive; answer with [`ResponderSession::keepalive_response`] when `respond`.
     Keepalive { respond: bool },
-    /// The peer closed the Link.
+    /// An encrypted close payload began with this Link's ID; the session closed.
     Closed,
-    /// Nothing for the host: a repeated identification or an unsupported context.
+    /// No application event: unsupported context or a payload ignored by its
+    /// context handler. A repeated valid identification still refreshes liveness.
     Ignored,
 }
 
@@ -85,7 +86,8 @@ pub enum TickAction {
     Expired,
     /// No word from the peer for the stale time.
     Stale,
-    /// The stale grace ran out: send the LINKCLOSE from [`ResponderSession::teardown`].
+    /// Stale grace elapsed. The host should call [`ResponderSession::teardown`]
+    /// and send its close payload if available; this action alone does not close.
     Teardown,
 }
 
@@ -110,8 +112,9 @@ pub const fn link_header(
     }
 }
 
-/// A Link accepted by a destination this host owns. Not `Clone`: the session key is zeroized when
-/// it drops.
+/// Responder state for a destination owned by the host. The session key is
+/// wiped when this value is dropped; entering `Closed` does not itself wipe it.
+/// The host must route packets to the correct session and enforce peer policy.
 pub struct ResponderSession {
     link_id: [u8; DESTINATION_LENGTH],
     keys: LinkKeys,
@@ -129,9 +132,12 @@ pub struct ResponderSession {
 }
 
 impl ResponderSession {
-    /// Accept a LINKREQUEST payload addressed to `destination_hash`, writing the LRPROOF payload
-    /// into `proof` and returning its length. `ephemeral_x25519` is fresh host entropy; `hops` is
-    /// the request's received hop count.
+    /// Parse an accepted LINKREQUEST and write its LRPROOF payload into `proof`.
+    /// Returns a session in `Handshake` and the proof length. The caller must
+    /// verify that the request targets its `destination_hash` and that `identity`
+    /// is the associated signing identity; this function does not check that binding.
+    /// Supply fresh cryptographic `ephemeral_x25519`, the received hop count, and
+    /// monotonic `now_ms`. It does not transmit the proof or authorize the initiator.
     pub fn accept(
         identity: &LocalIdentity,
         destination_hash: &[u8; DESTINATION_LENGTH],
@@ -190,8 +196,17 @@ impl ResponderSession {
         self.remote_identity_hash
     }
 
-    /// Handle the context and payload of an inbound packet on this Link. Decrypted data lands in
-    /// `plaintext`. Packets that fail authentication change nothing.
+    /// Handle a packet already routed to this Link; no header or destination
+    /// validation occurs here. Decrypted bytes may be written to `plaintext`
+    /// before a context-specific check fails, so consume only the returned event.
+    /// Authentication failures leave session state unchanged.
+    ///
+    /// Application data requires `Active` or `Stale`; identification can arrive
+    /// during `Handshake`. The first valid identity is retained, but later valid
+    /// identifications still refresh liveness. An authenticated RTT with invalid
+    /// RTT encoding activates using the local measurement. Keepalive requests are
+    /// unencrypted and can revive a stale session. The caller applies authorization
+    /// and replay policy before acting on application data.
     pub fn receive(
         &mut self,
         context: PacketContext,
@@ -264,8 +279,11 @@ impl ResponderSession {
         }
     }
 
-    /// Encrypt application data for a packet on this Link (context `None`). `iv` is fresh host
-    /// entropy.
+    /// Encrypt application data in `Active` or `Stale` state and record
+    /// `now_ms` as outbound activity on success. Supply fresh, unpredictable IV
+    /// bytes and keep plaintext within [`crate::link::LINK_MDU`]; the Token helper
+    /// allows a larger buffer ceiling. Success constructs a payload, not proof of
+    /// transmission or delivery.
     pub fn seal(
         &mut self,
         plaintext: &[u8],
@@ -281,14 +299,18 @@ impl ResponderSession {
         Ok(len)
     }
 
-    /// The unencrypted keepalive answer, recorded as outbound traffic.
+    /// Return the unencrypted keepalive answer and record outbound activity.
+    /// The host sends it only when the receive event requests a response. This
+    /// method does not check state or transmit the answer.
     pub fn keepalive_response(&mut self, now_ms: u64) -> [u8; 1] {
         self.last_outbound_ms = Some(now_ms);
         [KEEPALIVE_RESPONSE]
     }
 
-    /// Close the Link and write the LINKCLOSE payload (the link id under the session key) into
-    /// `out`. `None` once already closed.
+    /// Close locally and try to encrypt a LINKCLOSE payload into `out` using a
+    /// fresh, unpredictable IV. Returns its length on success. `None` means either
+    /// the session was already closed or encryption/output capacity failed; the
+    /// session is closed in both cases. The host transmits any returned payload.
     pub fn teardown(&mut self, iv: &[u8; 16], out: &mut [u8]) -> Option<usize> {
         if self.state == SessionState::Closed {
             return None;
@@ -298,7 +320,10 @@ impl ResponderSession {
         len
     }
 
-    /// Advance the handshake, stale and grace timers.
+    /// Advance handshake, stale and grace timers using monotonic `now_ms`.
+    /// Handshake expiry closes immediately. Stale-grace expiry returns
+    /// [`TickAction::Teardown`] repeatedly until the host tears down or inbound
+    /// traffic revives the session. No packet is sent by this method.
     pub fn tick(&mut self, now_ms: u64) -> TickAction {
         match self.state {
             SessionState::Handshake => {

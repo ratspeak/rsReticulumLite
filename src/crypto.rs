@@ -1,18 +1,19 @@
-//! RNS SINGLE-destination encryption (ECIES) — `no_std`, no-alloc, fixed-buffer.
+//! RNS SINGLE-destination encryption (ECIES) with caller-owned buffers.
 //!
-//! Faithful port of rsReticulum `rns-crypto` (`token` + `Identity::encrypt`/`decrypt`). The
-//! embedded port has no RNG/clock, so the ephemeral X25519 key and the AES IV are CALLER-supplied
-//! (platform entropy on-device; fixed values for deterministic vectors). Output layout, byte-exact
-//! with Python Reticulum `Identity.encrypt`:
+//! The port uses the AES-256 Token format from rsReticulum. The caller supplies
+//! the ephemeral X25519 private key and IV from a cryptographic RNG; this module
+//! has no RNG or clock. Legacy AES-128 Tokens are not supported.
 //!
 //! ```text
 //! ephemeral_X25519_pub(32) || IV(16) || AES-256-CBC(PKCS7(plaintext)) || HMAC-SHA256(IV || ct)(32)
 //! ```
 //!
-//! Token key = `HKDF-SHA256(ikm = ECDH(ephemeral, target_x25519_pub), salt = recipient_identity_hash,
-//! info = "")` → 64 bytes. Per rns-crypto `Token::split_key`, the HMAC (signing) key is the FIRST
-//! 32 bytes and the AES-256 key is the LAST 32 bytes. AES-256 only (rsDeck never negotiates the
-//! legacy AES-128 Token).
+//! HKDF-SHA256 derives 64 bytes from the X25519 shared secret, using the recipient
+//! identity hash as salt and empty info. The first 32 bytes are the HMAC key and
+//! the last 32 are the AES key. Successful decryption checks the Token's HMAC and
+//! padding; it does not authenticate a sender identity or detect replay. Validate
+//! the enclosing protocol's signature and policy separately. The ECIES helpers
+//! do not reject an all-zero X25519 shared secret.
 
 use aes::Aes256;
 use cbc::cipher::block_padding::NoPadding;
@@ -42,13 +43,13 @@ pub const ECIES_FIXED_OVERHEAD: usize = 32 + TOKEN_OVERHEAD;
 /// Plaintext/ciphertext offset inside an in-place ECIES buffer (ephemeral + IV).
 pub const ECIES_PLAINTEXT_OFFSET: usize = 32 + 16;
 
-/// Largest plaintext the SINGLE-dest ECIES token can wrap and still fit the Reticulum MDU — the
-/// FORWARDABLE per-packet budget (MDU already reserves HEADER_MAXSIZE + IFAC so a relayed Header2
-/// packet fits MTU). Matches Python `RNS.Packet.ENCRYPTED_MDU`:
-/// `floor((MDU - ECIES_FIXED_OVERHEAD)/16)*16 - 1` = `floor((464-80)/16)*16 - 1` = 383. The `-1`
-/// keeps the PKCS7-padded ciphertext at exactly one block budget (383 → 384), so the blob
-/// (80 + 384 = 464) never exceeds the MDU. Building a larger message returns `PlaintextTooLong`
-/// (the caller falls back to link delivery, mirroring Python's OPPORTUNISTIC→DIRECT downgrade).
+/// Largest plaintext accepted by [`ecies_encrypt`]: 383 bytes.
+///
+/// The 464-byte MDU reserves room for forwarding headers and IFAC. After the
+/// 80 fixed ECIES bytes, 384 bytes remain for PKCS7-padded ciphertext, so the
+/// plaintext limit is `floor((MDU - ECIES_FIXED_OVERHEAD) / 16) * 16 - 1`.
+/// The helper returns `PlaintextTooLong` above this limit; the caller chooses
+/// another delivery method.
 pub const MAX_ECIES_PLAINTEXT: usize = (crate::constants::MDU - ECIES_FIXED_OVERHEAD) / 16 * 16 - 1;
 const _: () = assert!(MAX_ECIES_PLAINTEXT == 383);
 /// PKCS7-padded ciphertext budget: one full block past the max plaintext (383 pads to 384).
@@ -56,12 +57,12 @@ const PADDED_MAX: usize = MAX_ECIES_PLAINTEXT + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CryptoError {
-    /// Plaintext exceeds [`MAX_ECIES_PLAINTEXT`].
+    /// Plaintext exceeds the selected buffer/packet budget, or its size overflows.
     PlaintextTooLong,
     /// Caller's output buffer is too small for the result.
     OutputTooSmall,
-    /// Ciphertext is malformed (too short / not block-aligned) or the HMAC/padding did not validate.
-    /// All decrypt failures collapse here (padding-oracle defence).
+    /// Ciphertext shape, HMAC or padding validation failed.
+    /// An insufficient caller output buffer instead returns `OutputTooSmall`.
     AuthenticationFailed,
 }
 
@@ -108,17 +109,12 @@ fn derive_token_key(shared: &[u8; 32], salt: &[u8; 16]) -> [u8; 64] {
     okm
 }
 
-/// The raw RNS Token (Fernet-like) primitive — `IV(16) || AES-256-CBC(PKCS7(pt)) || HMAC-SHA256(32)`
-/// over a 64-byte combined key (`signing(32) || encryption(32)`). This is the shared inner layer of
-/// both SINGLE-destination ECIES (which prepends an ephemeral key) and link session encryption
-/// (which derives the key from the handshake). Byte-exact with rsReticulum `rns-crypto::token`.
+/// Encrypt a Token as `IV(16) || AES-256-CBC(PKCS7(pt)) || HMAC-SHA256(IV || ct)(32)`.
 ///
-/// Per `Token::split_key`, the HMAC (signing) key is the FIRST 32 bytes and the AES-256 key is the
-/// LAST 32. `PAD` bounds the PKCS7-padded plaintext (and, on decrypt, the accepted ciphertext) —
-/// each caller pins its own protocol budget so an oversized frame is rejected, not buffered.
-///
-/// `iv` is caller-supplied entropy (`no_std`: no RNG) and MUST be fresh per frame for real traffic;
-/// fixed only for deterministic test vectors.
+/// The 64-byte key contains the HMAC key followed by the AES key. `PAD` bounds
+/// the padded plaintext stored on the stack; `out` needs another 48 bytes for
+/// the IV and tag. Supply a fresh, unpredictable IV for each encryption.
+/// Fixed IVs are for deterministic tests only.
 pub fn token_encrypt<const PAD: usize>(
     plaintext: &[u8],
     key: &[u8; 64],
@@ -156,9 +152,13 @@ pub fn token_encrypt<const PAD: usize>(
     Ok(total)
 }
 
-/// Inverse of [`token_encrypt`]. Constant-time HMAC verify, then AES-CBC decrypt + PKCS7 unpad.
-/// Every malformed/forged input collapses to [`CryptoError::AuthenticationFailed`] (padding-oracle
-/// defence). `PAD` bounds the accepted ciphertext length.
+/// Verify the Token's HMAC, then decrypt and check PKCS7 padding.
+///
+/// HMAC comparison is constant-time. Malformed input returns
+/// [`CryptoError::AuthenticationFailed`]; valid plaintext that cannot fit in
+/// `out` returns [`CryptoError::OutputTooSmall`]. `PAD` bounds ciphertext and the
+/// temporary stack buffer. `out` is unchanged on error; on success the caller
+/// owns the returned plaintext and must wipe it when required.
 pub fn token_decrypt<const PAD: usize>(
     data: &[u8],
     key: &[u8; 64],
@@ -218,11 +218,11 @@ pub fn token_decrypt<const PAD: usize>(
     Ok(n)
 }
 
-/// In-place variant of [`token_encrypt`] for frames too large for a PAD-sized stack copy (resource
-/// blobs). Caller layout on entry: plaintext at `buf[16..16 + pt_len]`. Writes the IV, PKCS7-pads
-/// and AES-256-CBC-encrypts in place, then appends the HMAC; returns the total token length
-/// `16 + padded + 32`. The caller's fixed-size `buf` is the anti-DoS bound. Byte-identical output
-/// to [`token_encrypt`] for the same key/iv/plaintext.
+/// Encrypt without a plaintext-sized stack copy, using the same Token format
+/// as [`token_encrypt`]. On entry, place plaintext at `buf[16..16 + pt_len]`.
+/// The buffer must also fit PKCS7 padding and the trailing 32-byte HMAC.
+/// Returns the total Token length. The caller bounds the allocation and supplies
+/// a fresh, unpredictable IV for each encryption.
 pub fn token_encrypt_in_place(
     key: &[u8; 64],
     iv: &[u8; 16],
@@ -258,10 +258,12 @@ pub fn token_encrypt_in_place(
     Ok(total)
 }
 
-/// In-place inverse of [`token_encrypt_in_place`]: `buf` holds one full token
-/// (`IV || ct || HMAC`). Constant-time HMAC verify, then decrypt + unpad in place. On success the
-/// plaintext sits at `buf[16..16 + n]` and `n` is returned. Every malformed/forged input collapses
-/// to [`CryptoError::AuthenticationFailed`].
+/// Verify and decrypt exactly one Token (`IV || ct || HMAC`) in place.
+///
+/// On success, plaintext occupies `buf[16..16 + n]` and `n` is returned.
+/// Shape/HMAC failure leaves the buffer unchanged; invalid authenticated
+/// padding clears the decrypted region. No bytes may be used as plaintext
+/// after an error. The caller bounds the input and owns the plaintext buffer.
 pub fn token_decrypt_in_place(key: &[u8; 64], buf: &mut [u8]) -> Result<usize, CryptoError> {
     // IV(16) + >=1 ct block(16) + HMAC(32).
     if buf.len() < 16 + 16 + 32 {
@@ -305,16 +307,18 @@ pub fn token_decrypt_in_place(key: &[u8; 64], buf: &mut [u8]) -> Result<usize, C
     }
 }
 
-/// ECIES-encrypt `plaintext` to a recipient identity, writing
-/// `ephemeral_pub(32) || IV(16) || ct || HMAC(32)` into `out`; returns the byte length.
+/// Encrypt up to [`MAX_ECIES_PLAINTEXT`] bytes to a recipient, writing
+/// `ephemeral_pub(32) || IV(16) || ct || HMAC(32)` into `out` and returning its length.
 ///
-/// `target_x25519_pub` is the recipient's X25519 public key (the first 32 bytes of their 64-byte
-/// public key, or a ratchet public). `recipient_identity_hash` is the HKDF salt.
+/// Use the recipient's X25519 public key, or its selected ratchet public key,
+/// as `target_x25519_pub`; `recipient_identity_hash` remains the HKDF salt.
+/// The caller must authenticate that key/hash association. This function does
+/// not check key provenance or reject an all-zero shared secret.
 ///
-/// SECURITY: `ephemeral_priv` and `iv` are caller-supplied entropy (`no_std`: no RNG). On-device they
-/// MUST be freshly random PER MESSAGE — reusing an `(ephemeral_priv, iv)` pair across two different
-/// plaintexts leaks the AES-CBC key-stream relationship and breaks confidentiality. Fixed values are
-/// ONLY for deterministic test vectors, never for real traffic.
+/// Supply a fresh cryptographically random `ephemeral_priv` and unpredictable
+/// `iv` for each message. Fixed values are for deterministic tests only.
+/// Encryption may write the ephemeral public key before returning an output
+/// capacity error; use `out` only when the call succeeds.
 pub fn ecies_encrypt(
     plaintext: &[u8],
     target_x25519_pub: &[u8; 32],
@@ -412,10 +416,14 @@ pub fn ecies_decrypt_in_place(
     result
 }
 
-/// ECIES-decrypt a payload addressed to us into `out`; returns the plaintext length.
+/// Verify and decrypt an ECIES payload into `out`, returning its plaintext length.
 ///
-/// `my_x25519_priv` is the first 32 bytes of our raw 64-byte private key; `my_identity_hash` is the
-/// HKDF salt. Every malformed/forged input returns [`CryptoError::AuthenticationFailed`].
+/// `my_x25519_priv` is the identity or selected ratchet private key;
+/// `my_identity_hash` is the HKDF salt. The ciphertext budget matches
+/// [`ecies_encrypt`]. Shape, HMAC and padding failures return
+/// [`CryptoError::AuthenticationFailed`]; insufficient `out` capacity returns
+/// [`CryptoError::OutputTooSmall`]. `out` is unchanged on error. Success does not
+/// authenticate a sender identity or check replay.
 pub fn ecies_decrypt(
     data: &[u8],
     my_x25519_priv: &[u8; 32],
@@ -439,10 +447,13 @@ pub fn ecies_decrypt(
     result
 }
 
-/// ECIES-decrypt trying retained ratchet private keys newest-first, then the base identity key
-/// (upstream `Identity.decrypt` with ratchets; the base-key fallback is never disabled — no
-/// enforce mode, EMB ADR 2026-07-18). Returns the plaintext length and which ratchet index
-/// decrypted it (`None` = base key).
+/// Try `ratchet_privs` in slice order, then the base identity key. Returns the
+/// plaintext length and successful ratchet index (`None` for the base key).
+///
+/// Supply a bounded slice in newest-first order; this helper neither sorts nor
+/// limits it. Base-key fallback is always enabled. Failed ratchet attempts,
+/// including output-capacity errors, are discarded; if none succeeds, the
+/// base-key attempt determines the returned error.
 pub fn ecies_decrypt_with_ratchets(
     data: &[u8],
     ratchet_privs: &[[u8; 32]],
@@ -458,12 +469,12 @@ pub fn ecies_decrypt_with_ratchets(
     ecies_decrypt(data, my_x25519_priv, my_identity_hash, out).map(|len| (len, None))
 }
 
-/// ECIES-decrypt with the exact key selected by an earlier authenticated parse.
+/// Decrypt with exactly one key selected by an earlier successful decryption.
 ///
-/// This is the bounded second-pass counterpart to [`ecies_decrypt_with_ratchets`]:
-/// `Some(index)` selects exactly one retained ratchet and `None` selects exactly
-/// the base identity key. An out-of-range index fails closed. It prevents a
-/// peek-then-parse LXMF pipeline from scanning all 64 retained keys twice.
+/// `Some(index)` selects that retained ratchet; `None` selects the base key.
+/// An out-of-range index returns `AuthenticationFailed`, with no fallback or
+/// scan. Keep the key slice and ciphertext unchanged between passes. This
+/// avoids a second scan; it does not validate the sender or trust the hint.
 pub fn ecies_decrypt_with_ratchet_hint(
     data: &[u8],
     ratchet_privs: &[[u8; 32]],

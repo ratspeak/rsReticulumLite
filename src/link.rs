@@ -1,28 +1,25 @@
-//! Reticulum LINK establishment + session encryption — `no_std`, no-alloc, fixed-buffer.
+//! Reticulum Link handshake and encryption primitives with fixed buffers.
 //!
-//! Faithful port of rsReticulum `rns-link` (`handshake`, `key_derivation`, `encryption`,
-//! `mtu_discovery`), byte-exact with Python RNS 1.4.2 `RNS.Link`. This module provides
-//! cryptographic and wire primitives for initiators and responders; the caller owns
-//! the link state machine, timers and packet I/O.
+//! These helpers use the full Rust stack's wire layout and AES-256 Token format.
+//! The caller owns state, timers, entropy and packet I/O. Builders and proof
+//! validation enforce AES-256-CBC with an effective MTU of 500; structural
+//! parsers accept a wider signalling domain for callers to inspect.
 //!
-//! Handshake (two packets):
 //! ```text
-//! 1. LINKREQUEST  (initiator -> dest):  x25519_pub(32) || ed25519_pub(32) || signalling(3)
-//!    link_id = truncated_hash( 0x02 || dest_hash(16) || 0x00 || x25519_pub || ed25519_pub )
-//!    (the signalling trailer is EXCLUDED from the link_id so both sides agree pre-negotiation)
-//! 2. LRPROOF      (dest -> initiator):  signature(64) || responder_x25519_pub(32) || signalling(3)
-//!    signature = identity.sign( link_id || responder_x25519_pub || identity_ed25519_pub || signalling )
+//! LINKREQUEST: x25519_pub(32) || ed25519_pub(32) || signalling(3)
+//! LRPROOF:     signature(64) || responder_x25519_pub(32) || signalling(3)
 //! ```
-//! Both sides then derive the session key `HKDF-SHA256(64, ikm = ECDH, salt = link_id, info = "")`
-//! → `signing(32) || encryption(32)`, and frames are encrypted with the shared [`crate::crypto`]
-//! Token layer (`IV(16) || AES-256-CBC(PKCS7(pt)) || HMAC-SHA256(32)`). Only AES-256-CBC
-//! is supported; the legacy AES-128 link mode is rejected.
 //!
-//! Packet proofs ON an established link are role-strict (trusted `f7ae027`): the INITIATOR proves
-//! with the LINKREQUEST transient Ed25519 key (so it must retain that seed for the link's life),
-//! the RESPONDER proves with the destination identity; on-link proofs are always the explicit
-//! 96-byte form. The signer choice is the host owner's — [`crate::proof::build_proof`] takes an
-//! explicit signer and never falls back to the identity key.
+//! The link ID hashes the request's key block with its destination and packet
+//! type/context; signalling is excluded. The proof signs the link ID, responder
+//! X25519 key, destination Ed25519 key and optional signalling trailer. Legacy
+//! request/proof forms omit that trailer. Derivation uses X25519 and HKDF-SHA256
+//! with the link ID as salt, yielding `HMAC key(32) || AES key(32)`.
+//!
+//! On-link packet receipts use explicit 96-byte proofs. Initiators sign with the
+//! request's retained ephemeral Ed25519 seed via
+//! [`crate::proof::build_initiator_proof`]; responders use their destination
+//! identity via [`crate::proof::build_proof`]. The host enforces role and state.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hkdf::Hkdf;
@@ -49,10 +46,10 @@ pub const LINK_REQUEST_LEN: usize = ECPUBSIZE + LINK_MTU_SIZE;
 pub const LINK_PROOF_LEGACY_LEN: usize = SIGNATURE_LENGTH + KEYSIZE;
 pub const LINK_PROOF_LEN: usize = SIGNATURE_LENGTH + KEYSIZE + LINK_MTU_SIZE;
 
-/// AES-256-CBC link mode (the only mode rsDeck enables).
+/// AES-256-CBC link mode, the only mode enabled by these endpoint helpers.
 pub const MODE_AES256_CBC: u8 = 0x01;
 pub const DEFAULT_MODE: u8 = MODE_AES256_CBC;
-/// AES-256 derived key length: cipher(32) || HMAC(32).
+/// AES-256 derived key length: HMAC key(32) followed by AES key(32).
 pub const LINK_KEY_LENGTH: usize = 64;
 
 /// Build the plaintext for LINKIDENTIFY, adapted from `rns-link::Link::identify`.
@@ -108,18 +105,17 @@ pub fn verify_identification(
 const MTU_BYTEMASK: u32 = 0x001F_FFFF;
 const MODE_BYTEMASK: u32 = 0x00E0;
 
-/// PKCS7-padded plaintext budget for one link frame. A generous bound at the Reticulum MDU (a clean
-/// 29 AES blocks); the link/resource layer is responsible for sizing each frame's plaintext to fit
-/// the negotiated MTU — this is only the fixed-buffer / anti-DoS cap on what [`link_decrypt`] will
-/// buffer. Larger ciphertext is rejected, never allocated. NOTE: this is the receive-buffer ceiling,
-/// NOT the negotiated link plaintext MDU — use [`link_mdu`] / [`LINK_MDU`] for frame plaintext sizing.
+/// Fixed 464-byte padded-ciphertext/stack budget for link Token operations.
+/// This is larger than the padded budget of an ordinary 500-byte packet. The
+/// caller must enforce [`link_mdu`] / [`LINK_MDU`] before framing or sending;
+/// [`link_encrypt`] and [`link_decrypt`] enforce only this buffer ceiling.
 pub const LINK_PADDED_MAX: usize = MDU;
 const _: () = assert!(LINK_PADDED_MAX.is_multiple_of(16));
 
-/// Negotiated link plaintext MDU for a given MTU: the largest plaintext whose Token frame still
-/// fits one relayed packet, `floor((mtu - IFAC_MIN(1) - HEADER_MINSIZE - TOKEN_OVERHEAD)/16)*16 - 1`
-/// (the trailing `-1` reserves the PKCS7 worst case). Byte-exact with Python RNS 1.4.2 `Link.mdu` /
-/// rsReticulum `rns-link::Link::update_mdu`. Returns 0 when the MTU cannot carry one AES block.
+/// Compute the plaintext budget for an MTU using the Reticulum link formula:
+/// `floor((mtu - 1 - HEADER_MINSIZE - TOKEN_OVERHEAD) / 16) * 16 - 1`.
+/// Returns zero when no padded AES block fits. This arithmetic helper does not
+/// validate signalling or change the endpoint's fixed 500-byte admission limit.
 pub const fn link_mdu(mtu: usize) -> usize {
     let overhead = 1 + crate::constants::HEADER_MINSIZE + crate::crypto::TOKEN_OVERHEAD;
     if mtu <= overhead {
@@ -139,8 +135,8 @@ pub enum LinkError {
     OutputTooSmall,
     /// Payload length is not a valid LINKREQUEST / LRPROOF size.
     InvalidLength,
-    /// Requested encryption mode is not enabled (rsDeck enables AES-256-CBC only). Mirrors Python
-    /// `Link.signalling_bytes` raising for a mode outside `ENABLED_MODES`.
+    /// Encryption mode is outside the wire domain or unsupported by the operation.
+    /// Endpoint builders and proof validation enable only AES-256-CBC.
     UnsupportedMode,
     /// MTU is outside the checked protocol domain or fixed 500-byte endpoint budget.
     InvalidMtu,
@@ -156,7 +152,9 @@ pub struct SignallingData {
 }
 
 impl SignallingData {
-    /// Low-level masking representation; admission must use `try_new` or checked parsers.
+    /// Mask mode to three bits and MTU to 21 bits without validating either.
+    /// Use [`Self::try_new`] for domain checks; endpoint builders apply stricter
+    /// AES-256/MTU-500 admission checks.
     pub fn new(mode: u8, mtu: u32) -> Self {
         Self {
             mode: mode & 0x07,
@@ -164,8 +162,9 @@ impl SignallingData {
         }
     }
 
-    /// Checked construction adapted from trusted `rns-wire::link_signalling`.
-    /// Zero normalizes to the base contract; no input is masked or truncated.
+    /// Check the wire domain: mode 0..=7 and MTU zero or 500..=0x1F_FFFF.
+    /// Zero becomes 500. This accepts modes and MTUs the fixed endpoint does not
+    /// support; it does not mask out-of-range input.
     pub fn try_new(mode: u8, mtu: u32) -> Result<Self, LinkError> {
         if mode > 7 {
             return Err(LinkError::UnsupportedMode);
@@ -177,7 +176,8 @@ impl SignallingData {
         })
     }
 
-    /// Checked effective MTU while preserving original trailer bytes for signatures.
+    /// Return 500 for MTU zero, otherwise require 500..=0x1F_FFFF.
+    /// Does not check mode or mutate the stored trailer used for signatures.
     pub fn effective_mtu(self) -> Result<u32, LinkError> {
         match self.mtu {
             0 => Ok(crate::constants::MTU as u32),
@@ -202,12 +202,16 @@ impl SignallingData {
         Self::new(DEFAULT_MODE, crate::constants::MTU as u32)
     }
 
+    /// Pack the low three mode bits and low 21 MTU bits without validation.
+    /// Construct validated signalling first when masking would hide invalid input.
     pub fn pack(&self) -> [u8; 3] {
         let value = (self.mtu & MTU_BYTEMASK) | ((((self.mode as u32) << 5) & MODE_BYTEMASK) << 16);
         let bytes = value.to_be_bytes();
         [bytes[1], bytes[2], bytes[3]]
     }
 
+    /// Decode the first three bytes without domain or endpoint checks.
+    /// Returns `None` for shorter input and ignores any trailing bytes.
     pub fn unpack(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 3 {
             return None;
@@ -220,12 +224,12 @@ impl SignallingData {
     }
 }
 
-/// Compute the 16-byte link id from the destination hash and the LINKREQUEST payload.
+/// Hash `0x02 || destination_hash || 0x00 || request_data[..64]` to a 16-byte
+/// link ID, excluding the signalling trailer.
 ///
-/// `link_id = truncated_hash( 0x02 || dest_hash || 0x00 || request[..64] )` — the low flag nibble
-/// of a LINKREQUEST/Single packet (`0x02`), the destination hash, the `None` context byte, and the
-/// two ephemeral public keys. The signalling trailer is EXCLUDED (only the first 64 request bytes
-/// are hashed) so both peers agree on the same id regardless of MTU/mode negotiation.
+/// This helper does not validate request shape: shorter input is hashed as-is
+/// and bytes beyond the key block are ignored. Parse the request before using
+/// the result as a session identifier.
 pub fn compute_link_id(
     destination_hash: &[u8; DESTINATION_LENGTH],
     request_data: &[u8],
@@ -240,12 +244,13 @@ pub fn compute_link_id(
     truncated_hash(&hashable[..body + key_len])
 }
 
-/// Build a LINKREQUEST payload (initiator → destination) into `out`, returning its length (67).
+/// Build a 67-byte LINKREQUEST: `x25519_pub(32) || ed25519_pub(32) || signalling(3)`.
+/// Only AES-256 with effective MTU 500 is accepted; zero MTU becomes 500.
 ///
-/// `x25519_priv` and `ed25519_seed` are the initiator's per-link EPHEMERAL key material (caller-
-/// supplied entropy; `no_std` has no RNG). The initiator MUST retain `x25519_priv` to derive the
-/// session keys once the proof arrives. The two public keys are derived here and written as
-/// `x25519_pub(32) || ed25519_pub(32) || signalling(3)`.
+/// Supply fresh cryptographically random per-link private keys. Retain X25519
+/// material for session-key derivation and the Ed25519 seed for initiator
+/// packet proofs, then wipe caller copies when no longer needed. This helper
+/// derives public keys but does not transmit or retain the request.
 pub fn build_link_request(
     x25519_priv: &[u8; KEYSIZE],
     ed25519_seed: &[u8; KEYSIZE],
@@ -274,8 +279,9 @@ pub struct LinkRequestView {
 }
 
 impl LinkRequestView {
-    /// Parse a LINKREQUEST payload. Accepts exactly the legacy 64-byte or modern 67-byte form
-    /// (matching Python `Link.validate_request`); any other length is rejected.
+    /// Parse exactly 64 bytes (legacy) or 67 bytes (with signalling).
+    /// Legacy input uses AES-256/MTU-500 defaults. Checks the MTU wire domain but
+    /// does not restrict the mode, authenticate the keys or enforce endpoint MTU.
     pub fn parse(data: &[u8]) -> Result<Self, LinkError> {
         if data.len() != LINK_REQUEST_LEGACY_LEN && data.len() != LINK_REQUEST_LEN {
             return Err(LinkError::InvalidLength);
@@ -299,13 +305,14 @@ impl LinkRequestView {
     }
 }
 
-/// Build an LRPROOF payload (destination → initiator) into `out`, returning its length (99).
+/// Build a 99-byte LRPROOF using the destination's long-term signing identity
+/// and a fresh caller-supplied ephemeral X25519 private key. Only AES-256 with
+/// effective MTU 500 is accepted; zero MTU becomes 500.
 ///
-/// `identity` is the destination's LONG-TERM identity (its Ed25519 key authenticates the link).
-/// `responder_x25519_priv` is the responder's per-link EPHEMERAL X25519 key (caller-supplied; the
-/// responder retains it to derive the session keys). The signature binds
-/// `link_id || responder_x25519_pub || identity_ed25519_pub || signalling`. Layout:
-/// `signature(64) || responder_x25519_pub(32) || signalling(3)`.
+/// The signature covers `link_id || responder_x25519_pub || identity_ed25519_pub || signalling`.
+/// Output is `signature(64) || responder_x25519_pub(32) || signalling(3)`.
+/// The caller binds the identity and link ID to the accepted request and keeps
+/// the ephemeral private key long enough to derive session keys.
 pub fn build_link_proof(
     identity: &LocalIdentity,
     responder_x25519_priv: &[u8; KEYSIZE],
@@ -352,7 +359,9 @@ pub struct LinkProofView {
 }
 
 impl LinkProofView {
-    /// Parse an LRPROOF payload. Accepts exactly the legacy 96-byte or modern 99-byte form.
+    /// Parse exactly 96 bytes (legacy) or 99 bytes (with signalling).
+    /// Checks the MTU wire domain; use [`Self::validate`] to verify the signature
+    /// and fixed endpoint's mode/MTU restrictions. Parsing alone authenticates nothing.
     pub fn parse(data: &[u8]) -> Result<Self, LinkError> {
         if data.len() != LINK_PROOF_LEGACY_LEN && data.len() != LINK_PROOF_LEN {
             return Err(LinkError::InvalidLength);
@@ -376,14 +385,13 @@ impl LinkProofView {
         })
     }
 
-    /// Verify this proof against the destination identity's 64-byte public key and the link id.
-    /// Reconstructs `link_id || responder_x25519_pub || identity_ed25519_pub || signalling` and
-    /// checks the Ed25519 signature (permissive `verify`, matching pyca / the network).
+    /// Verify the proof with the expected destination identity's Ed25519 key
+    /// and original link ID. Requires AES-256 with effective MTU 500.
     ///
-    /// Rejects any proof whose advertised mode is not AES-256-CBC — rsDeck's only enabled link mode.
-    /// This mirrors Python `Link.validate_proof` raising on `mode != self.mode` (the initiator's mode
-    /// is always AES-256), so a peer that down-/cross-negotiates to AES-128 or GCM fails visibly here
-    /// instead of silently agreeing on an AES-256 key the peer isn't using.
+    /// The signed fields include the raw signalling trailer when present; legacy
+    /// proofs omit it. The caller must authenticate the destination-key binding
+    /// and supply the link ID of its pending request. This does not activate a
+    /// session or identify the initiator.
     pub fn validate(
         &self,
         identity_public_key: &[u8; PUBLIC_KEY_LENGTH],
@@ -423,9 +431,10 @@ pub struct LinkKeys {
 }
 
 impl LinkKeys {
-    /// `HKDF-SHA256(64, ikm = ECDH(my_x25519_priv, peer_x25519_pub), salt = link_id, info = "")`.
-    /// Byte-exact with Python `Link.handshake` (`derived_key_length = 64`, `salt = link_id`,
-    /// `context = None`).
+    /// Derive `HMAC key(32) || AES key(32)` with HKDF-SHA256 over the X25519
+    /// shared secret, using `link_id` as salt and empty info. This does not
+    /// authenticate the handshake, validate key provenance or reject an all-zero
+    /// shared secret. The caller must complete the role's handshake checks.
     pub fn derive(
         my_x25519_priv: &[u8; KEYSIZE],
         peer_x25519_pub: &[u8; KEYSIZE],
@@ -440,10 +449,9 @@ impl LinkKeys {
         Self { key }
     }
 
-    /// Reconstruct from a previously-derived combined key (`signing(32) || encryption(32)`). For the
-    /// firmware seam, where the C++ link owner holds the 64-byte session key for the link's lifetime
-    /// and passes it back per frame — the key never re-derives, so the per-frame call is stateless.
-    /// The caller MUST zeroize its copy when the link closes.
+    /// Copy a previously derived `HMAC key(32) || AES key(32)`.
+    /// The new value wipes its own key on drop; the caller must also wipe the
+    /// original copy when the link closes.
     pub fn from_combined(key: &[u8; LINK_KEY_LENGTH]) -> Self {
         Self { key: *key }
     }
@@ -468,9 +476,10 @@ impl Drop for LinkKeys {
     }
 }
 
-/// Encrypt a link frame with the session key. `iv` is caller-supplied entropy and MUST be fresh per
-/// frame (reusing an IV across two plaintexts under one key leaks the CBC key-stream relationship).
-/// Output: `IV(16) || AES-256-CBC(PKCS7(pt)) || HMAC-SHA256(32)`.
+/// Encrypt with the link's session key and a fresh, unpredictable IV.
+/// Output is `IV(16) || AES-256-CBC(PKCS7(pt)) || HMAC-SHA256(IV || ct)(32)`.
+/// The caller enforces the packet plaintext limit; this helper checks only
+/// [`LINK_PADDED_MAX`] and output capacity, and does not transmit the frame.
 pub fn link_encrypt(
     keys: &LinkKeys,
     plaintext: &[u8],
@@ -480,8 +489,10 @@ pub fn link_encrypt(
     token_encrypt::<LINK_PADDED_MAX>(plaintext, keys.combined(), iv, out)
 }
 
-/// Decrypt a link frame with the session key. Every malformed/forged input collapses to
-/// [`CryptoError::AuthenticationFailed`].
+/// Verify and decrypt a link Token. Shape, HMAC and padding failures return
+/// [`CryptoError::AuthenticationFailed`]; insufficient output capacity returns
+/// [`CryptoError::OutputTooSmall`]. Output is unchanged on error. The caller
+/// checks packet framing, session state and application/replay policy.
 pub fn link_decrypt(
     keys: &LinkKeys,
     ciphertext: &[u8],

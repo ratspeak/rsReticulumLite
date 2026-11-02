@@ -1,50 +1,41 @@
-//! Reticulum RESOURCE transfer (staged: single resource, single segment) — `no_std`, no-alloc,
-//! fixed-buffer.
+//! Bounded Reticulum RESOURCE transfers without allocation.
 //!
-//! Faithful adaptation of rsReticulum `rns-protocol` (`resource.rs` / `resource_adv.rs`), byte-exact
-//! with Python RNS 1.4.2 `RNS.Resource`. The lite endpoint provides the resource MECHANISM
-//! (advertisement codec, part hashing, part request/response, delivery proof, bounded reassembly);
-//! the transfer state machine and persistence stay with the host owner (mirroring the link.rs
-//! split); retry/window timing is host-driven too, with [`AdvWatchdog`] encoding the trusted ADV
-//! retry policy against a caller-supplied clock. Entropy (`random_hash`, IV) is caller-supplied.
+//! Adapted from the full Rust `rns-protocol` resource implementation. This module supplies
+//! advertisement encoding, part selection, reassembly and delivery proofs. The host owns
+//! authenticated Link routing, transfer admission, persistence, transmission and timers.
+//! [`AdvWatchdog`] uses a caller-supplied clock; all entropy is supplied by the caller.
 //!
-//! Wire formats (all byte-exact with rns-protocol / Python):
+//! Wire layout:
 //! ```text
-//! blob      = Token( random_hash(4) || data )          — ONE link-session Token over the whole
-//!             payload (IV(16) || AES-256-CBC(PKCS7) || HMAC(32)); parts are raw SDU-sized chunks
-//!             of this ciphertext (packet context RESOURCE, sent without re-encryption).
-//! ADV       = msgpack fixmap, keys in order: t(transfer_size) d(data_size) n(num_parts)
+//! blob      = Token(random_hash(4) || data)
+//!             IV(16) || AES-256-CBC(PKCS7) || HMAC(32)
+//!             Parts are raw ciphertext chunks (RESOURCE context, no second encryption).
+//! ADV       = msgpack map with keys t(transfer_size) d(data_size) n(num_parts)
 //!             h(resource_hash,32) r(random_hash,4) o(original_hash,32) i(segment_index)
-//!             l(total_segments) q(request_id | nil) f(flags byte) m(hashmap, 4B/part)
-//!             — sent link-encrypted (context RESOURCE_ADV).
+//!             l(total_segments) q(request_id | nil) f(flags) m(hashmap, 4 bytes/part)
+//!             Sent Link-encrypted with RESOURCE_ADV context.
 //! map_hash  = SHA-256(part_ciphertext || random_hash)[..4]
-//! hash      = SHA-256(data || random_hash)              (over PLAINTEXT data)
+//! hash      = SHA-256(data || random_hash)
 //! REQ       = exhausted_flag(1) || [last_map_hash(4) when 0xFF] || resource_hash(32)
-//!             || wanted_map_hashes(4N)                  (context RESOURCE_REQ, link-encrypted)
-//! PROOF     = resource_hash(32) || SHA-256(data || resource_hash)(32)   (context RESOURCE_PRF)
-//! flags f   = bit0 encrypted, 1 compressed, 2 split, 3 is_request, 4 is_response, 5 has_metadata
+//!             || wanted_map_hashes(4N), Link-encrypted with RESOURCE_REQ context
+//! PROOF     = resource_hash(32) || SHA-256(data || resource_hash)(32), RESOURCE_PRF context
+//! flags     = bit0 encrypted, 1 compressed, 2 split, 3 is_request, 4 is_response, 5 has_metadata
 //! ```
 //!
-//! Honest-subset bounds (fail-closed, documented divergences from the full stack):
-//! - MCU caps: [`MAX_PARTS`] parts / [`TRANSFER_MAX`] ciphertext / [`DATA_MAX`] payload per
-//!   resource. Larger advertisements return [`ResourceError::TooLarge`]. The host must send an
-//!   encrypted RESOURCE_RCL containing [`ResourceAdv::rejection_hash`] to notify the sender.
-//! - UNCOMPRESSED only: the fleet ships bz2 disabled (micro fork) and lite targets MCU, so
-//!   compressed ADVs are rejected at accept time ([`ResourceError::CompressedUnsupported`]) — the
-//!   honest no-bz2 behaviour (a bz2-less peer would fail the transfer at assembly; lite fails it
-//!   up front instead of accepting parts it can never decode). The sender never sets the flag.
-//! - Single segment only (`split`/multi-segment and metadata-prefixed resources rejected), plain
-//!   transfers by default. A response is accepted only through the explicit
-//!   pending-request-bound constructor; requests are rejected. Encrypted-only (Python link resources
-//!   always set `encrypted`; a plaintext ADV is refused).
-//! - `random_hash` and the Token IV are caller-supplied entropy. On a map-hash collision the
-//!   builder returns [`ResourceError::MapHashCollision`]; the caller retries with fresh
-//!   `random_hash` (rns-protocol/Python loop internally on their own RNG).
-//! - With ≤ [`MAX_PARTS`] parts the FULL hashmap always fits one ADV (capacity 74 at MTU 500), so
-//!   the receiver never exhausts its hashmap and HMU segments are not needed.
+//! Each transfer is limited to [`MAX_PARTS`] parts, [`TRANSFER_MAX`] ciphertext bytes and
+//! [`DATA_MAX`] payload bytes. Inbound constructors require one encrypted, uncompressed
+//! segment without metadata. Ordinary transfers use [`InboundResource::from_advertisement`];
+//! responses use [`InboundResource::from_response_into`] with a live pending request ID.
+//! Request resources are unsupported. Parsing an advertisement alone does not admit it.
 //!
-//! [`OutboundResource`]/[`InboundResource`] embed a [`TRANSFER_MAX`]-byte buffer (~3.7 KiB); place
-//! them in static storage on MCU targets rather than the stack.
+//! The full hashmap fits in one advertisement, so no hashmap updates are needed. If the
+//! sender finds a truncated map-hash collision, construction returns
+//! [`ResourceError::MapHashCollision`]; retry with fresh randomness. To refuse an authenticated
+//! advertisement, the host can use [`ResourceAdv::rejection_hash`] for its RESOURCE_RCL payload.
+//!
+//! Each endpoint embeds a [`TRANSFER_MAX`]-byte buffer. Account for the full object and
+//! construction temporaries when placing it on an MCU. These types do not wipe memory on
+//! drop; an inbound buffer retains decrypted data after assembly, including a hash failure.
 
 use sha2::{Digest, Sha256};
 
@@ -102,8 +93,8 @@ pub const fn hashmap_max_len(mdu: usize) -> usize {
 }
 const _: () = assert!(hashmap_max_len(LINK_MDU) == 74);
 
-/// MCU bound: parts per resource. 8 × 464 B keeps each endpoint buffer under 4 KiB while still
-/// carrying a full LXMF message with attachments headroom; the full hashmap always fits one ADV.
+/// Maximum parts per resource. Eight 464-byte parts keep the ciphertext buffer below 4 KiB;
+/// the full hashmap fits in one advertisement. Application data must fit [`DATA_MAX`].
 pub const MAX_PARTS: usize = 8;
 const _: () = assert!(MAX_PARTS <= hashmap_max_len(LINK_MDU));
 
@@ -116,9 +107,10 @@ const _: () = assert!(TRANSFER_MAX.is_multiple_of(16));
 pub const DATA_MAX: usize = (TRANSFER_MAX - TOKEN_OVERHEAD) - 1 - RANDOM_HASH_SIZE;
 const _: () = assert!(DATA_MAX == 3659);
 
-/// Worst-case packed ADV size at lite bounds (u32 ints, 32-byte request id, full hashmap).
+/// Output buffer bound for a packed ADV (u32 integers, 32-byte request ID, full hashmap).
 pub const ADV_PACKED_MAX: usize = 192;
-/// Worst-case lite part request: flag + resource_hash + MAX_PARTS wanted hashes.
+/// Maximum request emitted by the lite receiver: flag + resource hash + wanted hashes.
+/// An incoming exhausted-hashmap request has four additional bytes and may request more parts.
 pub const REQUEST_MAX: usize = 1 + 32 + MAX_PARTS * MAPHASH_LEN;
 
 /// Token length for `pt_len` bytes of plaintext: IV + PKCS7-padded body + HMAC.
@@ -136,9 +128,9 @@ pub enum ResourceError {
     CompressedUnsupported,
     /// Multi-segment (`split`) resource — lite is single-segment only.
     SplitUnsupported,
-    /// Metadata-prefixed resource — outside the staged lite scope.
+    /// Metadata-prefixed resource; unsupported by this endpoint.
     MetadataUnsupported,
-    /// Request/response resource (`q`/`is_request`/`is_response`) — outside the lite scope.
+    /// Request resource, or response/request ID that does not match the chosen constructor.
     RequestResponseUnsupported,
     /// ADV without the `encrypted` flag; link resources are always Token-encrypted.
     EncryptionRequired,
@@ -156,7 +148,7 @@ pub enum ResourceError {
     InvalidState,
     /// Caller-supplied output buffer too small.
     OutputTooSmall,
-    /// Blob encryption/decryption failure (bad session keys or forged ciphertext).
+    /// Failure returned by the Token encryption/decryption operation.
     Crypto(CryptoError),
 }
 
@@ -173,6 +165,7 @@ pub struct ResourceFlags {
 }
 
 impl ResourceFlags {
+    /// Encode the six defined flags; bits 6 and 7 are zero.
     pub fn to_byte(self) -> u8 {
         (self.encrypted as u8)
             | ((self.compressed as u8) << 1)
@@ -182,6 +175,7 @@ impl ResourceFlags {
             | ((self.has_metadata as u8) << 5)
     }
 
+    /// Decode bits 0–5 and discard the reserved high bits.
     pub fn from_byte(b: u8) -> Self {
         Self {
             encrypted: b & 0x01 != 0,
@@ -201,7 +195,9 @@ fn hash_pair(a: &[u8], b: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// `SHA-256(part || random_hash)[..4]` — identifies a part slot in the hashmap.
+/// `SHA-256(part || random_hash)[..4]`, used to select a part slot.
+/// This truncated hash does not authenticate a complete resource; assembly checks the Token
+/// HMAC and full resource hash.
 pub fn get_map_hash(part: &[u8], random_hash: &[u8; RANDOM_HASH_SIZE]) -> [u8; MAPHASH_LEN] {
     let full = hash_pair(part, random_hash);
     let mut mh = [0u8; MAPHASH_LEN];
@@ -369,8 +365,9 @@ pub struct ResourceAdv {
 }
 
 impl ResourceAdv {
-    /// Encode as msgpack, byte-exact with rns-protocol `ResourceAdvertisement::pack` / Python
-    /// `ResourceAdvertisement.pack`. Returns the packed length (≤ [`ADV_PACKED_MAX`]).
+    /// Encode the eleven fields in the module's listed order using minimal unsigned integers.
+    /// Returns the length, at most [`ADV_PACKED_MAX`]. Checks array lengths, but does not
+    /// validate transfer sizes, flags or part counts. A short output may contain a partial map.
     pub fn pack(&self, out: &mut [u8]) -> Result<usize, ResourceError> {
         if self.hashmap_len > self.hashmap.len() || self.request_id_len > self.request_id.len() {
             return Err(ResourceError::InvalidAdvertisement);
@@ -406,11 +403,15 @@ impl ResourceAdv {
         Ok(w.pos)
     }
 
-    /// Decode an advertisement produced by [`Self::pack`], rns-protocol, or Python. Total parser:
-    /// requires the canonical 11-key map (any key order, no duplicates), exact hash/random-tag
-    /// lengths, integers ≤ `u32::MAX`, and a whole-entry hashmap that fits the lite part cap
-    /// (larger resources return [`ResourceError::TooLarge`]). Trailing bytes after the map are
-    /// ignored (both references decode a single object).
+    /// Decode an eleven-key fixmap, in any key order with no duplicate or unknown keys.
+    /// Keys must be one-byte fixstrings; binary values use bin8/bin16. Unsigned integer
+    /// encodings through uint64 are accepted if their value fits `u32`, including nonminimal
+    /// encodings. Hashes must be 32 bytes, the random tag four bytes, and `q` nil or at most
+    /// [`REQUEST_ID_MAX`] bytes. Flags must fit one byte. The hashmap must contain whole
+    /// four-byte entries and fit [`MAX_PARTS`]. Reserved flag bits and trailing bytes are ignored.
+    ///
+    /// This checks representation only. Authenticate the Link packet and use an inbound
+    /// constructor to validate transfer bounds, purpose and supported features.
     pub fn parse(data: &[u8]) -> Result<Self, ResourceError> {
         let adv = Self::parse_bounded(data)?;
         if adv.hashmap_len > MAX_PARTS * MAPHASH_LEN {
@@ -419,17 +420,20 @@ impl ResourceAdv {
         Ok(adv)
     }
 
-    /// Identify a syntactically valid advertisement even when its hashmap exceeds our endpoint
-    /// capacity. The host can refuse it with RESOURCE_RCL without allocating a transfer or
-    /// accepting its data. As in the trusted runtime, cancellation names the segment hash `h`,
-    /// not the original multi-segment hash `o`. Malformed maps never yield a cancellation target.
+    /// Extract the segment hash `h` for a refusal, allowing a hashmap beyond the endpoint cap.
+    /// Validates the same representation as [`Self::parse`]. An oversized hashmap is checked
+    /// as a slice without copying. The bin16 length and whole-entry rule limit it to 65,532 bytes.
+    /// This does not authenticate the advertisement or authorize cancellation of a live
+    /// transfer; the host must bind the authenticated Link and transfer before acting.
     pub fn rejection_hash(data: &[u8]) -> Result<[u8; 32], ResourceError> {
         Ok(Self::parse_bounded(data)?.resource_hash)
     }
 
-    /// Inspect a response's request binding without admitting its transfer. Oversized or
-    /// compressed responses still identify the waiting request so the host can fail it
-    /// explicitly. Malformed maps and other resource purposes never expose an ID.
+    /// Extract a 16-byte ID from a response advertisement without admitting its transfer.
+    /// Uses the representation checks of [`Self::rejection_hash`], then requires `is_response`
+    /// and rejects `is_request`. Oversized or compressed responses can still yield an ID.
+    /// The caller must match it to a live request on the authenticated Link and interface
+    /// incarnation before changing that request's state.
     pub fn response_id(data: &[u8]) -> Result<[u8; 16], ResourceError> {
         let adv = Self::parse_bounded(data)?;
         if !adv.flags.is_response || adv.flags.is_request || adv.request_id_len != 16 {
@@ -550,8 +554,10 @@ pub struct PartRequestView<'a> {
 }
 
 impl<'a> PartRequestView<'a> {
-    /// Total parser for a request payload. Trailing bytes that do not fill a whole map hash are
-    /// ignored (mirrors rns-protocol's `chunks_exact`).
+    /// Parse a decrypted request payload. Only flag `0xFF` means exhausted; every other byte
+    /// selects the ordinary form. Trailing one to three bytes are ignored, and the requested
+    /// hash count is not capped at [`MAX_PARTS`]. The caller authenticates the Link and binds
+    /// the resource before serving the request.
     pub fn parse(data: &'a [u8]) -> Result<Self, ResourceError> {
         let flag = *data.first().ok_or(ResourceError::InvalidRequest)?;
         let wants_more_hashmap = flag == HASHMAP_IS_EXHAUSTED;
@@ -590,14 +596,15 @@ impl<'a> PartRequestView<'a> {
         })
     }
 
+    /// Number of complete four-byte hashes, excluding any trailing partial hash.
     pub fn requested_count(&self) -> usize {
         self.requested.len() / MAPHASH_LEN
     }
 }
 
-/// Receiver flow-control window (Python `Resource` window fields; rns-protocol `WindowState`).
-/// The lite core exposes it; the host owner decides WHEN to grow (batch completed) or shrink
-/// (timeout), since the core has no clock.
+/// Receiver window controlled by the host: grow after a batch, shrink after a timeout.
+/// Fields are public; preserve sensible bounds when changing them. Receiver methods add
+/// `window` to the completed-part index, and counters increment without saturation.
 #[derive(Clone, Copy, Debug)]
 pub struct WindowState {
     pub window: usize,
@@ -618,10 +625,11 @@ impl WindowState {
         }
     }
 
-    /// Grow after a completed batch; `rate` is the observed transfer rate in bytes/sec, or 0 when
-    /// the host has no estimate (0 is NEUTRAL: Python only feeds measured rates into the tier
-    /// counters, so an unknown rate must not count as a very-slow round). A run of fast/very-slow
-    /// rounds promotes/demotes the ceiling.
+    /// Grow after a completed batch; `rate` is bytes/sec, or zero for no estimate.
+    /// Zero leaves rate counters unchanged. Four fast observations promote the ceiling to 75;
+    /// two very-slow observations reduce it to four and clamp the current window. Intermediate
+    /// rates clear both counters but do not restore the initial ceiling. Zero observations
+    /// between qualifying observations do not break their run.
     pub fn grow(&mut self, rate: usize) {
         if self.window < self.window_max {
             self.window += 1;
@@ -684,8 +692,9 @@ fn has_map_hash_collision(map_hashes: &[[u8; MAPHASH_LEN]]) -> bool {
     false
 }
 
-/// Sender side of a single-segment resource: the Token-encrypted blob plus everything the wire
-/// needs (ADV fields, map hashes, expected proof). ~3.7 KiB — statically place on MCU.
+/// Sender state for one segment: ciphertext, advertisement fields, map hashes and proof.
+/// Use only after successful construction. The embedded buffer is [`TRANSFER_MAX`] bytes;
+/// the complete object is larger. No memory wiping is performed on drop.
 pub struct OutboundResource {
     buf: [u8; TRANSFER_MAX],
     total_size: u32,
@@ -709,8 +718,8 @@ impl core::fmt::Debug for OutboundResource {
 }
 
 impl OutboundResource {
-    /// All-zero resource (valid: every field is a zeroable POD). Used to obtain a
-    /// destination for [`Self::build_into`] without a large by-value temporary.
+    /// Empty storage for [`Self::build_into`], with zero parts.
+    /// It is not a sendable transfer; build successfully before using its advertisement or proof.
     pub const fn zeroed() -> Self {
         Self {
             buf: [0u8; TRANSFER_MAX],
@@ -724,18 +733,15 @@ impl OutboundResource {
         }
     }
 
-    /// Build a resource IN PLACE into `self`: hash the plaintext, Token-encrypt
-    /// `random_hash || data` with the link session keys, chunk into SDU parts and
-    /// derive the map hashes. `self` is typically heap-resident (the
-    /// [`TRANSFER_MAX`]-byte `buf` is ~3.7 KiB), so this avoids the ~7.7 KiB stack
-    /// frame a by-value [`Self::build`] costs — which overflows small MCU task stacks
-    /// (loopTask).
+    /// Build in place: hash the plaintext, encrypt `random_hash || data` with the Link keys,
+    /// divide the ciphertext into [`SDU`]-sized parts, and derive the map hashes.
+    /// In-place construction avoids returning the large buffer by value; actual stack use
+    /// depends on the target and build profile.
     ///
-    /// `random_hash` and `iv` are caller-supplied entropy and MUST be fresh per
-    /// resource for real traffic (fixed only for deterministic vectors). On
-    /// [`ResourceError::MapHashCollision`] retry with a fresh `random_hash`.
-    /// On any error `self` is left invalidated (`num_parts == 0`), never a mix of
-    /// old metadata over new ciphertext.
+    /// Supply fresh random tags and unpredictable IVs for real transfers. On
+    /// [`ResourceError::MapHashCollision`], retry with fresh randomness. Oversized input returns
+    /// [`ResourceError::TooLarge`] without changing the previous resource. Errors after that
+    /// size check leave `num_parts == 0`; do not send or validate a proof from that state.
     pub fn build_into(
         &mut self,
         data: &[u8],
@@ -786,6 +792,7 @@ impl OutboundResource {
         Ok(())
     }
 
+    /// Construct by value using [`Self::build_into`]; account for the large buffer on MCU stacks.
     pub fn build(
         data: &[u8],
         keys: &LinkKeys,
@@ -822,7 +829,8 @@ impl OutboundResource {
         Some(&self.buf[i * SDU..((i + 1) * SDU).min(total)])
     }
 
-    /// The single-segment advertisement for this resource (`encrypted` set, full hashmap).
+    /// Build the single-segment advertisement (`encrypted` set, full hashmap).
+    /// Requires a successful build; zeroed or failed construction does not produce a valid ADV.
     pub fn advertisement(&self) -> ResourceAdv {
         let mut adv = ResourceAdv {
             transfer_size: self.total_size,
@@ -846,10 +854,10 @@ impl OutboundResource {
         adv
     }
 
-    /// Part indices to (re)send for a parsed request, in wire order (sender-side RESOURCE_REQ
-    /// service, mirroring rns-protocol `handle_request`'s hash matching). Requests addressed to a
-    /// different resource hash return zero parts (Python's link routes RESOURCE_REQs by hash and
-    /// ignores non-matching ones).
+    /// Return matching part indices in ascending resource-part order, once per index.
+    /// A different resource hash returns zero parts. The exhausted flag does not generate
+    /// a hashmap update: this endpoint advertises all hashes at once. Authenticate and bind
+    /// the request before using these indices to send data.
     pub fn requested_parts(&self, req: &PartRequestView<'_>) -> ([usize; MAX_PARTS], usize) {
         let mut idx = [0usize; MAX_PARTS];
         let mut n = 0;
@@ -865,8 +873,9 @@ impl OutboundResource {
         (idx, n)
     }
 
-    /// Check a delivery proof (`resource_hash(32) || proof(32)`). Exact-length like Python;
-    /// additionally requires the leading resource hash to match (honest proofs always do).
+    /// Compare an exact 64-byte proof with this resource's hash and expected proof.
+    /// Call only for a successfully built resource on the matching transfer. This verifies
+    /// the resource proof value; it does not establish application persistence or a read receipt.
     pub fn validate_proof(&self, proof: &[u8]) -> bool {
         proof.len() == PROOF_LEN
             && proof[..32] == self.resource_hash
@@ -881,9 +890,9 @@ pub enum InboundState {
     Corrupt,
 }
 
-/// Receiver side of a single-segment resource: slots parts by map hash into a fixed buffer,
-/// reassembles (Token decrypt + hash verify) and produces the delivery proof. ~3.8 KiB —
-/// statically place on MCU.
+/// Receiver state for one segment, with a [`TRANSFER_MAX`]-byte buffer plus metadata.
+/// Part hashes select slots; [`Self::assemble`] checks the Token and full resource hash.
+/// The object retains decrypted bytes after assembly and does not wipe them on drop.
 pub struct InboundResource {
     buf: [u8; TRANSFER_MAX],
     resource_hash: [u8; 32],
@@ -914,9 +923,9 @@ impl core::fmt::Debug for InboundResource {
 }
 
 impl InboundResource {
-    /// Validate an advertisement against the lite honest-subset rules (see module docs) and the
-    /// internal consistency of the advertised sizes; returns the derived `(map_hashes,
-    /// num_parts)`. Shared by [`from_advertisement`] and [`from_advertisement_into`].
+    /// Check supported flags, purpose, Token size, part count and full hashmap length.
+    /// Returns `(map_hashes, num_parts)`. Does not authenticate the advertisement, reject
+    /// duplicate map hashes, or compare `original_hash` with `resource_hash`.
     fn validate_adv(
         adv: &ResourceAdv,
         expected_response: Option<&[u8; 16]>,
@@ -975,8 +984,9 @@ impl InboundResource {
         Ok((map_hashes, num_parts))
     }
 
-    /// Accept an advertisement IN PLACE into `self` (typically heap-resident — the ~3.7 KiB
-    /// `buf` would otherwise be a by-value stack temp that pressures the MCU task stack).
+    /// Replace this receiver with an ordinary transfer after validating its advertisement.
+    /// The caller must authenticate the Link packet before admission. Unsupported flags,
+    /// sizes or purpose leave the previous receiver unchanged. Reuses the embedded buffer.
     pub fn from_advertisement_into(&mut self, adv: &ResourceAdv) -> Result<(), ResourceError> {
         self.accept_into(adv, None)
     }
@@ -984,7 +994,8 @@ impl InboundResource {
     /// Accept a response on the authenticated Link owning `expected_request_id`.
     /// The caller binds the Link, interface incarnation and live request lifetime;
     /// this verifies the response flag and exact 16-byte ADV request ID before
-    /// replacing any state. All ordinary size/compression/crypto limits still apply.
+    /// replacing any state. Ordinary size and supported-feature checks apply; Token
+    /// authentication happens later in [`Self::assemble`]. Failure leaves prior state unchanged.
     /// The assembled response envelope must independently match the same ID.
     pub fn from_response_into(
         &mut self,
@@ -1016,6 +1027,8 @@ impl InboundResource {
         Ok(())
     }
 
+    /// Construct an ordinary transfer by value after the same checks as
+    /// [`Self::from_advertisement_into`]. The caller supplies an authenticated advertisement.
     pub fn from_advertisement(adv: &ResourceAdv) -> Result<Self, ResourceError> {
         let (map_hashes, num_parts) = Self::validate_adv(adv, None)?;
         Ok(Self {
@@ -1047,7 +1060,8 @@ impl InboundResource {
         &self.resource_hash
     }
 
-    /// Advertised plaintext data size (informational; the hash check is the authority).
+    /// Advertised payload size. Admission checks its padded Token length, but assembly
+    /// does not compare it with the decrypted payload length. Use [`Self::data`] for actual bytes.
     pub fn data_size(&self) -> usize {
         self.data_size as usize
     }
@@ -1061,9 +1075,9 @@ impl InboundResource {
         }
     }
 
-    /// Recognize a current-window part or a matching already-received duplicate.
-    /// Uses the trusted full Rust receiver's map-hash/window admission; duplicates
-    /// may credit Link liveness without back-filling the receiver's completed slots.
+    /// Check length and truncated map hash for a current-window part or received duplicate.
+    /// Duplicates can match after assembly. This does not change state or authenticate the
+    /// complete resource; the host decides whether a match should count as Link activity.
     pub fn matches_part(&self, part: &[u8]) -> bool {
         if !matches!(
             self.state,
@@ -1081,10 +1095,9 @@ impl InboundResource {
         })
     }
 
-    /// Slot a received part (raw ciphertext chunk) by map hash within the current receive window.
-    /// Returns true when it filled a previously-empty slot; duplicates, tampered parts and
-    /// out-of-window arrivals return false (rns-protocol's replay-guarded scan, plus an exact
-    /// length check so buffer placement stays sound).
+    /// Store raw ciphertext in an unfilled current-window slot with matching length and
+    /// four-byte map hash. Returns whether a slot was filled. Truncated hashes can collide;
+    /// treat the data as unverified until [`Self::assemble`] succeeds.
     pub fn receive_part(&mut self, part: &[u8]) -> bool {
         if self.state != InboundState::Transferring {
             return false;
@@ -1112,12 +1125,14 @@ impl InboundResource {
         false
     }
 
+    /// Whether all part slots are filled, independent of assembly or verification state.
     pub fn is_complete(&self) -> bool {
         self.consecutive_completed as usize == self.num_parts as usize
     }
 
-    /// Emit a RESOURCE_REQ for the missing parts in the current window. The lite receiver always
-    /// holds the full hashmap, so the exhausted flag is never set. Returns the request length.
+    /// Write a request payload for missing current-window parts and return its length.
+    /// The exhausted flag is zero because the full hashmap is available. The host must
+    /// Link-encrypt the payload and transmit it with RESOURCE_REQ context. This method sends nothing.
     pub fn build_part_request(&self, out: &mut [u8]) -> Result<usize, ResourceError> {
         if self.state != InboundState::Transferring || self.is_complete() {
             return Err(ResourceError::InvalidState);
@@ -1157,9 +1172,13 @@ impl InboundResource {
         Ok(pos)
     }
 
-    /// Reassemble: Token-decrypt the concatenated parts in place, strip the embedded random hash
-    /// and verify the resource hash over the plaintext. Returns the payload length; the payload is
-    /// then available via [`Self::data`] and the proof via [`Self::build_proof`].
+    /// Authenticate and decrypt the complete Token, skip its four-byte prefix, then verify
+    /// the payload hash using the advertisement's random tag. The decrypted prefix is not
+    /// compared with that tag, and the payload length is not compared with advertised `data_size`.
+    /// Success exposes the actual payload through [`Self::data`] and permits [`Self::build_proof`].
+    ///
+    /// Decryption or hash failure marks the receiver `Corrupt`; another assembly attempt is
+    /// refused. Bytes already decrypted remain in the buffer, but [`Self::data`] returns `None`.
     pub fn assemble(&mut self, keys: &LinkKeys) -> Result<usize, ResourceError> {
         if self.state != InboundState::Transferring {
             return Err(ResourceError::InvalidState);
@@ -1206,8 +1225,9 @@ impl InboundResource {
         Some(&self.buf[off..off + self.data_len as usize])
     }
 
-    /// Write the 64-byte delivery proof (`resource_hash || SHA-256(data || resource_hash)`),
-    /// sent as a PROOF packet with context RESOURCE_PRF.
+    /// Write the 64-byte proof after successful assembly and return its length.
+    /// The host sends it as a PROOF packet with RESOURCE_PRF context. Apply any required
+    /// application persistence policy before sending; proof construction itself stores nothing.
     pub fn build_proof(&self, out: &mut [u8]) -> Result<usize, ResourceError> {
         if self.state != InboundState::Assembled {
             return Err(ResourceError::InvalidState);
@@ -1239,12 +1259,11 @@ pub enum AdvWatchdogAction {
     Failed,
 }
 
-/// Advertisement watchdog for the sender (rns-protocol `OutboundTransfer::check_timeout`):
-/// until the receiver's first `RESOURCE_REQ`, the ADV is re-sent after
-/// `rtt * TRAFFIC_TIMEOUT_FACTOR + ADV_PROCESSING_GRACE_MS`, up to [`MAX_ADV_RETRIES`]
-/// times, then the transfer fails. Clock-free per the module split: the host owns the
-/// transfer state machine and drives [`poll`](Self::poll) from its tick with its own
-/// clock and measured RTT, re-sending its stored ADV on [`AdvWatchdogAction::Resend`].
+/// Host-driven advertisement retry policy, adapted from the full Rust sender.
+/// Poll with the same monotonic millisecond clock and measured RTT. Each expired round
+/// requests a resend, up to [`MAX_ADV_RETRIES`]; the next expiration reports failure.
+/// The host performs transmission and transfer cleanup, and calls [`Self::request_seen`]
+/// after a valid request for this transfer.
 #[derive(Debug, Clone, Copy)]
 pub struct AdvWatchdog {
     marked_ms: u64,
@@ -1262,23 +1281,28 @@ impl AdvWatchdog {
         }
     }
 
-    /// Deadline for one ADV round: `rtt * TRAFFIC_TIMEOUT_FACTOR + ADV_PROCESSING_GRACE_MS`.
+    /// Round duration: `rtt * TRAFFIC_TIMEOUT_FACTOR + ADV_PROCESSING_GRACE_MS`,
+    /// saturating at `u64::MAX`.
     pub const fn deadline_ms(rtt_ms: u64) -> u64 {
         rtt_ms
             .saturating_mul(TRAFFIC_TIMEOUT_FACTOR)
             .saturating_add(ADV_PROCESSING_GRACE_MS)
     }
 
-    /// The receiver responded (first `RESOURCE_REQ` served): the watchdog is done.
+    /// Conclude the watchdog. The caller must first validate a request for the correct
+    /// resource and authenticated Link; this setter performs no request validation.
     pub fn request_seen(&mut self) {
         self.concluded = true;
     }
 
+    /// Number of resend actions returned, regardless of whether the host transmitted them.
     pub const fn retries(&self) -> usize {
         self.retries
     }
 
-    /// Mirror of the trusted `check_timeout`: strictly-greater-than-deadline fires.
+    /// Return an action only when elapsed time is strictly greater than the round duration.
+    /// `Resend` consumes a retry and restarts the deadline immediately, even if host transmission
+    /// later fails. Once concluded, polls return `Wait`; this method performs no I/O.
     pub fn poll(&mut self, now_ms: u64, rtt_ms: u64) -> AdvWatchdogAction {
         if self.concluded || now_ms.saturating_sub(self.marked_ms) <= Self::deadline_ms(rtt_ms) {
             return AdvWatchdogAction::Wait;

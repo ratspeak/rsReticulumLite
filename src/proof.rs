@@ -1,16 +1,15 @@
-//! Reticulum packet PROOF (delivery receipt) create/validate + bounded inbound-message dedup.
+//! Reticulum packet receipts and a bounded in-memory message-ID set.
 //!
-//! A proof of receipt is the receiver's Ed25519 signature over the proven packet's FULL 32-byte
-//! packet hash. Matches Python RNS `Identity.prove` / rsReticulum `rns-identity::Identity::prove`:
+//! A receipt carries an Ed25519 signature over the packet's full 32-byte hash:
 //!
 //! ```text
-//! implicit (default): signature(64)
-//! explicit:           packet_hash(32) || signature(64)
+//! implicit: signature(64)
+//! explicit: packet_hash(32) || signature(64)
 //! ```
 //!
-//! Validation verifies the signature over the original packet hash with the prover's identity
-//! Ed25519 public key (and, for an explicit proof, checks the prepended hash). The sender maps a
-//! valid proof → DELIVERED. `no_std`, no-alloc.
+//! The caller binds a validated proof to the original packet and expected
+//! recipient before updating delivery state. It is not evidence that a user
+//! read the message. These helpers do not transmit proofs or track pending sends.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
@@ -75,21 +74,15 @@ pub fn build_proof(
     }
 }
 
-/// Validate a proof of receipt for `packet_hash`, signed by the identity whose 64-byte public key is
-/// `prover_public_key`. Accepts an implicit (64-byte) or explicit (96-byte, hash-prefixed) proof; any
-/// other length, a hash-prefix mismatch, or a bad signature returns `false`. Permissive Ed25519
-/// `verify` (matches pyca / the network).
+/// Validate an implicit (64-byte) or explicit (96-byte) proof for `packet_hash`.
+/// Invalid length, public-key encoding, hash prefix or signature returns `false`.
+/// Verification uses `ed25519_dalek::Verifier::verify`, matching the full Rust stack.
 ///
-/// BINDING CONTRACT (the caller is responsible for this — it is NOT enforced here): this only proves
-/// "`prover_public_key` signed `packet_hash`". It does NOT identify which of the caller's pending
-/// messages the proof is for, nor that `prover_public_key` is the right prover. To map a proof →
-/// DELIVERED safely (mirroring Python `Transport`'s receipt iteration):
-/// - pass `packet_hash` = the ORIGINAL sent packet's own 32-byte hash, and `prover_public_key` = the
-///   public key of THAT message's recipient identity (the destination it was sent to);
-/// - for an IMPLICIT (64-byte) proof there is no embedded hash, so iterate each outstanding sent
-///   packet's `(hash, recipient_key)` and accept DELIVERED only on the first that validates;
-/// - an EXPLICIT (96-byte) proof carries its own hash, so match it to the receipt whose hash equals
-///   the prefix before validating. Never accept a proof for an arbitrary pending message.
+/// The caller must supply the original sent packet's hash and expected prover's
+/// key. Only the Ed25519 half of `prover_public_key` is used. For an implicit
+/// proof, try the outstanding `(hash, recipient_key)` pairs; for an explicit
+/// proof, first match its prefix to a pending packet. Success verifies that
+/// signature; it does not locate a pending message or validate the key's origin.
 pub fn validate_proof(
     prover_public_key: &[u8; PUBLIC_KEY_LENGTH],
     packet_hash: &[u8; PACKET_HASH_LENGTH],
@@ -116,15 +109,13 @@ pub fn validate_proof(
     key.verify(packet_hash, &signature).is_ok()
 }
 
-/// Bounded, FIFO set of recently-seen 32-byte message ids — inbound-duplicate suppression so a
-/// re-delivered message isn't double-stored. rsDeck uses `MAX_SEEN_IDS = 100` ([`SeenMessages100`]).
-/// `no_std`, no-alloc; membership is a linear scan (N is small).
+/// FIFO set of up to `N` message IDs for duplicate suppression. Membership is
+/// a linear scan. Duplicate insertion does not refresh an ID's position.
 ///
-/// IN-MEMORY ONLY: this set is empty after construction and does NOT persist. The production dedup
-/// contract holds across a reboot only because the owner (the C++ MessageStore) seeds its set from
-/// storage at boot (`loadRecentMessageIds(MAX_SEEN_IDS)`). To make THIS set the dedup owner, the
-/// caller MUST replay the recently-stored ids via [`SeenMessages::insert_if_new`] after init —
-/// otherwise a post-reboot retry of an already-stored message is seen as NEW and double-stored.
+/// The set starts empty and does not persist itself. A storage owner should
+/// restore retained IDs at startup and persist a new message before inserting
+/// its ID, so a failed write can be retried. IDs evicted by the bound are no
+/// longer remembered; this is not an unlimited replay history.
 #[derive(Clone, Debug)]
 pub struct SeenMessages<const N: usize> {
     ids: [[u8; 32]; N],
@@ -132,7 +123,7 @@ pub struct SeenMessages<const N: usize> {
     len: usize,
 }
 
-/// rsDeck's seen-id capacity (`MAX_SEEN_IDS = 100`).
+/// Convenience alias with capacity for 100 message IDs.
 pub type SeenMessages100 = SeenMessages<100>;
 
 impl<const N: usize> SeenMessages<N> {
@@ -150,8 +141,9 @@ impl<const N: usize> SeenMessages<N> {
         (0..self.len).any(|i| &self.ids[(self.head + i) % N] == id)
     }
 
-    /// Record `id`. Returns `true` if it was NEW (process the message), `false` if already seen
-    /// (a duplicate — drop it). On overflow the OLDEST id is evicted (FIFO).
+    /// Insert `id`, returning `false` if it is already retained and `true` otherwise.
+    /// Evicts the oldest ID when full. With `N == 0`, always returns `true` and
+    /// retains nothing. This does not store the message itself.
     pub fn insert_if_new(&mut self, id: &[u8; 32]) -> bool {
         if self.contains(id) {
             return false;

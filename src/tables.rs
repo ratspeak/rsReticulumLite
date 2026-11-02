@@ -6,11 +6,11 @@ pub type InterfaceId = u8;
 pub type Hash16 = [u8; 16];
 pub type Hash32 = [u8; PACKET_HASH_LENGTH];
 
-/// PLACEMENT CONTRACT (here and on every table below): the storage fields are
-/// `#[doc(hidden)] pub` so the FFI crate's in-place `LiteNode` constructor can write them
-/// per-element via raw projections (this crate forbids unsafe; safe construction is
-/// by-value — a stack hazard at node size). Not public API: never touch fields directly;
-/// invariants (`len <= N`, `head < N`, ring occupancy) are maintained by the methods only.
+/// Fixed-capacity FIFO queue. Storage fields are public but hidden from the
+/// generated API so the FFI constructor can initialize large tables in place.
+/// Normal callers must use the methods: direct field mutation can violate the
+/// length, head and occupancy invariants those methods assume. This placement
+/// restriction also applies to the hidden storage fields of the tables below.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Queue<T: Copy, const N: usize> {
     #[doc(hidden)]
@@ -45,8 +45,9 @@ impl<T: Copy, const N: usize> Queue<T, N> {
         self.len == 0
     }
 
-    /// Push `value`; on a full queue, overwrite the OLDEST entry (FIFO head). Returns `true` if
-    /// an entry was evicted (so callers can account for the dropped item).
+    /// Push `value`, replacing the oldest entry when full. Returns `true` only
+    /// when an existing entry was evicted. With `N == 0`, discards the supplied
+    /// value and returns `false`; the result is not an insertion-success flag.
     pub fn push_drop_oldest(&mut self, value: T) -> bool {
         if N == 0 {
             return false;
@@ -71,8 +72,8 @@ impl<T: Copy, const N: usize> Queue<T, N> {
         self.entries[self.head].as_ref()
     }
 
-    /// Iterate in FIFO order. The physical ring layout stays private so callers cannot create
-    /// holes or violate the queue's bounded accounting.
+    /// Borrow entries in FIFO order without changing queue state.
+    /// Use the queue methods to preserve the underlying ring invariants.
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         (0..self.len).filter_map(|offset| {
             let idx = (self.head + offset) % N.max(1);
@@ -91,8 +92,8 @@ impl<T: Copy, const N: usize> Queue<T, N> {
         self.entries[(self.head + offset) % N].as_mut()
     }
 
-    /// Remove the entry at `offset` in FIFO order. This is used by the transport's fair scheduler
-    /// to choose another interface without allocating one queue per interface.
+    /// Remove the entry at `offset` in FIFO order, preserving the remaining entries' order.
+    /// Returns `None` if the offset is absent.
     pub fn remove(&mut self, offset: usize) -> Option<T> {
         if offset >= self.len || N == 0 {
             return None;
@@ -148,6 +149,10 @@ impl<const N: usize> PacketHashTable<N> {
         Self { entries: [None; N] }
     }
 
+    /// Expire old entries, then retain an unseen hash, evicting the earliest
+    /// expiry if full. Returns `false` for a retained duplicate without refreshing
+    /// its expiry. With `N == 0`, returns `true` but retains nothing. The caller
+    /// supplies a future expiry and monotonic `now_ms`.
     pub fn insert(&mut self, hash: Hash32, expires_ms: u64, now_ms: u64) -> bool {
         self.expire(now_ms);
         for entry in self.entries.iter().flatten() {
@@ -203,8 +208,9 @@ pub struct PathEntry {
     pub packet_hash: Hash32,
     pub random_hash: [u8; RANDOM_HASH_LENGTH],
     pub public_key: [u8; PUBLIC_KEY_LENGTH],
-    /// Learned from an unsolicited announce on a bulk interface (an uplink to a busy hub):
-    /// evicted before any other path, and never displaces one.
+    /// Low-priority path learned from unsolicited bulk-interface traffic.
+    /// For a new destination, eviction prefers bulk entries; a bulk newcomer
+    /// cannot evict a non-bulk path. Existing-destination updates are separate.
     pub bulk: bool,
 }
 
@@ -273,6 +279,8 @@ impl<const N: usize> PathTable<N> {
             })
     }
 
+    /// Look up a stored path without checking expiry. Use [`Self::get_live`]
+    /// before routing traffic through it.
     pub fn get(&self, destination_hash: &Hash16) -> Option<&PathEntry> {
         self.entries
             .iter()
@@ -285,6 +293,8 @@ impl<const N: usize> PathTable<N> {
             .and_then(|entry| entry.is_live(now_ms).then_some(entry))
     }
 
+    /// Borrow a stored path's public key without checking expiry or authenticity.
+    /// This is path-cache state, not a separate trusted identity store.
     pub fn known_public_key(&self, destination_hash: &Hash16) -> Option<&[u8; PUBLIC_KEY_LENGTH]> {
         self.get(destination_hash).map(|entry| &entry.public_key)
     }
@@ -320,6 +330,12 @@ impl<const N: usize> PathTable<N> {
             .count()
     }
 
+    /// Insert an already-validated announce's path after expiring old routes.
+    /// For a retained destination, require a different random hash and a newer
+    /// 40-bit emission value; no earlier announce history survives route removal.
+    /// New destinations use free space or the bulk-aware eviction policy. Returns
+    /// `false` for a rejected replacement, no eligible slot, or generation exhaustion.
+    /// The caller checks signatures, key binding and the new entry's expiry.
     pub fn insert_or_update(&mut self, entry: PathEntry, now_ms: u64) -> bool {
         self.expire(now_ms);
         if let Some(idx) = self
@@ -420,6 +436,10 @@ impl<const N: usize> AnnounceCache<N> {
             .find(|entry| &entry.destination_hash == destination_hash && now_ms < entry.expires_ms)
     }
 
+    /// Cache an already-validated announce, replacing an existing destination
+    /// without a freshness comparison. New destinations follow bulk-aware
+    /// eviction; insertion can silently do nothing when no slot is eligible.
+    /// The caller checks consistency with the selected live path.
     pub fn insert(&mut self, entry: CachedAnnounce, now_ms: u64) {
         self.expire(now_ms);
         if let Some(slot) = self
@@ -440,7 +460,9 @@ impl<const N: usize> AnnounceCache<N> {
         }
     }
 
-    /// A signed announce is useful only while its matching route is retained.
+    /// Discard cached announces whose destination has no live route.
+    /// This checks route presence, not signature validity or whether cached bytes
+    /// belong to the route's current announce.
     pub fn retain_paths<const P: usize>(&mut self, paths: &PathTable<P>, now_ms: u64) {
         for slot in &mut self.entries {
             if slot.is_some_and(|entry| paths.get_live(&entry.destination_hash, now_ms).is_none()) {
@@ -506,8 +528,10 @@ impl<const N: usize> AnnounceSchedule<N> {
         Self { entries: [None; N] }
     }
 
-    /// A full schedule gives up the waiting entry trusted would release last (most hops, then
-    /// newest), so a flood churns only the tail of the queue; with none, the oldest entry.
+    /// Insert or replace by destination after expiring old entries.
+    /// When full, evict a pending-only entry with the most hops, then latest
+    /// expiry; if none exists, evict the earliest-expiring entry. Equal values
+    /// use physical slot order. Insertion itself does not check an airtime gate.
     pub fn insert(&mut self, entry: ScheduledAnnounce, now_ms: u64) {
         self.expire(now_ms);
         if let Some(slot) = self
@@ -545,8 +569,10 @@ impl<const N: usize> AnnounceSchedule<N> {
         last.map(|(idx, _)| idx)
     }
 
-    /// Release the announce owed to registry `slot` that trusted's order sends first, clearing
-    /// its pending bit. The queue time is the learn time, which `expires_ms` encodes.
+    /// Take the next announce owed to registry `slot` (0..7), preferring fewer
+    /// hops then earlier expiry, and clear its pending bit. Expiry order represents
+    /// learn order only when callers use a common lifetime. This does not check
+    /// the interface gate or transmit; the caller handles failure after release.
     pub fn release_pending(&mut self, slot: usize, now_ms: u64) -> Option<ScheduledAnnounce> {
         self.expire(now_ms);
         let bit = 1u8.checked_shl(u32::try_from(slot).ok()?)?;
@@ -583,6 +609,9 @@ impl<const N: usize> AnnounceSchedule<N> {
         }
     }
 
+    /// Expire entries and remove the first due entry in physical slot order.
+    /// This does not select the earliest deadline, check an interface gate or
+    /// preserve pending-target bits elsewhere; the returned entry belongs to the caller.
     pub fn pop_due(&mut self, now_ms: u64) -> Option<ScheduledAnnounce> {
         self.expire(now_ms);
         let idx = self
@@ -698,6 +727,9 @@ impl<const N: usize> ReverseTable<N> {
             })
     }
 
+    /// Replace a matching proof hash, use a free slot, or evict the earliest
+    /// expiry after purging expired entries. Does nothing when capacity is zero
+    /// or the generation counter is exhausted. The caller validates the entry.
     pub fn insert(&mut self, entry: ReverseEntry, now_ms: u64) {
         self.expire(now_ms);
         let Some(generation) = self.next_generation() else {
@@ -831,6 +863,10 @@ impl<const N: usize> LinkTable<N> {
             })
     }
 
+    /// Replace a matching Link, use a free slot, or evict the earliest expiry.
+    /// Call [`Self::has_free_slot`] first when admitting a new Link must not evict
+    /// a live one. Zero capacity or generation exhaustion prevents insertion;
+    /// this method does not validate handshake evidence or report insertion success.
     pub fn insert(&mut self, entry: LinkEntry, now_ms: u64) {
         self.expire(now_ms);
         let Some(generation) = self.next_generation() else {
@@ -849,8 +885,9 @@ impl<const N: usize> LinkTable<N> {
         }
     }
 
-    /// Room for another Link without evicting a live one (trusted refuses new
-    /// transit Links at capacity).
+    /// Expire old entries and report whether a slot is free.
+    /// Call this before inserting a new Link when live-entry eviction is forbidden.
+    /// It does not reserve the slot or check whether the generation counter is exhausted.
     pub fn has_free_slot(&mut self, now_ms: u64) -> bool {
         self.expire(now_ms);
         self.entries.iter().any(Option::is_none)
@@ -877,6 +914,8 @@ impl<const N: usize> LinkTable<N> {
         self.get(link_id, now_ms).is_some()
     }
 
+    /// Mark an existing live Link validated and replace its expiry.
+    /// The caller must verify the proof first; this setter performs no verification.
     pub fn mark_validated(&mut self, link_id: &Hash16, expires_ms: u64, now_ms: u64) {
         self.expire(now_ms);
         if let Some(entry) = self
@@ -939,6 +978,9 @@ impl<const N: usize> RequestTagTable<N> {
         Self { entries: [None; N] }
     }
 
+    /// Retain a new request tag after expiry cleanup, evicting the earliest
+    /// expiry when full. A retained duplicate returns `false` without refresh.
+    /// With `N == 0`, returns `true` but retains nothing. Supply a future expiry.
     pub fn insert_if_new(&mut self, key: [u8; 32], expires_ms: u64, now_ms: u64) -> bool {
         self.expire(now_ms);
         if self.entries.iter().flatten().any(|entry| entry.key == key) {

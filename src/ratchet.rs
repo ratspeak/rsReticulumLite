@@ -1,12 +1,10 @@
-//! Announce ratchets — bounded `no_std` adaptation of the trusted Rust stack.
+//! Bounded storage and rotation policy for own and peer X25519 ratchet keys.
 //!
-//! The wire and cryptographic behavior matches Reticulum ratchets: X25519
-//! private keys are retained newest-first, receivers try the retained ring
-//! before the base identity key, and learned peer ratchets are preferred for
-//! opportunistic sends. Embedded-only policy is explicit here: clocks and
-//! entropy are host supplied, capacity is fixed, uptime ages become unknown
-//! after restore, and a full ring never evicts a private key whose expiry
-//! cannot be proven.
+//! The host supplies clocks, entropy and durable storage. Own private keys are
+//! kept newest first; decryption and peer-key selection are separate operations.
+//! Preparation will not evict an own key from a full ring unless the oldest key
+//! is provably expired. Persisted uptime ages become unknown on restore and
+//! must be re-anchored. These storage blobs contain no authentication tag.
 
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
@@ -15,10 +13,12 @@ use crate::constants::DESTINATION_LENGTH;
 
 /// Retained own ratchet private keys.
 pub const RATCHET_RING_MAX: usize = 64;
-/// Embedded rotation cadence. Sixty-four keys cover 32 days, longer than the
-/// 30-day peer memory window.
+/// Rotation interval: 12 hours. At that cadence, 64 slots span 32 days,
+/// exceeding the 30-day expiry threshold. Rotation still requires host calls;
+/// unknown ages or protected full rings can delay it.
 pub const RATCHET_INTERVAL_SECS: u64 = 60 * 60 * 12;
-/// Upstream `Identity.RATCHET_EXPIRY` (30 days).
+/// Expiry threshold: 30 days. A comparable age must be strictly greater
+/// than this to count as expired; unknown or rolled-back ages do not expire.
 pub const RATCHET_EXPIRY_SECS: u64 = 60 * 60 * 24 * 30;
 const _: () = assert!(RATCHET_RING_MAX as u64 * RATCHET_INTERVAL_SECS >= RATCHET_EXPIRY_SECS);
 
@@ -47,7 +47,7 @@ pub enum RatchetError {
     InvalidBlob,
     /// Output buffer too small.
     OutputTooSmall,
-    /// Candidate does not represent a valid transition from the live ring.
+    /// Candidate key sequence is incompatible with the live ring.
     InvalidCandidate,
 }
 
@@ -172,6 +172,8 @@ impl RatchetPreparation {
 }
 
 /// Bounded history of own X25519 ratchet private keys, newest first.
+/// Keys are wiped when the ring is dropped. Serialized blobs and caller copies
+/// also contain private keys and need caller-managed protection and wiping.
 pub struct RatchetRing {
     keys: [[u8; 32]; RATCHET_RING_MAX],
     age_kinds: [u8; RATCHET_RING_MAX],
@@ -189,6 +191,10 @@ impl RatchetRing {
         }
     }
 
+    /// Choose the next preparation action from the supplied clock and live ages.
+    /// This does not generate a key, rotate, persist or advertise anything. Clock
+    /// rollback or unavailable age information may require metadata re-anchoring
+    /// before rotation can proceed.
     pub fn rotation_action(&self, clock: RatchetClock) -> RatchetRotationAction {
         if self.len == 0 {
             return RatchetRotationAction::Rotate;
@@ -226,12 +232,14 @@ impl RatchetRing {
         }
     }
 
-    /// Serialize the next candidate directly into caller storage without
-    /// cloning the ~2.6 KiB ring or mutating live key material.
+    /// Prepare a candidate blob without changing the live ring. Supply fresh
+    /// cryptographic key bytes when [`Self::rotation_action`] requests rotation.
     ///
-    /// The host must durably store `out[..blob_len]`, read/verify it as needed,
-    /// and only then call [`Self::commit_prepared_blob`]. Abandoning the bytes
-    /// leaves the live ring and advertised key unchanged.
+    /// Durably store exactly `out[..blob_len]`, then pass those unchanged bytes to
+    /// [`Self::commit_prepared_blob`] before advertising the new public key. The
+    /// blob contains private keys. Abandoning it leaves the live ring unchanged;
+    /// wipe unused candidate bytes and any caller copy of `fresh_private`. This
+    /// function wipes only its own by-value copy.
     pub fn prepare_rotation_into(
         &self,
         mut fresh_private: [u8; 32],
@@ -301,8 +309,13 @@ impl RatchetRing {
         }
     }
 
-    /// Commit exactly one valid prepared transition after persistence succeeds.
-    /// Validation completes before the live ring is overwritten.
+    /// Apply a prepared v2 blob after the host has persisted it.
+    ///
+    /// Checks blob shape and compatibility with the current key sequence before
+    /// changing the live ring. This does not prove persistence, candidate origin,
+    /// key freshness or expiry: age metadata and the new leading key are trusted.
+    /// Pass only unchanged bytes from [`Self::prepare_rotation_into`], prepared
+    /// against the same live state; do not construct a transition externally.
     pub fn commit_prepared_blob(&mut self, blob: &[u8]) -> Result<(), RatchetError> {
         validate_ring_blob(blob, false)?;
         if blob[0] != RING_BLOB_VERSION || !self.is_valid_candidate(blob) {
@@ -352,7 +365,9 @@ impl RatchetRing {
         self.len == 0
     }
 
-    /// Serialize current live state in the bounded v2 format.
+    /// Serialize live private keys and age metadata in the bounded v2 format.
+    /// The caller protects the output and wipes it when no longer needed; this
+    /// method does not persist or encrypt it.
     pub fn serialize_into(&self, out: &mut [u8]) -> Result<usize, RatchetError> {
         let need = ring_blob_len(self.len);
         if out.len() < need {
@@ -369,8 +384,10 @@ impl RatchetRing {
         Ok(need)
     }
 
-    /// Restore host-persisted state in place. The live ring remains unchanged
-    /// if the blob fails complete bounds/shape validation.
+    /// Restore a trusted v1/v2 blob after complete bounds/shape validation.
+    /// Invalid shape leaves the live ring unchanged. The blob is not authenticated;
+    /// its key order and metadata are trusted. Persisted uptime ages become unknown.
+    /// The caller must protect stored private keys and enforce rollback policy.
     pub fn load_persisted(&mut self, blob: &[u8]) -> Result<(), RatchetError> {
         validate_ring_blob(blob, true)?;
         self.apply_blob(blob, true)
@@ -508,7 +525,9 @@ impl PeerRatchet {
     }
 }
 
-/// Latest announced ratchet per peer destination, newest first.
+/// Up to 32 remembered peer ratchets in insertion order, newest first.
+/// The caller verifies each destination/key association before insertion.
+/// This table does not validate announce signatures or their ordering.
 pub struct PeerRatchets {
     entries: [PeerRatchet; PEER_RATCHETS_MAX],
     len: usize,
@@ -522,8 +541,13 @@ impl PeerRatchets {
         }
     }
 
-    /// Remember a new ratchet. Re-observing the same key is a strict no-op and
-    /// therefore cannot refresh its expiry. Returns whether state changed.
+    /// Remember an already-validated destination/ratchet pair. A changed key
+    /// moves to the front; a full table evicts its last entry after purging
+    /// provably expired entries. Returns whether state changed.
+    ///
+    /// Re-observing the same key returns immediately without refreshing expiry,
+    /// reordering or purging. The caller must reject stale or unauthenticated
+    /// announces before calling this method.
     pub fn remember(
         &mut self,
         dest_hash: [u8; DESTINATION_LENGTH],
@@ -573,7 +597,9 @@ impl PeerRatchets {
         changed
     }
 
-    /// Latest non-expired ratchet for `dest_hash`.
+    /// Return the first matching ratchet whose age is not provably expired.
+    /// Unknown or incomparable ages remain eligible; this does not prove the key
+    /// is fresh. Re-anchor restored ages with [`Self::anchor_unknown_ages`].
     pub fn get(
         &self,
         dest_hash: &[u8; DESTINATION_LENGTH],
@@ -630,8 +656,10 @@ impl PeerRatchets {
         Ok(need)
     }
 
-    /// Restore a v1/v2 table in place after complete validation. Persisted
-    /// uptime ages become unknown and must be re-anchored by the host.
+    /// Restore a trusted v1/v2 table after bounds, length and age-kind checks.
+    /// The blob is not authenticated and duplicate destinations are not rejected.
+    /// Invalid shape leaves live state unchanged. Persisted uptime ages become
+    /// unknown and must be re-anchored by the host.
     pub fn load_persisted(&mut self, blob: &[u8]) -> Result<(), RatchetError> {
         validate_peer_blob(blob)?;
         let version = blob[0];

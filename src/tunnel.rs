@@ -1,7 +1,7 @@
-//! Tunnel synthesis for client hosts: the signed PLAIN packet a TCP client sends first on every
-//! connection, so a transport hub rebinds its tunnel and restores its paths (Python
-//! `Transport.synthesize_tunnel`). Ported from trusted rns-transport `tunnel.rs`; the caller
-//! supplies the random hash because `no_std` has no RNG.
+//! Build a signed PLAIN tunnel-synthesis packet for a client interface.
+//! Adapted from `rns-transport::tunnel`. The caller supplies entropy and sends
+//! the packet on the intended connection; the hub owns validation, tunnel
+//! rebinding and restoration of any retained paths.
 
 use crate::constants::{HEADER_MINSIZE, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use crate::identity::{LocalIdentity, destination_hash_from_name};
@@ -9,8 +9,8 @@ use crate::wire::{
     DestinationType, HeaderType, PacketContext, PacketFlags, PacketType, TransportType, sha256,
 };
 
-/// `public_key(64) || interface_hash(32) || random_hash(16) || signature(64)`, the only length
-/// Python accepts (Transport.py:2790-2791).
+/// Length of `public_key(64) || interface_hash(32) || random_hash(16) || signature(64)`.
+/// This is the synthesis payload, excluding the packet header.
 pub const TUNNEL_SYNTHESIS_LEN: usize = PUBLIC_KEY_LENGTH + 32 + 16 + SIGNATURE_LENGTH;
 /// The HEADER_1 packet that carries one synthesis.
 pub const TUNNEL_SYNTHESIS_PACKET_LEN: usize = HEADER_MINSIZE + TUNNEL_SYNTHESIS_LEN;
@@ -23,14 +23,16 @@ pub enum TunnelError {
     OutputTooSmall,
 }
 
-/// Interface identifier: SHA-256 of the interface's Python `str()`, such as
-/// `TCPInterface[name/host:port]` with an IPv6 host in brackets.
+/// SHA-256 of a caller-supplied interface identifier's UTF-8 bytes.
+/// Pass the same stable full identifier on reconnect, such as
+/// `TCPInterface[name/host:port]`; this helper does not format addresses.
 pub fn interface_hash(name: &str) -> [u8; 32] {
     sha256(name.as_bytes())
 }
 
-/// Write the synthesis packet for one connection into `out` and return its length. Use a fresh
-/// `random_hash` per connection: a repeated packet is a duplicate the hub drops.
+/// Write a synthesis packet into `out` and return its length; this does not send it.
+/// Use fresh cryptographic `random_hash` bytes for each connection so duplicate
+/// suppression at the hub does not mistake a reconnect for a repeated packet.
 // Out of line so the signing scratch never joins a caller's stack frame.
 #[inline(never)]
 pub fn build_tunnel_synthesis_packet(

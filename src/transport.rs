@@ -32,8 +32,9 @@ use crate::wire::{
 
 pub type SmallNode = LiteNode<256, 512, 64, 64, 32, 64, 64, KNOWN_DESTINATIONS_SMALL>;
 pub type Esp32PsramNode = LiteNode<1024, 2048, 128, 128, 64, 256, 128, KNOWN_DESTINATIONS_SMALL>;
-/// Cardputer-class profile (no PSRAM): sized for [`LiteConfig::ESP32_LORA_TRANSPORT_MICRO`];
-/// whole node <= 32 KB (asserted in tests) so it fits the internal heap.
+/// Smallest preset, paired with [`LiteConfig::ESP32_LORA_TRANSPORT_MICRO`].
+/// Tests assert a 32 KiB node budget on their build target. Check the actual target layout,
+/// construction temporaries and available device memory before allocating it.
 pub type MicroNode = LiteNode<48, 64, 8, 8, 4, 8, 8, KNOWN_DESTINATIONS_MICRO>;
 
 /// Fixed slot count for a node's own registered destination hashes (endpoint destinations
@@ -136,6 +137,9 @@ impl OutboundLifetime {
     /// enum/Option layout across a C ABI. Hosts must retain the original token.
     pub const TOKEN_BYTES: usize = 88;
 
+    /// Serialize process-local lifetime metadata with the current token version.
+    /// Preserve it unchanged with the queued bytes; serialization neither authenticates it
+    /// nor checks whether the referenced route or state is still live.
     pub fn to_token(self) -> [u8; Self::TOKEN_BYTES] {
         let mut token = [0; Self::TOKEN_BYTES];
         token[..4].copy_from_slice(b"RTX\x02");
@@ -156,8 +160,9 @@ impl OutboundLifetime {
 
     /// Decode only the defined token version and discriminants. The token is
     /// not authentication; in-process callers still obey the ownership contract.
-    /// Version 1 hash snapshots do not identify a state incarnation and are
-    /// deliberately rejected. The remaining fixed-size bytes are reserved zero.
+    /// Version 1 hash snapshots are rejected. Checks reserved zero bytes, path/state
+    /// discriminants and the maximum queue-age interval, but not current time or live tables.
+    /// Pass the decoded value to [`LiteNode::outbound_lifetime_is_live`] before driver admission.
     pub fn from_token(token: &[u8; Self::TOKEN_BYTES]) -> Option<Self> {
         if &token[..4] != b"RTX\x02"
             || token[4] > 1
@@ -205,14 +210,18 @@ pub enum OutboundReason {
     ProofReturn,
 }
 
+/// Ingress classification, not a transmission or application-delivery receipt.
+/// `ForwardedTransport`/`ForwardedProof` can also mean a Link packet was consumed by
+/// relay policy without queuing it, including duplicate, hop or capacity rejection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IngestAction {
     Accepted,
     Duplicate,
     LearnedAnnounce,
-    /// Signature-valid announce rejected by path freshness/quality policy.
-    /// Hosts must not commit its peer ratchet or mutate a KeyMap from it; the node
-    /// still learns its delivery identity, as every validated announce teaches one.
+    /// Signature-valid announce that did not update the path, including freshness,
+    /// quality or table-capacity refusal. Hosts must not commit its peer ratchet or
+    /// mutate a KeyMap from it. Validated `lxmf.delivery` identities are learned before
+    /// this path decision; other application names do not enter that identity cache.
     AnnounceIgnored,
     ScheduledAnnounce,
     AnsweredPathRequest,
@@ -222,6 +231,10 @@ pub enum IngestAction {
     Dropped,
 }
 
+/// Saturating counters for individual processing paths, not an exhaustive packet accounting.
+/// `accepted` increments after parsing and initial Link checks, before later policy/dedup
+/// decisions. `queued_outbound` counts queue admissions, including replacement of an older
+/// frame; it does not count driver starts or completed transmissions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub struct TransportStats {
     pub accepted: u64,
@@ -230,7 +243,8 @@ pub struct TransportStats {
     pub queued_outbound: u64,
     pub dropped: u64,
     pub validation_failures: u64,
-    /// Outbound frames evicted (oldest-dropped) because the TX queue was full — backpressure loss.
+    /// Recorded outbound losses: queue eviction, expiry, construction/capacity refusal,
+    /// exhausted delivery IDs and retirement of all remaining targets. Includes `outbound_expired`.
     pub outbound_dropped: u64,
     /// Queued or driver-held frames discarded after their deadline/state became stale.
     pub outbound_expired: u64,
@@ -286,8 +300,8 @@ impl From<KnownDestinationError> for TransportError {
     }
 }
 
-/// Private host facts; no IFAC keys, driver pointers or packet storage. IDs are
-/// mapped to at most8 stable requester slots, independent of their u8 value.
+/// Host interface metadata without keys or packet storage. IDs map to at most eight
+/// requester slots, independent of their numeric value. Hidden placement API; preserve invariants.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InterfaceFacts {
@@ -313,12 +327,13 @@ impl InterfaceFacts {
     }
 }
 
-/// PLACEMENT CONTRACT: fields are `#[doc(hidden)] pub` so the FFI crate's in-place
-/// constructor can initialize a caller-provided buffer via raw field projections —
-/// this crate forbids unsafe, and every safe construction path takes `Self` BY VALUE
-/// (a SmallNode is ~173 KB: a guaranteed-elision-free stack hazard on MCU tasks).
-/// Not public API: construct via [`LiteNode::new`]/[`LiteNode::new_const`], never
-/// read or write fields directly.
+/// Fixed-capacity transport state driven by the host's clock and packet I/O.
+/// Construct with [`Self::new`] for validation or [`Self::new_const`] for static placement.
+/// Large embedded tables and by-value construction can require substantial stack space;
+/// measure the target layout and build profile.
+///
+/// Hidden public fields support the FFI placement constructor. They are accessible in Rust,
+/// but direct changes can break table, generation and queue invariants; use the methods below.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiteNode<
     const PATHS: usize,
@@ -394,14 +409,17 @@ impl<
         SCHEDULED,
     >
 {
+    /// Validate configuration and return an empty node by value.
+    /// This allocates no drivers, opens no interfaces and schedules no work until the host acts.
     pub fn new(config: LiteConfig, transport_id: Hash16) -> Result<Self, TransportError> {
         Self::validate_config(&config)?;
         Ok(Self::new_const(config, transport_id))
     }
 
-    /// The exact pre-construction checks [`LiteNode::new`] runs (config validity + caps vs the
-    /// const-generic capacities), exposed so an external in-place constructor (FFI placement
-    /// init) validates identically before touching caller memory.
+    /// Run the same checks as [`Self::new`] before an external placement constructor writes.
+    /// Validates `LiteConfig` and the path, hash, announce, reverse, Link, tag and outbound
+    /// capacity comparisons. Does not check `KNOWN_DESTINATIONS` or `SCHEDULED`, or impose the
+    /// configured counts as runtime limits on the larger const-generic tables.
     pub fn validate_config(config: &LiteConfig) -> Result<(), TransportError> {
         config
             .validate()
@@ -420,10 +438,10 @@ impl<
         Ok(())
     }
 
-    /// Const constructor for firmware targets that place the node directly in
-    /// static storage. The caller must keep `config.table_caps` within the
-    /// const-generic capacities; use [`LiteNode::new`] where runtime validation
-    /// and stack budget permit.
+    /// Construct without validation, for example in static storage.
+    /// The caller must satisfy [`Self::validate_config`] and choose usable known-destination
+    /// and scheduled-announce capacities. Zero or undersized capacities can silently discard
+    /// work. Use [`Self::new`] when runtime validation and stack budget permit.
     pub const fn new_const(config: LiteConfig, transport_id: Hash16) -> Self {
         Self {
             config,
@@ -494,8 +512,8 @@ impl<
             .any(|slot| slot.as_ref() == Some(destination_hash))
     }
 
-    /// Clear every registered own destination. Registered dests belong to the ACTIVE
-    /// identity — call before re-registering after an identity switch.
+    /// Clear the own-destination list before registering destinations for a different identity.
+    /// This does not clear learned paths, known identities or queued packets.
     pub fn clear_own_destinations(&mut self) {
         self.own_destinations = [None; OWN_DESTINATIONS_MAX];
     }
@@ -504,6 +522,8 @@ impl<
         self.stats
     }
 
+    /// Change both announce-admission rates and reset the bucket if either changes.
+    /// The grace duration is unchanged and remains relative to the host clock's zero point.
     pub fn set_announce_budget(&mut self, steady_per_sec: u16, grace_per_sec: u16) {
         if self.config.announce_admission.steady_per_sec == steady_per_sec
             && self.config.announce_admission.grace_per_sec == grace_per_sec
@@ -515,10 +535,14 @@ impl<
         self.announce_admission = AnnounceAdmission::new();
     }
 
+    /// Recall a stored delivery key and refresh its eviction recency; no path or age check.
     pub fn known_destination_recall(&mut self, destination_hash: &Hash16) -> Option<[u8; 64]> {
         self.known_destinations.recall(destination_hash)
     }
 
+    /// Learn a key bound to its `lxmf.delivery` destination hash; the caller authenticates it.
+    /// Existing identical keys are a no-op, conflicts fail, and a full table evicts its least
+    /// recent entry. Returns whether the table changed.
     pub fn known_destination_learn(
         &mut self,
         destination_hash: Hash16,
@@ -533,6 +557,9 @@ impl<
         self.known_destinations.len()
     }
 
+    /// Write the known-destination blob into caller storage and return its length.
+    /// The blob contains public keys and recency metadata without authentication; protect its
+    /// integrity when persisting it. This method performs no storage I/O.
     pub fn known_destinations_export_into(
         &self,
         out: &mut [u8],
@@ -540,6 +567,9 @@ impl<
         self.known_destinations.export_into(out)
     }
 
+    /// Replace known destinations from a complete trusted blob after validating every entry.
+    /// Checks destination/key binding and duplicate entries, clamps recency to `now`, and leaves
+    /// live state unchanged on error. These checks do not prove announcement authenticity.
     pub fn known_destinations_import(
         &mut self,
         blob: &[u8],
@@ -570,11 +600,12 @@ impl<
         self.paths.drop_path(destination_hash)
     }
 
-    /// Originate a path request for `destination_hash` (the endpoint operation): build the wire
-    /// packet and enqueue it for transmission on `interface_id`. `tag` is a caller-supplied 16-byte
-    /// request tag (random per Reticulum; no_std has no RNG). Wire-identical to Python
-    /// `Transport.request_path` (`dest_hash || [transport_id] || tag` to `rnstransport.path.request`).
-    /// The tag is registered so an echoed copy of our own request is deduped, not re-forwarded.
+    /// Build a path request with a caller-supplied random 16-byte tag and attempt to queue it.
+    /// Payload is `dest_hash || [transport_id when transport is enabled] || tag`, addressed to
+    /// `rnstransport.path.request`. A successful queue attempt records the tag for echo filtering.
+    /// `Ok(())` also covers queue refusal; it does not confirm transmission or a discovered path.
+    /// `interface_id` is retained as frame metadata; the retained handheld adapter fans locally
+    /// originated requests out to its eligible targets.
     pub fn request_path(
         &mut self,
         destination_hash: &Hash16,
@@ -601,8 +632,11 @@ impl<
         Ok(())
     }
 
-    /// The clock is advanced by ingest, request_path, and tick. Drivers retaining
-    /// a popped frame must recheck this predicate immediately before admission.
+    /// Check the queue-age interval and referenced path/reverse/Link/discovery incarnation
+    /// against `now_ms`. Drivers must recheck immediately before admission.
+    /// This core's interface-online hook currently always returns true: the host must also
+    /// verify the target interface generation, availability and endpoint Link ownership.
+    /// Use the same monotonic clock as ingest, request_path and tick.
     pub fn outbound_lifetime_is_live(
         &self,
         interface_id: InterfaceId,
@@ -650,7 +684,9 @@ impl<
     /// Snapshot a locally constructed packet before a host driver retains it.
     /// The selected table incarnation identifies a learned route; endpoint Link
     /// membership is owned by the host's local Link registry, not the relay table.
-    /// No reverse-route entry is fabricated for local outgoing application data.
+    /// No reverse-route entry is created for local application data. If no live Single path
+    /// exists, the result is independent rather than an error; this is not a route-availability
+    /// check. The host still owns interface generation and endpoint Link validation.
     pub fn local_outbound_lifetime(
         &self,
         packet: &[u8],
@@ -675,6 +711,8 @@ impl<
         Ok(lifetime)
     }
 
+    /// Increment both expiry and aggregate outbound-loss counters for a host-discarded frame.
+    /// Does not remove any queued frame; call once for a loss owned by the host.
     pub fn record_expired_outbound(&mut self) {
         self.stats.outbound_expired = self.stats.outbound_expired.saturating_add(1);
         self.stats.outbound_dropped = self.stats.outbound_dropped.saturating_add(1);
@@ -847,6 +885,8 @@ impl<
             .min(crate::constants::LORA_SPLIT_FRAME_PAYLOAD_MAX.saturating_sub(tag))
     }
 
+    /// Return the registered clear-packet budget, or the fixed-profile fallback for an unknown ID.
+    /// This does not establish that the interface exists or is online.
     pub fn interface_clear_mtu(&self, id: InterfaceId) -> usize {
         self.interface_slot(id).map_or_else(
             || self.default_clear_mtu(),
@@ -854,8 +894,10 @@ impl<
         )
     }
 
-    /// Publish the host's measured clear-packet budget after IFAC/framing.
-    /// A changed capability retires existing Links before any new handshake.
+    /// Publish a clear-packet budget for the matching nonzero registered generation.
+    /// Clamps the value to the fixed MTU. A change removes transit Links on that interface
+    /// and expires dependent queued work; the host retires any separate endpoint Links.
+    /// Returns false for an unknown ID or generation mismatch.
     pub fn update_interface_packet_capacity(
         &mut self,
         id: InterfaceId,
@@ -877,6 +919,8 @@ impl<
         true
     }
 
+    /// Require a clear-packet budget of at least 500 bytes for fixed-profile Links.
+    /// Uses the fallback for an unknown interface; success does not check online state.
     pub fn require_link_capacity(&self, interface_id: InterfaceId) -> Result<(), TransportError> {
         let clear_mtu = self.interface_clear_mtu(interface_id);
         if clear_mtu < 500 {
@@ -945,6 +989,9 @@ impl<
         true
     }
 
+    /// Remove the next frame after expiring stale work using the last supplied host time.
+    /// The driver must check lifetime and interface ownership again before starting it.
+    /// Returns `None` after the retained handheld owner API has been selected, even if work remains.
     pub fn poll_tx(&mut self) -> Option<OutboundFrame> {
         // A legacy consumer cannot reinterpret partially admitted target bits.
         if self.retained_owner_mode {
@@ -954,8 +1001,9 @@ impl<
         self.outbound.pop().map(|queued| queued.frame)
     }
 
-    /// Byte length of the next queued outbound packet without consuming it, so a consumer can size
-    /// its buffer before [`Self::poll_tx`] (avoids destructively popping a frame that won't fit).
+    /// Peek at the next queued byte length without consuming or expiring anything.
+    /// It may describe stale work that [`Self::poll_tx`] will discard. Returns `None` in
+    /// retained-owner mode; otherwise useful for sizing a legacy consumer's buffer.
     pub fn outbound_peek_len(&self) -> Option<usize> {
         if self.retained_owner_mode {
             return None;
@@ -1098,10 +1146,14 @@ impl<
         self.expire_outbound(self.clock_ms);
     }
 
+    /// Stored queue rows, including work not yet expired or retired by a mutating operation.
     pub const fn outbound_len(&self) -> usize {
         self.outbound.len()
     }
 
+    /// Advance the host clock, expire tables and queue due announce work.
+    /// Uses one monotonic millisecond timebase. This performs no driver I/O; a scheduled
+    /// announce consumes its retry attempt even if the queue attempt fails.
     pub fn tick(&mut self, now_ms: u64) {
         self.clock_ms = now_ms;
         if !self.config.transport_enabled {
@@ -1155,6 +1207,10 @@ impl<
         }
     }
 
+    /// Process a received frame using the supplied interface facts and monotonic time.
+    /// Applies configured IFAC, wire, routing and announce checks, and may enqueue work.
+    /// Returned actions classify processing; they do not authenticate application payloads
+    /// or confirm transmission. Endpoint Links use [`Self::ingest_with_local_link`].
     pub fn ingest(
         &mut self,
         raw: &[u8],

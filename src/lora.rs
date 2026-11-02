@@ -40,9 +40,9 @@ impl Default for LoraFrame {
     }
 }
 
-/// Complete bytes carried by one RNode LoRa transmission. This is deliberately
-/// larger than the 500-byte clear Reticulum MTU: the default 8-byte IFAC tag
-/// rides on top of a full-MTU packet, yielding the RNode `HW_MTU` of 508.
+/// Buffer for one reassembled RNode packet, up to 508 bytes: a 500-byte
+/// Reticulum packet plus the default eight-byte IFAC tag. A packet over 254
+/// bytes is carried in two physical LoRa frames, each with its own framing byte.
 pub type LoraPacketBuffer = PacketBuffer<LORA_SPLIT_FRAME_PAYLOAD_MAX>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,6 +66,10 @@ impl LoraFramer {
         }
     }
 
+    /// Split up to 508 packet bytes into one or two frames with at most 254
+    /// payload bytes each. Uses the low four bits of `sequence_nibble` and returns
+    /// the frame count; unused output entries are unchanged. The caller sends
+    /// the frames in order and chooses sequence values for successive packets.
     pub fn encode(
         packet: &[u8],
         sequence_nibble: u8,
@@ -85,6 +89,12 @@ impl LoraFramer {
         }
     }
 
+    /// Reassemble caller-supplied physical frames using one pending split slot.
+    /// The caller checks physical frame size/CRC and supplies monotonic time.
+    /// Two split frames with the same four-bit sequence are concatenated in arrival
+    /// order; there is no first/second marker or duplicate check. A different split
+    /// sequence replaces the pending half; an unsplit frame clears it. The helper
+    /// only bounds the final 508-byte buffer, so validate the recovered packet.
     pub fn ingest_frame(
         &mut self,
         frame: &[u8],
@@ -172,6 +182,11 @@ impl LoraModemConfig {
         low_data_rate_optimize: false,
     };
 
+    /// Estimate one physical frame's airtime in milliseconds, rounding up.
+    /// Supply valid radio settings and a frame length no greater than 255 bytes,
+    /// including the framing byte. This helper does not validate the full radio
+    /// parameter domain; zero bandwidth or an unusable symbol denominator returns
+    /// zero. Sum both frame estimates for a split packet.
     pub fn frame_airtime_ms(self, frame_len: usize) -> u32 {
         if self.bandwidth_hz == 0 || self.spreading_factor == 0 {
             return 0;
@@ -213,6 +228,11 @@ pub struct AirtimeLimiter {
 }
 
 impl AirtimeLimiter {
+    /// Create a fixed-window airtime counter. Utilization is in basis points
+    /// (10,000 means 100%); input is not clamped. An empty window may admit an
+    /// over-budget frame; once charged, it blocks further positive reservations until reset.
+    /// A zero-length window resets usage on every check. The caller supplies
+    /// monotonic time, estimated airtime and the actual transmission schedule.
     pub const fn new(window_ms: u64, max_utilization_bps: u16) -> Self {
         Self {
             window_ms,
@@ -222,6 +242,9 @@ impl AirtimeLimiter {
         }
     }
 
+    /// Check admission after refreshing the window; this does not charge airtime.
+    /// Zero airtime always passes. Window expiry or a clock value before the
+    /// current window start clears usage, so callers must provide a consistent clock.
     pub fn can_reserve(&mut self, airtime_ms: u32, now_ms: u64) -> bool {
         self.refresh(now_ms);
         let airtime_ms = airtime_ms as u64;
@@ -233,6 +256,8 @@ impl AirtimeLimiter {
             || (self.used_airtime_ms == 0 && airtime_ms > budget)
     }
 
+    /// Charge the supplied airtime if the current window admits it.
+    /// Success updates local accounting only; it does not transmit or reserve the radio.
     pub fn reserve(&mut self, airtime_ms: u32, now_ms: u64) -> bool {
         if !self.can_reserve(airtime_ms, now_ms) {
             return false;
@@ -356,6 +381,12 @@ impl CarrierSenseBackoff {
         self.state = CarrierSenseState::Idle;
     }
 
+    /// Advance backoff using the caller's current medium observation and clock.
+    /// Busy observations restart the wait. After DIFS, the random byte selects
+    /// a slot by modulo within the configured inclusive contention range; later
+    /// polls retain that wait. `Ready` resets state and permits an attempt, but
+    /// does not sense, reserve or transmit on the radio. Supply valid timing values
+    /// and a fresh random byte when selecting a contention wait.
     pub fn poll(
         &mut self,
         now_ms: u64,

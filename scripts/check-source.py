@@ -229,8 +229,8 @@ def check_release_tag(release_tag: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--release-tag")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--release-tag", help="also require the existing annotated tag to match v0.1.0 and HEAD")
     args = parser.parse_args()
     check_required_files()
     check_metadata()

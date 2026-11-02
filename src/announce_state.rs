@@ -1,9 +1,8 @@
 //! Durable ordering state for locally-created announces.
 //!
-//! Reticulum orders announces by the unsigned 40-bit value in
-//! `random_hash[5..10]`. That protocol value is deliberately separate from
-//! ratchet rotation and expiry clocks: it orders wire events, but is never
-//! interpreted as elapsed seconds by this crate.
+//! Track the unsigned 40-bit ordering value carried in `random_hash[5..10]`.
+//! The host supplies wall time or restores the logical value and owns durable
+//! storage. Ratchet rotation and expiry are separate caller responsibilities.
 
 /// Largest value representable by the announce wire field.
 pub const ANNOUNCE_TIME_MAX: u64 = (1u64 << 40) - 1;
@@ -21,18 +20,17 @@ pub enum AnnounceWireError {
     InvalidBlob,
     /// The caller's output buffer cannot hold the fixed-size state.
     OutputTooSmall,
-    /// No later 40-bit value exists.
+    /// The requested wall value or logical increment exceeds the 40-bit range.
     Exhausted,
-    /// A stale or unrelated candidate was supplied to [`AnnounceWireState::commit_prepared`].
+    /// The candidate has no value or does not advance the live ordering value.
     StaleCandidate,
 }
 
-/// Persisted, monotonically increasing announce ordering state.
+/// Monotonically increasing announce ordering state for caller-owned storage.
 ///
-/// With a wall clock, the wall value is used verbatim and same/backward time
-/// coalesces. This matches the full Rust stack and never fabricates a value a
-/// few seconds into the future. Without a wall clock, the only interoperable
-/// way to produce a fresh later announce is a durable logical increment.
+/// A supplied wall value is used verbatim; same/backward values coalesce.
+/// Without wall time, the first value is zero and later values increment by one.
+/// Persist each prepared value before committing it or emitting its announce.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AnnounceWireState {
     last_value: Option<u64>,
@@ -49,9 +47,9 @@ impl AnnounceWireState {
 
     /// Plan the next wire value without mutating live state.
     ///
-    /// `wall_secs = Some(_)` uses real wall time. `None` selects the persisted
-    /// logical fallback needed by boards without a clock. `Ok(None)` means the
-    /// wall clock has not advanced and the caller must coalesce/defer.
+    /// `Some(_)` uses caller-supplied wall seconds. `None` selects the restored
+    /// logical sequence. `Ok(None)` means the supplied wall value does not exceed
+    /// the last value; the caller must coalesce or defer.
     pub fn prepare_next(&self, wall_secs: Option<u64>) -> Result<Option<Self>, AnnounceWireError> {
         let next = match wall_secs {
             Some(now) => {
@@ -78,7 +76,8 @@ impl AnnounceWireState {
     }
 
     /// Commit a candidate only after its serialized bytes have been durably
-    /// stored by the host.
+    /// stored by the host. This checks that the value advances; it cannot verify
+    /// persistence or that the candidate was prepared from this instance.
     pub fn commit_prepared(&mut self, prepared: Self) -> Result<u64, AnnounceWireError> {
         let next = prepared
             .last_value

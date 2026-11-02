@@ -23,6 +23,9 @@ pub struct AnnounceView<'a> {
 }
 
 impl<'a> AnnounceView<'a> {
+    /// Parse announce fields without verifying the signature or destination binding.
+    /// `has_ratchet` must match the packet context flag. The caller supplies the
+    /// app-data allowance and checks the enclosing packet's size and framing.
     pub fn parse(
         payload: &'a [u8],
         has_ratchet: bool,
@@ -78,6 +81,10 @@ impl<'a> AnnounceView<'a> {
         identity_hash(&self.public_key)
     }
 
+    /// Check destination-hash binding, an optional previously known public key,
+    /// and the signature. Returns the identity hash on success. This does not
+    /// check announce age, ordering or application policy; the caller owns those
+    /// decisions and supplies scratch for the signed fields.
     pub fn validate(
         &self,
         destination_hash: &[u8; DESTINATION_LENGTH],
@@ -101,6 +108,9 @@ impl<'a> AnnounceView<'a> {
         Ok(identity_hash)
     }
 
+    /// Verify the signature over the supplied destination hash and announce fields.
+    /// Use [`Self::validate`] when destination binding and known-key consistency
+    /// must also be checked. Signature success alone does not establish freshness.
     pub fn verify_signature(
         &self,
         destination_hash: &[u8; DESTINATION_LENGTH],
@@ -209,23 +219,22 @@ pub const LXMF_DELIVERY_NAME: &str = "lxmf.delivery";
 const ANNOUNCE_FIXED_NO_RATCHET: usize =
     PUBLIC_KEY_LENGTH + NAME_HASH_LENGTH + RANDOM_HASH_LENGTH + SIGNATURE_LENGTH;
 
-/// Max `app_data` a single-packet announce can carry on the wire, sized to the LARGEST packet that
-/// can arrive: a HEADER_1 (directly-received) announce spends only `HEADER_MINSIZE`, so the ceiling
-/// is `MTU - HEADER_MINSIZE - announce_fixed`. NOT an arbitrary cap, and NOT the MDU-derived value
-/// (`MTU - HEADER_MAXSIZE - IFAC`) — that under-counts by the forwarding-header + IFAC bytes and
-/// would black-hole a long-display-name announce the rest of the network accepts (validate_announce
-/// imposes no app_data limit). rsDeck's own emitted announces are tiny (~8 B), but ingest must
-/// accept any network-valid single-packet announce. (Forwardability is bounded separately, at the
-/// rebroadcast step, which skips an announce too large to re-frame as HEADER_2 rather than dropping
-/// the learned path.)
+/// Largest app-data allowance for a header-1 announce without a ratchet or
+/// IFAC: `MTU - HEADER_MINSIZE - ANNOUNCE_FIXED_NO_RATCHET` (333 bytes).
+///
+/// This is an upper receive bound, not a guarantee that every constructed
+/// announce fits a packet. A ratchet adds 32 bytes, forwarding headers add
+/// packet bytes, and IFAC adds to the wrapped frame. Callers must check both
+/// the packet budget and the interface's frame limit.
 pub const MAX_ANNOUNCE_APP_DATA: usize = MTU - HEADER_MINSIZE - ANNOUNCE_FIXED_NO_RATCHET;
 
 // Pin the wire bound (MTU 500 - HEADER_MINSIZE 19 - fixed 148 = 333). A regression that lowers it
 // would re-introduce the long-display-name black-hole; raising MTU should bump this in lockstep.
 const _: () = assert!(MAX_ANNOUNCE_APP_DATA == 333);
 
-/// signed_data = dest_hash || pub || name_hash || random_hash || \[ratchet\] || app_data.
-/// Public so consumers (the FFI) can size their scratch identically and never drift.
+/// Scratch capacity for `dest_hash || pub || name_hash || random_hash ||
+/// ratchet || app_data` at the maximum app-data allowance. This sizes signing
+/// scratch; it is not an on-wire packet-size limit.
 pub const SIGNED_DATA_MAX: usize = DESTINATION_LENGTH
     + PUBLIC_KEY_LENGTH
     + NAME_HASH_LENGTH
@@ -233,17 +242,14 @@ pub const SIGNED_DATA_MAX: usize = DESTINATION_LENGTH
     + RATCHET_SIZE
     + MAX_ANNOUNCE_APP_DATA;
 
-/// Compose an announce `random_hash` in the canonical Reticulum layout: `rng(5) || unix_secs_be(5)`.
+/// Compose `random_hash` as five caller-supplied entropy bytes followed by
+/// the low five bytes of `unix_secs` in big-endian order.
 ///
-/// The low 5 bytes ARE the announce emission time (big-endian Unix seconds), matching Python
-/// `Destination.announce` (`get_random_hash()[0:5] + int(time).to_bytes(5,"big")`) and rsReticulum
-/// `AnnounceData::create`. This is load-bearing, not cosmetic: the relay freshness / anti-replay
-/// gate ([`crate::tables`] `announce_emitted`) parses bytes `[5..10]` big-endian to order and reject
-/// stale/replayed announces. A `random_hash` that is fully random, wrong-endian, or carries a
-/// non-Unix tick still passes signature validation everywhere (nobody validates its structure) but
-/// is mis-ordered or dropped by freshness-aware relays. Compose it through this helper (no_std has
-/// no clock/RNG, so the caller supplies the 5 entropy bytes + the Unix time) so the create seam
-/// cannot produce a freshness-hostile announce.
+/// The helper silently truncates values above the 40-bit wire range; it does
+/// not read a clock, generate entropy or enforce monotonic ordering. Use
+/// [`crate::announce_state::AnnounceWireState`] to prepare and persist ordering
+/// values when needed. Relays interpret these bytes as the announce ordering
+/// value, so the caller must not replace them with unrelated random bytes.
 pub fn compose_random_hash(rng: &[u8; 5], unix_secs: u64) -> [u8; RANDOM_HASH_LENGTH] {
     let mut out = [0u8; RANDOM_HASH_LENGTH];
     out[..5].copy_from_slice(rng);
@@ -269,7 +275,9 @@ impl Drop for LocalIdentity {
 }
 
 impl LocalIdentity {
-    /// Load a raw 64-byte private key and derive the public key + identity hash.
+    /// Copy a raw 64-byte private key and derive its public key and identity hash.
+    /// The caller supplies securely generated or restored key bytes and remains
+    /// responsible for wiping the original copy.
     pub fn from_private_key(private_key: &[u8; PRIVATE_KEY_LENGTH]) -> Self {
         let public_key = derive_public_key(private_key);
         let identity_hash = identity_hash(&public_key);
@@ -280,7 +288,8 @@ impl LocalIdentity {
         }
     }
 
-    /// The raw 64-byte private key (the canonical Reticulum export form).
+    /// Borrow the raw 64-byte private key in Reticulum export format.
+    /// Any copy or exported file contains the complete identity secret.
     pub fn private_key(&self) -> &[u8; PRIVATE_KEY_LENGTH] {
         &self.private_key
     }
@@ -325,17 +334,17 @@ impl LocalIdentity {
         self.create_announce_named(LXMF_DELIVERY_NAME, random_hash, ratchet, app_data, out)
     }
 
-    /// Build a signed `announce_data` payload for destination `name`, writing it into `out`
-    /// and returning the byte length. `no_std`: the caller supplies `random_hash`
-    /// (`random(5) || unix_seconds_be(5)`) and the optional `ratchet` public bytes — this
-    /// crate has no RNG or clock.
+    /// Build a signed announce payload for destination `name`, writing into `out`
+    /// and returning its length. The caller supplies `random_hash` and any ratchet
+    /// public key; this crate has no RNG or clock.
     ///
-    /// On-wire layout (identical to Python `Destination.announce`):
-    /// `announce_data = pub(64) || name_hash(10) || random_hash(10) || [ratchet(32)] || sig(64) || app_data`
-    /// signed over `dest_hash(16) || pub(64) || name_hash(10) || random_hash(10) || [ratchet(32)] || app_data`.
+    /// Layout: `pub(64) || name_hash(10) || random_hash(10) || [ratchet(32)] || sig(64) || app_data`.
+    /// The signature covers `dest_hash(16)` followed by those fields without `sig`.
     ///
-    /// The packet header (flags/hops/dest_hash/context byte) is built separately; the
-    /// announce's `context_flag` MUST be set iff `ratchet` is `Some` (Python parses on it).
+    /// The helper accepts up to [`MAX_ANNOUNCE_APP_DATA`] app-data bytes even when
+    /// a ratchet is present. The caller must fit the result plus packet headers
+    /// and IFAC within the interface budget, and set the packet's `context_flag`
+    /// exactly when `ratchet` is `Some`. It does not send or schedule the announce.
     pub fn create_announce_named(
         &self,
         name: &str,
