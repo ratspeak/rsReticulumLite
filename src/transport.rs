@@ -1,6 +1,10 @@
+mod router;
 use ed25519_dalek::Verifier;
+pub use router::RouterOutboundFrame;
 
 use crate::announce_admission::AnnounceAdmission;
+use crate::announce_cap::{bitrate_spacing_ms, lora_spacing_ms};
+use crate::config::{ConfigError, InterfaceConfig, InterfaceRegistry, InterfaceRole};
 use crate::config::{InterfaceMode, LiteConfig};
 use crate::constants::{
     AP_PATH_TIME_SECS, LINK_TIMEOUT_SECS, LOCAL_REBROADCASTS_MAX, PATH_REQUEST_DUPLICATE_GATE_SECS,
@@ -18,6 +22,8 @@ use crate::ifac::{IfacError, has_ifac_flag, ifac_sign_into, ifac_verify_into};
 use crate::known_destinations::{
     KNOWN_DESTINATIONS_MICRO, KNOWN_DESTINATIONS_SMALL, KnownDestinationError, KnownDestinations,
 };
+use crate::lora::LoraModemConfig;
+use crate::model::{Endpoint, Model, Router, RouterStats};
 use crate::packet_buffer::{BufferError, PacketBuffer, WireBuffer};
 use crate::tables::{
     AnnounceCache, AnnounceSchedule, CachedAnnounce, Hash16, InterfaceId, LinkEntry, LinkTable,
@@ -40,6 +46,15 @@ pub type MicroNode = LiteNode<48, 64, 8, 8, 4, 8, 8, KNOWN_DESTINATIONS_MICRO>;
 /// Fixed slot count for a node's own registered destination hashes (endpoint destinations
 /// living on the same device as the relay, e.g. lxmf.delivery — one per local identity).
 pub const OWN_DESTINATIONS_MAX: usize = 4;
+pub const LOCAL_LINKS_MAX: usize = 3;
+
+/// Local ownership slots share the endpoint's existing 68-byte budget.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalSlot {
+    Empty,
+    Destination(Hash16),
+    Link(Hash16),
+}
 
 const HASHLIST_LIFETIME_MS: u64 = 120_000;
 // Upstream PATHFINDER_RW = 0.5s: announce rebroadcast jitter window is [0,500)ms.
@@ -104,9 +119,9 @@ pub struct OutboundDelivery {
 /// Internal queue entry; legacy consumers still receive the unchanged OutboundFrame.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct QueuedOutbound {
+pub struct QueuedOutbound<D = OutboundDelivery> {
     pub frame: OutboundFrame,
-    pub delivery: OutboundDelivery,
+    pub delivery: D,
 }
 
 /// Immutable local queue-wait ceiling, checked before a driver starts a packet.
@@ -208,6 +223,14 @@ pub enum OutboundReason {
     PathRequest,
     TransportForward,
     ProofReturn,
+    /// Packet originated by a registered local endpoint.
+    Local,
+}
+
+impl OutboundReason {
+    pub const fn gated(self) -> bool {
+        matches!(self, Self::AnnounceRebroadcast)
+    }
 }
 
 /// Ingress classification, not a transmission or application-delivery receipt.
@@ -228,6 +251,8 @@ pub enum IngestAction {
     ForwardedPathRequest,
     ForwardedTransport,
     ForwardedProof,
+    LocalEndpoint,
+    LocalPlain,
     Dropped,
 }
 
@@ -255,6 +280,12 @@ pub struct TransportStats {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportError {
     InvalidConfig,
+    UnknownInterface,
+    InterfaceOffline,
+    InterfaceNotOutbound,
+    InterfaceNotInbound,
+    MtuExceeded,
+    Backpressure,
     LinkCapacityUnavailable {
         interface_id: InterfaceId,
         clear_mtu: usize,
@@ -345,6 +376,7 @@ pub struct LiteNode<
     const OUTBOUND: usize,
     const KNOWN_DESTINATIONS: usize = KNOWN_DESTINATIONS_SMALL,
     const SCHEDULED: usize = ANNOUNCES,
+    M: Model = Endpoint,
 > {
     #[doc(hidden)]
     pub config: LiteConfig,
@@ -353,7 +385,7 @@ pub struct LiteNode<
     #[doc(hidden)]
     pub transport_id: Hash16,
     #[doc(hidden)]
-    pub own_destinations: [Option<Hash16>; OWN_DESTINATIONS_MAX],
+    pub local: [LocalSlot; OWN_DESTINATIONS_MAX],
     #[doc(hidden)]
     pub announce_admission: AnnounceAdmission,
     #[doc(hidden)]
@@ -373,7 +405,7 @@ pub struct LiteNode<
     #[doc(hidden)]
     pub request_tags: RequestTagTable<TAGS>,
     #[doc(hidden)]
-    pub outbound: Queue<QueuedOutbound, OUTBOUND>,
+    pub outbound: Queue<QueuedOutbound<M::Delivery>, OUTBOUND>,
     #[doc(hidden)]
     pub last_delivery_identity: u64,
     #[doc(hidden)]
@@ -381,7 +413,7 @@ pub struct LiteNode<
     #[doc(hidden)]
     pub discoveries: Discoveries<LINKS>,
     #[doc(hidden)]
-    pub interface_facts: [InterfaceFacts; REQUESTERS],
+    pub interfaces: M,
     #[doc(hidden)]
     pub stats: TransportStats,
 }
@@ -396,6 +428,7 @@ impl<
     const OUTBOUND: usize,
     const KNOWN_DESTINATIONS: usize,
     const SCHEDULED: usize,
+    M: Model,
 >
     LiteNode<
         PATHS,
@@ -407,6 +440,7 @@ impl<
         OUTBOUND,
         KNOWN_DESTINATIONS,
         SCHEDULED,
+        M,
     >
 {
     /// Validate configuration and return an empty node by value.
@@ -447,7 +481,7 @@ impl<
             config,
             clock_ms: 0,
             transport_id,
-            own_destinations: [None; OWN_DESTINATIONS_MAX],
+            local: [LocalSlot::Empty; OWN_DESTINATIONS_MAX],
             announce_admission: AnnounceAdmission::new(),
             known_destinations: KnownDestinations::new(),
             packet_hashes: PacketHashTable::new(),
@@ -461,7 +495,7 @@ impl<
             last_delivery_identity: 0,
             retained_owner_mode: false,
             discoveries: Discoveries::new(),
-            interface_facts: [InterfaceFacts::EMPTY; REQUESTERS],
+            interfaces: M::EMPTY,
             stats: TransportStats {
                 accepted: 0,
                 duplicates: 0,
@@ -494,28 +528,102 @@ impl<
     /// (trusted rns-transport inbound.rs "dropping own announce" — the phantom self-path hazard
     /// when `transport_enabled`). Idempotent; returns false if all slots are taken.
     pub fn register_own_destination(&mut self, destination_hash: Hash16) -> bool {
-        if self.is_own_destination(&destination_hash) {
+        self.register_local_destination(destination_hash)
+    }
+
+    pub fn register_local_destination(&mut self, destination_hash: Hash16) -> bool {
+        self.register_local_slot(LocalSlot::Destination(destination_hash))
+    }
+
+    pub fn register_local_link(&mut self, link_id: Hash16) -> bool {
+        self.register_local_slot(LocalSlot::Link(link_id))
+    }
+
+    fn register_local_slot(&mut self, value: LocalSlot) -> bool {
+        if self.local.contains(&value) {
             return true;
         }
-        for slot in self.own_destinations.iter_mut() {
-            if slot.is_none() {
-                *slot = Some(destination_hash);
-                return true;
+        if let Some(slot) = self
+            .local
+            .iter_mut()
+            .find(|slot| **slot == LocalSlot::Empty)
+        {
+            *slot = value;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn unregister_local_destination(&mut self, destination: &Hash16) {
+        for slot in &mut self.local {
+            if *slot == LocalSlot::Destination(*destination) {
+                *slot = LocalSlot::Empty;
             }
         }
-        false
     }
 
-    pub fn is_own_destination(&self, destination_hash: &Hash16) -> bool {
-        self.own_destinations
-            .iter()
-            .any(|slot| slot.as_ref() == Some(destination_hash))
+    pub fn unregister_local_link(&mut self, link: &Hash16) {
+        for slot in &mut self.local {
+            if *slot == LocalSlot::Link(*link) {
+                *slot = LocalSlot::Empty;
+            }
+        }
     }
 
-    /// Clear the own-destination list before registering destinations for a different identity.
-    /// This does not clear learned paths, known identities or queued packets.
+    pub fn is_own_destination(&self, destination: &Hash16) -> bool {
+        self.local.contains(&LocalSlot::Destination(*destination))
+    }
+
+    pub fn clear_local(&mut self) {
+        self.local.fill(LocalSlot::Empty);
+    }
+
+    /// Remove destination ownership without disturbing independently owned local Links.
     pub fn clear_own_destinations(&mut self) {
-        self.own_destinations = [None; OWN_DESTINATIONS_MAX];
+        for slot in &mut self.local {
+            if matches!(slot, LocalSlot::Destination(_)) {
+                *slot = LocalSlot::Empty;
+            }
+        }
+    }
+
+    /// Clear runtime traffic state in place while keeping all incarnation counters monotonic.
+    pub fn reset_in_place(
+        &mut self,
+        config: LiteConfig,
+        transport_id: Hash16,
+    ) -> Result<(), TransportError> {
+        Self::validate_config(&config)?;
+        if let Some(router) = self.interfaces.router_mut() {
+            // Reserve a fresh registration epoch before changing any state.
+            let generation = router
+                .last_generation
+                .checked_add(1)
+                .ok_or(TransportError::InvalidConfig)?;
+            router.last_generation = generation;
+            router.generations.fill(generation);
+            router
+                .announce_gates
+                .fill(crate::announce_cap::AnnounceGate::OPEN);
+            router.stats = RouterStats::default();
+            router.plain_sink = None;
+        }
+        self.config = config;
+        self.transport_id = transport_id;
+        self.clear_local();
+        self.announce_admission = AnnounceAdmission::new();
+        self.packet_hashes.clear();
+        self.paths.clear();
+        self.announce_cache.clear();
+        self.announce_schedule.clear();
+        self.reverse.clear();
+        self.links.clear();
+        self.request_tags.clear();
+        self.outbound.clear();
+        self.discoveries.clear();
+        self.stats = TransportStats::default();
+        Ok(())
     }
 
     pub const fn stats(&self) -> TransportStats {
@@ -603,7 +711,8 @@ impl<
     /// Build a path request with a caller-supplied random 16-byte tag and attempt to queue it.
     /// Payload is `dest_hash || [transport_id when transport is enabled] || tag`, addressed to
     /// `rnstransport.path.request`. A successful queue attempt records the tag for echo filtering.
-    /// `Ok(())` also covers queue refusal; it does not confirm transmission or a discovered path.
+    /// Queue refusal returns a typed error. `Ok(())` confirms admission only, not
+    /// transmission or a discovered path.
     /// `interface_id` is retained as frame metadata; the retained handheld adapter fans locally
     /// originated requests out to its eligible targets.
     pub fn request_path(
@@ -619,7 +728,7 @@ impl<
         // Send before recording: a request that never queued must not burn the
         // duplicate gate or register its tag (trusted send-before-record ordering).
         if !self.enqueue(interface_id, request, OutboundReason::PathRequest) {
-            return Ok(());
+            return Err(self.egress_error(interface_id, request.len()));
         }
         let mut tag_key = [0u8; 32];
         tag_key[..16].copy_from_slice(destination_hash);
@@ -733,7 +842,9 @@ impl<
                     frame.frame.interface_id,
                     frame.frame.lifetime,
                     now_ms,
-                )
+                ) || !self
+                    .interfaces
+                    .delivery_is_current(frame.frame.interface_id, frame.delivery)
             });
             let Some(offset) = stale else { break };
             self.outbound.remove(offset);
@@ -809,72 +920,12 @@ impl<
     }
 
     fn interface_slot(&self, id: u8) -> Option<usize> {
-        self.interface_facts
-            .iter()
-            .position(|f| f.flags & 1 != 0 && f.id == id)
-    }
-
-    /// Private owner metadata. Call before ingest/tick. A generation change or loss of
-    /// outbound availability is a reconnect: queued permission retires, routes stay. A mode
-    /// change is a replacement. Rates are sampled only when a new operation begins.
-    #[doc(hidden)]
-    pub fn update_interface(
-        &mut self,
-        id: u8,
-        generation: u32,
-        mode: InterfaceMode,
-        bitrate_bps: u32,
-        outbound: bool,
-        local_client: bool,
-    ) -> bool {
-        let slot = self
-            .interface_slot(id)
-            .or_else(|| self.interface_facts.iter().position(|f| f.flags & 1 == 0));
-        let Some(slot) = slot else {
-            return false;
-        };
-        let previous = self.interface_facts[slot];
-        if previous.flags & 1 != 0 {
-            if previous.mode != mode {
-                self.retire_replaced_interface(id);
-            } else if previous.generation != generation || !outbound {
-                self.retained_outbound_retire_interface(id);
-            }
-        }
-        let previous = self.interface_facts[slot];
-        self.interface_facts[slot] = InterfaceFacts {
-            id,
-            generation,
-            mode,
-            bitrate_bps,
-            clear_mtu: if previous.flags & 1 != 0 {
-                previous.clear_mtu
-            } else {
-                self.default_clear_mtu() as u16
-            },
-            flags: 1
-                | 4
-                | if outbound && generation != 0 { 2 } else { 0 }
-                | if local_client { 8 } else { 0 },
-        };
-        true
+        self.interfaces.slot(id)
     }
 
     fn observe_interface(&mut self, meta: RxMeta) {
-        if let Some(slot) = self.interface_slot(meta.interface_id) {
-            if self.interface_facts[slot].flags & 4 == 0 {
-                self.interface_facts[slot].mode = meta.interface_mode.unwrap_or(self.config.mode);
-            }
-        } else if let Some(slot) = self.interface_facts.iter().position(|f| f.flags & 1 == 0) {
-            self.interface_facts[slot] = InterfaceFacts {
-                id: meta.interface_id,
-                generation: 1,
-                mode: meta.interface_mode.unwrap_or(self.config.mode),
-                bitrate_bps: 0,
-                clear_mtu: self.default_clear_mtu() as u16,
-                flags: 1 | 2,
-            };
-        }
+        let clear_mtu = self.default_clear_mtu();
+        self.interfaces.observe(meta, &self.config, clear_mtu);
     }
 
     fn default_clear_mtu(&self) -> usize {
@@ -890,38 +941,17 @@ impl<
     pub fn interface_clear_mtu(&self, id: InterfaceId) -> usize {
         self.interface_slot(id).map_or_else(
             || self.default_clear_mtu(),
-            |slot| usize::from(self.interface_facts[slot].clear_mtu),
+            |slot| usize::from(self.interfaces.facts(slot).clear_mtu),
         )
     }
 
-    /// Publish a clear-packet budget for the matching nonzero registered generation.
-    /// Clamps the value to the fixed MTU. A change removes transit Links on that interface
-    /// and expires dependent queued work; the host retires any separate endpoint Links.
-    /// Returns false for an unknown ID or generation mismatch.
-    pub fn update_interface_packet_capacity(
-        &mut self,
-        id: InterfaceId,
-        generation: u32,
-        clear_mtu: usize,
-    ) -> bool {
-        let Some(slot) = self.interface_slot(id) else {
-            return false;
-        };
-        if generation == 0 || self.interface_facts[slot].generation != generation {
-            return false;
-        }
-        let clear_mtu = clear_mtu.min(crate::constants::MTU) as u16;
-        if self.interface_facts[slot].clear_mtu != clear_mtu {
-            self.links.remove_interface(id);
-            self.interface_facts[slot].clear_mtu = clear_mtu;
-            self.expire_outbound(self.clock_ms);
-        }
-        true
-    }
-
     /// Require a clear-packet budget of at least 500 bytes for fixed-profile Links.
-    /// Uses the fallback for an unknown interface; success does not check online state.
+    /// Endpoint uses its fallback for an unknown interface. Router requires registration;
+    /// success does not check online state.
     pub fn require_link_capacity(&self, interface_id: InterfaceId) -> Result<(), TransportError> {
+        if M::ROUTER && self.interface_slot(interface_id).is_none() {
+            return Err(TransportError::UnknownInterface);
+        }
         let clear_mtu = self.interface_clear_mtu(interface_id);
         if clear_mtu < 500 {
             Err(TransportError::LinkCapacityUnavailable {
@@ -936,14 +966,23 @@ impl<
 
     fn interface_bitrate(&self, id: u8) -> u32 {
         self.interface_slot(id)
-            .map(|s| self.interface_facts[s])
+            .map(|s| self.interfaces.facts(s))
             .filter(|f| f.outbound())
             .map_or(0, |f| f.bitrate_bps)
     }
     fn slowest_outbound_bitrate(&self, requester: u8) -> u64 {
-        self.interface_facts
-            .iter()
-            .filter(|f| f.id != requester && f.outbound() && f.bitrate_bps > 0)
+        (0..REQUESTERS)
+            .map(|slot| self.interfaces.facts(slot))
+            .filter(|f| {
+                (f.id != requester
+                    || self
+                        .interfaces
+                        .router()
+                        .and_then(|r| r.interface(f.id))
+                        .is_some_and(|i| i.direction.repeat))
+                    && f.outbound()
+                    && f.bitrate_bps > 0
+            })
             .map(|f| u64::from(f.bitrate_bps))
             .min()
             .unwrap_or(0)
@@ -971,7 +1010,7 @@ impl<
             return Ok(());
         };
         for slot in 0..REQUESTERS {
-            let target = self.interface_facts[slot];
+            let target = self.interfaces.facts(slot);
             if owner.requesters & (1 << slot) != 0
                 && target.outbound()
                 && (target.id != meta.interface_id
@@ -985,165 +1024,8 @@ impl<
         Ok(())
     }
 
-    fn outbound_interface_online(&self, _interface_id: InterfaceId) -> bool {
-        true
-    }
-
-    /// Remove the next frame after expiring stale work using the last supplied host time.
-    /// The driver must check lifetime and interface ownership again before starting it.
-    /// Returns `None` after the retained handheld owner API has been selected, even if work remains.
-    pub fn poll_tx(&mut self) -> Option<OutboundFrame> {
-        // A legacy consumer cannot reinterpret partially admitted target bits.
-        if self.retained_owner_mode {
-            return None;
-        }
-        self.expire_outbound(self.clock_ms);
-        self.outbound.pop().map(|queued| queued.frame)
-    }
-
-    /// Peek at the next queued byte length without consuming or expiring anything.
-    /// It may describe stale work that [`Self::poll_tx`] will discard. Returns `None` in
-    /// retained-owner mode; otherwise useful for sizing a legacy consumer's buffer.
-    pub fn outbound_peek_len(&self) -> Option<usize> {
-        if self.retained_owner_mode {
-            return None;
-        }
-        self.outbound.peek().map(|f| f.frame.packet.len())
-    }
-
-    /// Private handheld owner API. Copies leave this borrow before driver callbacks.
-    /// Seven target bits map to the existing handheld interface registry only.
-    #[doc(hidden)]
-    pub fn retained_outbound_select(
-        &mut self,
-        after: u64,
-        blocked: u8,
-        generations: [u32; 7],
-    ) -> Option<&QueuedOutbound> {
-        self.retained_owner_mode = true;
-        self.expire_outbound(self.clock_ms);
-        for queued in self.outbound.iter_mut() {
-            let delivery = &mut queued.delivery;
-            if !delivery.initialized {
-                let selected = match queued.frame.reason {
-                    OutboundReason::PathResponse
-                    | OutboundReason::TransportForward
-                    | OutboundReason::ProofReturn => {
-                        if queued.frame.interface_id < 7 {
-                            1u8 << queued.frame.interface_id
-                        } else {
-                            0
-                        }
-                    }
-                    OutboundReason::AnnounceRebroadcast | OutboundReason::PathRequestForward => {
-                        if queued.frame.interface_id < 7 {
-                            0x7f & !(1u8 << queued.frame.interface_id)
-                        } else {
-                            0x7f
-                        }
-                    }
-                    OutboundReason::PathRequest => 0x7f,
-                };
-                delivery.pending_targets &= selected;
-                delivery.interface_generations = generations;
-                delivery.initialized = true;
-            }
-            for (id, generation) in generations.iter().enumerate() {
-                if *generation == 0 || *generation != delivery.interface_generations[id] {
-                    delivery.pending_targets &= !(1u8 << id);
-                }
-            }
-        }
-        loop {
-            let offset = self
-                .outbound
-                .iter()
-                .position(|q| q.delivery.pending_targets == 0);
-            let Some(offset) = offset else {
-                break;
-            };
-            self.outbound.remove(offset);
-            // Fully acknowledged rows are removed by ack. Reaching this path
-            // means the remaining delivery permission was retired or no live
-            // target existed; expose that terminal loss through the existing
-            // saturating queue-drop counter.
-            self.stats.outbound_dropped = self.stats.outbound_dropped.saturating_add(1);
-        }
-        self.outbound
-            .iter()
-            .find(|q| q.delivery.identity > after && q.delivery.pending_targets & !blocked != 0)
-    }
-
-    #[doc(hidden)]
-    pub fn retained_outbound_ack(&mut self, identity: u64, completed: u8) -> bool {
-        if !self.retained_owner_mode || identity == 0 {
-            return false;
-        }
-        let offset = self
-            .outbound
-            .iter()
-            .position(|q| q.delivery.identity == identity);
-        let Some(offset) = offset else {
-            return false;
-        };
-        let queued = self
-            .outbound
-            .get_mut(offset)
-            .expect("located occupied queue slot");
-        if !queued.delivery.initialized {
-            return false;
-        }
-        queued.delivery.pending_targets &= !completed;
-        if queued.delivery.pending_targets == 0 {
-            self.outbound.remove(offset);
-        }
-        true
-    }
-
-    #[doc(hidden)]
-    pub fn retained_outbound_take(&mut self, identity: u64) -> bool {
-        if !self.retained_owner_mode || identity == 0 {
-            return false;
-        }
-        let offset = self
-            .outbound
-            .iter()
-            .position(|q| q.delivery.identity == identity);
-        offset
-            .and_then(|offset| self.outbound.remove(offset))
-            .is_some()
-    }
-
-    /// Also retire permission on rows that have never been peeked. Re-registering
-    /// this physical interface cannot bind its replacement to old queued bytes.
-    #[doc(hidden)]
-    pub fn retained_outbound_retire_interface(&mut self, interface: u8) {
-        if let Some(slot) = self.interface_slot(interface) {
-            self.interface_facts[slot].flags &= !2;
-        }
-        if interface >= 7 {
-            return;
-        }
-        for queued in self.outbound.iter_mut() {
-            queued.delivery.pending_targets &= !(1u8 << interface);
-        }
-    }
-
-    /// The interface behind `interface` was replaced or removed: drop every route through
-    /// it and forget its facts, as trusted does on re-registration. A reconnect keeps them.
-    #[doc(hidden)]
-    pub fn retire_replaced_interface(&mut self, interface: u8) {
-        self.retained_outbound_retire_interface(interface);
-        if let Some(slot) = self.interface_slot(interface) {
-            self.discoveries.retire_requester(slot);
-            self.interface_facts[slot] = InterfaceFacts::EMPTY;
-        }
-        self.paths.remove_interface(interface);
-        self.announce_schedule.remove_interface(interface);
-        self.reverse.remove_interface(interface);
-        self.links.remove_interface(interface);
-        self.announce_cache.retain_paths(&self.paths, self.clock_ms);
-        self.expire_outbound(self.clock_ms);
+    fn outbound_interface_online(&self, interface_id: InterfaceId) -> bool {
+        self.interfaces.online(interface_id)
     }
 
     /// Stored queue rows, including work not yet expired or retired by a mutating operation.
@@ -1183,15 +1065,24 @@ impl<
             {
                 continue;
             }
-            self.enqueue(
-                announce.interface_id,
-                announce.packet,
-                if announce.block_rebroadcast {
-                    OutboundReason::PathResponse
-                } else {
-                    OutboundReason::AnnounceRebroadcast
-                },
-            );
+            if !announce.block_rebroadcast && M::ROUTER {
+                let targets = self.announce_targets(announce.interface_id);
+                if announce.pending_targets & targets == 0 {
+                    announce.expires_ms =
+                        now_ms.saturating_add(u64::from(QUEUED_ANNOUNCE_LIFE_SECS) * 1000);
+                }
+                announce.pending_targets |= targets;
+            } else {
+                self.enqueue(
+                    announce.interface_id,
+                    announce.packet,
+                    if announce.block_rebroadcast {
+                        OutboundReason::PathResponse
+                    } else {
+                        OutboundReason::AnnounceRebroadcast
+                    },
+                );
+            }
             // Trusted maintenance.rs: count the send, retry once PATHFINDER_G later.
             announce.retries = announce.retries.saturating_add(1);
             if !announce.block_rebroadcast && announce.retries <= PATHFINDER_R {
@@ -1203,8 +1094,12 @@ impl<
                         announce.retries,
                     ));
                 self.announce_schedule.insert(announce, now_ms);
+            } else if announce.pending_targets != 0 {
+                announce.due_ms = ScheduledAnnounce::PENDING_ONLY;
+                self.announce_schedule.insert(announce, now_ms);
             }
         }
+        self.release_gated_announces(now_ms);
     }
 
     /// Process a received frame using the supplied interface facts and monotonic time.
@@ -1235,6 +1130,28 @@ impl<
         now_ms: u64,
         local_link: Option<&Hash16>,
     ) -> Result<IngestAction, TransportError> {
+        self.ingest_inner(raw, meta, now_ms, local_link, None)
+    }
+
+    /// Capture local endpoint traffic after all normal admission checks.
+    pub fn ingest_endpoint(
+        &mut self,
+        raw: &[u8],
+        meta: RxMeta,
+        now_ms: u64,
+        endpoint: &mut PacketBuffer,
+    ) -> Result<IngestAction, TransportError> {
+        self.ingest_inner(raw, meta, now_ms, None, Some(endpoint))
+    }
+
+    fn ingest_inner(
+        &mut self,
+        raw: &[u8],
+        mut meta: RxMeta,
+        now_ms: u64,
+        local_link: Option<&Hash16>,
+        endpoint: Option<&mut PacketBuffer>,
+    ) -> Result<IngestAction, TransportError> {
         self.clock_ms = now_ms;
         self.observe_interface(meta);
         if !self.config.transport_enabled {
@@ -1242,8 +1159,18 @@ impl<
         }
         self.discoveries.expire(now_ms);
         self.expire_outbound(now_ms);
+        if !self.router_ingress(meta.interface_id, raw.len())? {
+            return Ok(IngestAction::Dropped);
+        }
+        if let Some(interface) = self
+            .interfaces
+            .router()
+            .and_then(|r| r.interface(meta.interface_id))
+        {
+            meta.interface_mode = Some(interface.mode);
+        }
         let mut ifac_plain = PacketBuffer::new();
-        let raw = if let Some(ifac) = self.config.ifac {
+        let raw = if let Some(ifac) = self.interfaces.ifac(meta.interface_id, &self.config) {
             match ifac_verify_into(raw, &ifac.key, ifac.size, &mut ifac_plain) {
                 Ok(()) => ifac_plain.as_slice(),
                 Err(_) => {
@@ -1275,6 +1202,23 @@ impl<
             self.require_link_capacity(meta.interface_id)?;
         }
 
+        if self.interfaces.router().and_then(|r| r.plain_sink) == Some(view.header.destination_hash)
+            && view.header.flags.packet_type == PacketType::Data
+            && view.header.flags.destination_type == DestinationType::Plain
+            && view.header.flags.transport_type == TransportType::Broadcast
+        {
+            // A configured sink is direct-only, including when local-client bridges
+            // exist. A relayed copy must not fall through into bridge fan-out.
+            if view.header.hops != 0 {
+                return Ok(IngestAction::Dropped);
+            }
+            if let Some(endpoint) = endpoint {
+                endpoint.clear();
+                endpoint.extend_from_slice(view.payload)?;
+                return Ok(IngestAction::LocalPlain);
+            }
+            return Ok(IngestAction::Dropped);
+        }
         self.stats.accepted = self.stats.accepted.saturating_add(1);
 
         // Python 1.3.8 (Packet.py:247) / trusted actor/inbound.rs: reject an on-wire hop count
@@ -1314,7 +1258,10 @@ impl<
             || view.header.flags.packet_type == PacketType::LinkRequest
             || view.header.context == PacketContext::Lrproof
             || (view.header.flags.destination_type == DestinationType::Link
-                && local_link == Some(&view.header.destination_hash));
+                && (local_link == Some(&view.header.destination_hash)
+                    || self
+                        .local
+                        .contains(&LocalSlot::Link(view.header.destination_hash))));
         if !view.header.context.skip_hashlist() && !defer_hashlist {
             let hash = packet_hash(raw, view.header.flags.header_type);
             let inserted = self.packet_hashes.insert(
@@ -1338,6 +1285,22 @@ impl<
 
         let mut header = view.header;
         header.hops = header.hops.saturating_add(1);
+        if self.is_local_client_interface(meta.interface_id) {
+            header.hops = header.hops.saturating_sub(1);
+        }
+        if (header.flags.packet_type == PacketType::LinkRequest
+            && header.flags.destination_type == DestinationType::Single
+            && self.is_own_destination(&header.destination_hash))
+            || (header.flags.packet_type == PacketType::Data
+                && ((header.flags.destination_type == DestinationType::Link
+                    && self
+                        .local
+                        .contains(&LocalSlot::Link(header.destination_hash)))
+                    || (header.flags.destination_type == DestinationType::Single
+                        && self.is_own_destination(&header.destination_hash))))
+        {
+            return Self::capture_endpoint(raw, header.hops, endpoint);
+        }
 
         let result = match header.flags.packet_type {
             PacketType::Announce => self.handle_announce(raw, view, header, meta, now_ms),
@@ -1352,6 +1315,10 @@ impl<
                     Ok(IngestAction::ForwardedTransport)
                 } else if header.destination_hash == path_request_destination() {
                     self.handle_path_request(view.payload, meta, now_ms)
+                } else if header.flags.destination_type == DestinationType::Plain
+                    && header.flags.transport_type == TransportType::Broadcast
+                {
+                    self.bridge_plain_broadcast(raw, header, meta.interface_id)
                 } else {
                     self.handle_transport_forward(raw, view.header, header, meta, now_ms)
                 }
@@ -1362,10 +1329,27 @@ impl<
             PacketType::Proof => self.handle_proof(raw, view.header, header, meta, now_ms),
         };
 
+        if result == Ok(IngestAction::LocalEndpoint) {
+            return Self::capture_endpoint(raw, header.hops, endpoint);
+        }
         if matches!(result, Err(TransportError::Announce(_))) {
             self.stats.validation_failures = self.stats.validation_failures.saturating_add(1);
         }
         result
+    }
+
+    fn capture_endpoint(
+        raw: &[u8],
+        hops: u8,
+        endpoint: Option<&mut PacketBuffer>,
+    ) -> Result<IngestAction, TransportError> {
+        let Some(endpoint) = endpoint else {
+            return Ok(IngestAction::Dropped);
+        };
+        endpoint.clear();
+        endpoint.extend_from_slice(raw)?;
+        endpoint.as_mut_slice()[1] = hops;
+        Ok(IngestAction::LocalEndpoint)
     }
 
     fn handle_announce(
@@ -1406,7 +1390,7 @@ impl<
             announce.validate(&header.destination_hash, known_public_key, &mut scratch)?;
         // Python remembers every validated announce, replays and path responses included,
         // before it decides the path (Transport.py:2172, Identity.py:589), as trusted inbound.rs.
-        if announce.name_hash == name_hash(LXMF_DELIVERY_NAME) {
+        if KNOWN_DESTINATIONS != 0 && announce.name_hash == name_hash(LXMF_DELIVERY_NAME) {
             self.known_destinations
                 .learn(header.destination_hash, announce.public_key, now_ms)?;
         }
@@ -1444,6 +1428,21 @@ impl<
         // node-wide mode as a compatibility fallback.
         let path_expiry_secs =
             announce_path_expiry_secs(meta.interface_mode.unwrap_or(self.config.mode));
+        let bulk = self
+            .interfaces
+            .router()
+            .and_then(|r| r.interface(meta.interface_id))
+            .is_some_and(|i| i.bulk_paths)
+            && !self.discoveries.entries.iter().any(|entry| {
+                entry.identity != 0
+                    && entry.requesters != 0
+                    && entry.destination == header.destination_hash
+                    && now_ms < entry.expires_ms
+            });
+        let new_destination = self
+            .paths
+            .get_live(&header.destination_hash, now_ms)
+            .is_none();
         let path_entry = PathEntry {
             destination_hash: header.destination_hash,
             next_hop: view.header.transport_id,
@@ -1454,11 +1453,20 @@ impl<
             packet_hash,
             random_hash: announce.random_hash,
             public_key: announce.public_key,
-            // Lite hosts register no bulk interfaces; rsNode's registry marks its uplink.
-            bulk: false,
+            bulk,
         };
 
         let learned = self.paths.insert_or_update(path_entry, now_ms);
+        if bulk && new_destination {
+            if let Some(router) = self.interfaces.router_mut() {
+                let counter = if learned {
+                    &mut router.stats.bulk_paths_learned
+                } else {
+                    &mut router.stats.bulk_paths_refused
+                };
+                *counter = counter.saturating_add(1);
+            }
+        }
 
         if learned {
             let _ = identity_hash;
@@ -1580,7 +1588,7 @@ impl<
         // forwarded. Returning Dropped lets the FFI's own-path-request post-check fire in
         // both transport postures.
         if self.is_own_destination(&requested) {
-            return Ok(IngestAction::Dropped);
+            return Ok(IngestAction::LocalEndpoint);
         }
 
         if let Some(path) = self.paths.get_live(&requested, now_ms) {
@@ -1613,10 +1621,26 @@ impl<
             // trusted Rust recovery behavior without bypassing discovery policy.
         }
 
+        if M::ROUTER && self.is_local_client_interface(interface_id) {
+            let request = self.build_path_request(requested, tag)?;
+            return Ok(
+                if self.enqueue_packet_broadcast(
+                    interface_id,
+                    request,
+                    OutboundReason::PathRequestForward,
+                    false,
+                ) > 0
+                {
+                    IngestAction::ForwardedPathRequest
+                } else {
+                    IngestAction::Dropped
+                },
+            );
+        }
         if self.config.transport_enabled && mode_discovers_unknown_paths(mode) {
             let Some(slot) = self
                 .interface_slot(interface_id)
-                .filter(|&slot| self.interface_facts[slot].outbound())
+                .filter(|&slot| self.interfaces.facts(slot).outbound())
             else {
                 return Ok(IngestAction::Dropped);
             };
@@ -1637,12 +1661,14 @@ impl<
                         path: 0,
                         state: OutboundState::Discovery(identity),
                     };
-                    if !self.enqueue_with_lifetime(
+                    if self.enqueue_packet_broadcast_with_lifetime(
                         interface_id,
                         request,
                         OutboundReason::PathRequestForward,
+                        false,
                         lifetime,
-                    ) {
+                    ) == 0
+                    {
                         return Ok(IngestAction::Dropped);
                     }
                     return Ok(IngestAction::ForwardedPathRequest);
@@ -1650,6 +1676,18 @@ impl<
             }
         }
 
+        if M::ROUTER {
+            let request = self.build_path_request(requested, tag)?;
+            if self.enqueue_packet_broadcast(
+                interface_id,
+                request,
+                OutboundReason::PathRequestForward,
+                true,
+            ) > 0
+            {
+                return Ok(IngestAction::ForwardedPathRequest);
+            }
+        }
         Ok(IngestAction::Dropped)
     }
 
@@ -1684,7 +1722,8 @@ impl<
         };
         let mut lifetime = self.packet_lifetime(&forwarded, OutboundReason::TransportForward);
         lifetime.state = OutboundState::Reverse(generation);
-        if !self.enqueue_with_lifetime(
+        if !self.enqueue_forwarded_with_lifetime(
+            meta.interface_id,
             target_interface,
             forwarded,
             OutboundReason::TransportForward,
@@ -1692,6 +1731,7 @@ impl<
         ) {
             return Ok(IngestAction::Dropped);
         }
+        self.paths.touch(&header.destination_hash, now_ms);
         self.reverse.insert(
             ReverseEntry {
                 proof_hash,
@@ -1766,10 +1806,9 @@ impl<
                 let link_id = link_id_from_raw(raw, original_header.flags.header_type);
                 LinkEntry {
                     link_id,
-                    destination_hash: header.destination_hash,
+                    destination_ed25519: path.public_key[32..].try_into().ok(),
                     receiving_interface: meta.interface_id,
                     outbound_interface: target_interface,
-                    next_hop: path.next_hop,
                     remaining_hops: path.hops,
                     taken_hops: header.hops,
                     requested_mode: request.signalling.mode,
@@ -1793,7 +1832,8 @@ impl<
         // the checked generation is bound before any frame can leave the node.
         let mut lifetime = self.packet_lifetime(&forwarded, OutboundReason::TransportForward);
         lifetime.state = OutboundState::Link(generation);
-        if !self.enqueue_with_lifetime(
+        if !self.enqueue_forwarded_with_lifetime(
+            meta.interface_id,
             target_interface,
             forwarded,
             OutboundReason::TransportForward,
@@ -1801,6 +1841,7 @@ impl<
         ) {
             return Ok(IngestAction::Dropped);
         }
+        self.paths.touch(&header.destination_hash, now_ms);
         self.links.insert(entry, now_ms);
         Ok(IngestAction::ForwardedTransport)
     }
@@ -1829,7 +1870,8 @@ impl<
                     let packet = PacketBuffer::from_slice(raw)?.copy_with_hops(header.hops);
                     // Send before recording: only a queued proof consumes the packet
                     // hash and promotes the link to validated.
-                    if !self.enqueue(
+                    if !self.enqueue_forwarded(
+                        meta.interface_id,
                         link.receiving_interface,
                         packet,
                         OutboundReason::ProofReturn,
@@ -1865,10 +1907,18 @@ impl<
             return Ok(IngestAction::ForwardedProof);
         }
 
-        if let Some(reverse) = self.reverse.remove(&header.destination_hash, now_ms) {
-            if reverse.outbound_interface == meta.interface_id {
+        if self
+            .reverse
+            .get(&header.destination_hash, now_ms)
+            .is_some_and(|reverse| reverse.outbound_interface == meta.interface_id)
+        {
+            if let Some((reverse, generation)) = self
+                .reverse
+                .take_with_generation(&header.destination_hash, now_ms)
+            {
                 let packet = PacketBuffer::from_slice(raw)?.copy_with_hops(header.hops);
-                if !self.enqueue_with_lifetime(
+                if !self.enqueue_forwarded_with_lifetime(
+                    meta.interface_id,
                     reverse.receiving_interface,
                     packet,
                     OutboundReason::ProofReturn,
@@ -1879,8 +1929,8 @@ impl<
                         ..self.packet_lifetime(&packet, OutboundReason::ProofReturn)
                     },
                 ) {
-                    // Restore the consumed entry with its original deadline.
-                    self.reverse.insert(reverse, now_ms);
+                    // A failed queue attempt is an undo: retained DATA keeps its owner.
+                    self.reverse.restore_consumed(reverse, generation);
                     return Ok(IngestAction::Dropped);
                 }
                 return Ok(IngestAction::ForwardedProof);
@@ -1955,7 +2005,7 @@ impl<
         let packet = PacketBuffer::from_slice(raw)?.copy_with_hops(header.hops);
         // Send before recording: a dropped forward must not consume the hash or
         // extend the link lifetime.
-        if !self.enqueue(target_interface, packet, reason) {
+        if !self.enqueue_forwarded(meta.interface_id, target_interface, packet, reason) {
             return Ok(true);
         }
         if let Some(hash) = tracked_hash {
@@ -1999,14 +2049,11 @@ impl<
             return false;
         }
 
-        let Some(public_key) = self.paths.known_public_key(&link.destination_hash) else {
-            return false;
-        };
-
         let mut signature = [0u8; 64];
         signature.copy_from_slice(&proof[..64]);
-        let mut destination_ed25519 = [0u8; 32];
-        destination_ed25519.copy_from_slice(&public_key[32..]);
+        let Some(destination_ed25519) = link.destination_ed25519 else {
+            return false;
+        };
         let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(&destination_ed25519) else {
             return false;
         };
@@ -2176,12 +2223,26 @@ impl<
         reason: OutboundReason,
         lifetime: OutboundLifetime,
     ) -> bool {
+        if let Some(router) = self.interfaces.router_mut() {
+            if !router
+                .interface(interface_id)
+                .is_some_and(|interface| interface.online && interface.direction.outbound)
+            {
+                router.stats.interface_dropped = router.stats.interface_dropped.saturating_add(1);
+                self.stats.dropped = self.stats.dropped.saturating_add(1);
+                return false;
+            }
+        }
         if packet.len() > self.interface_clear_mtu(interface_id) {
             self.stats.outbound_dropped = self.stats.outbound_dropped.saturating_add(1);
+            if let Some(router) = self.interfaces.router_mut() {
+                router.stats.mtu_dropped = router.stats.mtu_dropped.saturating_add(1);
+                self.stats.dropped = self.stats.dropped.saturating_add(1);
+            }
             return false;
         }
         let mut wire = WireBuffer::new();
-        if let Some(ifac) = self.config.ifac {
+        if let Some(ifac) = self.interfaces.ifac(interface_id, &self.config) {
             if ifac_sign_into(packet.as_slice(), &ifac.key, ifac.size, &mut wire).is_err() {
                 self.stats.outbound_dropped = self.stats.outbound_dropped.saturating_add(1);
                 self.stats.dropped = self.stats.dropped.saturating_add(1);
@@ -2197,6 +2258,13 @@ impl<
             self.stats.outbound_dropped = self.stats.outbound_dropped.saturating_add(1);
             return false;
         };
+        if !self.reserve_router_queue(interface_id, reason) {
+            self.stats.outbound_dropped = self.stats.outbound_dropped.saturating_add(1);
+            if M::ROUTER {
+                self.stats.dropped = self.stats.dropped.saturating_add(1);
+            }
+            return false;
+        }
         self.last_delivery_identity = identity;
         let evicted = self.outbound.push_drop_oldest(QueuedOutbound {
             frame: OutboundFrame {
@@ -2205,18 +2273,268 @@ impl<
                 reason,
                 lifetime,
             },
-            delivery: OutboundDelivery {
-                identity,
-                interface_generations: [0; 7],
-                pending_targets: 0x7f,
-                initialized: false,
-            },
+            delivery: self.interfaces.delivery(identity, interface_id),
         });
         if evicted {
             self.stats.outbound_dropped = self.stats.outbound_dropped.saturating_add(1);
         }
         self.stats.queued_outbound = self.stats.queued_outbound.saturating_add(1);
         true
+    }
+}
+
+impl<
+    const PATHS: usize,
+    const HASHES: usize,
+    const ANNOUNCES: usize,
+    const REVERSE: usize,
+    const LINKS: usize,
+    const TAGS: usize,
+    const OUTBOUND: usize,
+    const KNOWN_DESTINATIONS: usize,
+    const SCHEDULED: usize,
+>
+    LiteNode<
+        PATHS,
+        HASHES,
+        ANNOUNCES,
+        REVERSE,
+        LINKS,
+        TAGS,
+        OUTBOUND,
+        KNOWN_DESTINATIONS,
+        SCHEDULED,
+        Endpoint,
+    >
+{
+    /// Private owner metadata. Call before ingest/tick. A generation change or loss of
+    /// outbound availability is a reconnect: queued permission retires, routes stay. A mode
+    /// change is a replacement. Rates are sampled only when a new operation begins.
+    #[doc(hidden)]
+    pub fn update_interface(
+        &mut self,
+        id: u8,
+        generation: u32,
+        mode: InterfaceMode,
+        bitrate_bps: u32,
+        outbound: bool,
+        local_client: bool,
+    ) -> bool {
+        let slot = self
+            .interface_slot(id)
+            .or_else(|| self.interfaces.facts.iter().position(|f| f.flags & 1 == 0));
+        let Some(slot) = slot else {
+            return false;
+        };
+        let previous = self.interfaces.facts[slot];
+        if previous.flags & 1 != 0 {
+            if previous.mode != mode {
+                self.retire_replaced_interface(id);
+            } else if previous.generation != generation || !outbound {
+                self.retained_outbound_retire_interface(id);
+            }
+        }
+        let previous = self.interfaces.facts[slot];
+        self.interfaces.facts[slot] = InterfaceFacts {
+            id,
+            generation,
+            mode,
+            bitrate_bps,
+            clear_mtu: if previous.flags & 1 != 0 {
+                previous.clear_mtu
+            } else {
+                self.default_clear_mtu() as u16
+            },
+            flags: 1
+                | 4
+                | if outbound && generation != 0 { 2 } else { 0 }
+                | if local_client { 8 } else { 0 },
+        };
+        true
+    }
+
+    /// Publish a clear-packet budget for the matching nonzero registered generation.
+    /// Clamps the value to the fixed MTU. A change removes transit Links on that interface
+    /// and expires dependent queued work; the host retires any separate endpoint Links.
+    /// Returns false for an unknown ID or generation mismatch.
+    pub fn update_interface_packet_capacity(
+        &mut self,
+        id: InterfaceId,
+        generation: u32,
+        clear_mtu: usize,
+    ) -> bool {
+        let Some(slot) = self.interface_slot(id) else {
+            return false;
+        };
+        if generation == 0 || self.interfaces.facts[slot].generation != generation {
+            return false;
+        }
+        let clear_mtu = clear_mtu.min(crate::constants::MTU) as u16;
+        if self.interfaces.facts[slot].clear_mtu != clear_mtu {
+            self.links.remove_interface(id);
+            self.interfaces.facts[slot].clear_mtu = clear_mtu;
+            self.expire_outbound(self.clock_ms);
+        }
+        true
+    }
+
+    /// Remove the next frame after expiring stale work using the last supplied host time.
+    /// The driver must check lifetime and interface ownership again before starting it.
+    /// Returns `None` after the retained handheld owner API has been selected, even if work remains.
+    #[deprecated(note = "use retained_outbound_select and acknowledge or transfer its identity")]
+    pub fn poll_tx(&mut self) -> Option<OutboundFrame> {
+        // A legacy consumer cannot reinterpret partially admitted target bits.
+        if self.retained_owner_mode {
+            return None;
+        }
+        self.expire_outbound(self.clock_ms);
+        self.outbound.pop().map(|queued| queued.frame)
+    }
+
+    /// Peek at the next queued byte length without consuming or expiring anything.
+    /// It may describe stale work that [`Self::poll_tx`] will discard. Returns `None` in
+    /// retained-owner mode; otherwise useful for sizing a legacy consumer's buffer.
+    pub fn outbound_peek_len(&self) -> Option<usize> {
+        if self.retained_owner_mode {
+            return None;
+        }
+        self.outbound.peek().map(|f| f.frame.packet.len())
+    }
+
+    /// Private handheld owner API. Copies leave this borrow before driver callbacks.
+    /// Seven target bits map to the existing handheld interface registry only.
+    #[doc(hidden)]
+    pub fn retained_outbound_select(
+        &mut self,
+        after: u64,
+        blocked: u8,
+        generations: [u32; 7],
+    ) -> Option<&QueuedOutbound> {
+        self.retained_owner_mode = true;
+        self.expire_outbound(self.clock_ms);
+        for queued in self.outbound.iter_mut() {
+            let delivery = &mut queued.delivery;
+            if !delivery.initialized {
+                let selected = match queued.frame.reason {
+                    OutboundReason::Local
+                    | OutboundReason::PathResponse
+                    | OutboundReason::TransportForward
+                    | OutboundReason::ProofReturn => {
+                        if queued.frame.interface_id < 7 {
+                            1u8 << queued.frame.interface_id
+                        } else {
+                            0
+                        }
+                    }
+                    OutboundReason::AnnounceRebroadcast | OutboundReason::PathRequestForward => {
+                        if queued.frame.interface_id < 7 {
+                            0x7f & !(1u8 << queued.frame.interface_id)
+                        } else {
+                            0x7f
+                        }
+                    }
+                    OutboundReason::PathRequest => 0x7f,
+                };
+                delivery.pending_targets &= selected;
+                delivery.interface_generations = generations;
+                delivery.initialized = true;
+            }
+            for (id, generation) in generations.iter().enumerate() {
+                if *generation == 0 || *generation != delivery.interface_generations[id] {
+                    delivery.pending_targets &= !(1u8 << id);
+                }
+            }
+        }
+        loop {
+            let offset = self
+                .outbound
+                .iter()
+                .position(|q| q.delivery.pending_targets == 0);
+            let Some(offset) = offset else {
+                break;
+            };
+            self.outbound.remove(offset);
+            // Fully acknowledged rows are removed by ack. Reaching this path
+            // means the remaining delivery permission was retired or no live
+            // target existed; expose that terminal loss through the existing
+            // saturating queue-drop counter.
+            self.stats.outbound_dropped = self.stats.outbound_dropped.saturating_add(1);
+        }
+        self.outbound
+            .iter()
+            .find(|q| q.delivery.identity > after && q.delivery.pending_targets & !blocked != 0)
+    }
+
+    #[doc(hidden)]
+    pub fn retained_outbound_ack(&mut self, identity: u64, completed: u8) -> bool {
+        if !self.retained_owner_mode || identity == 0 {
+            return false;
+        }
+        let offset = self
+            .outbound
+            .iter()
+            .position(|q| q.delivery.identity == identity);
+        let Some(offset) = offset else {
+            return false;
+        };
+        let queued = self
+            .outbound
+            .get_mut(offset)
+            .expect("located occupied queue slot");
+        if !queued.delivery.initialized {
+            return false;
+        }
+        queued.delivery.pending_targets &= !completed;
+        if queued.delivery.pending_targets == 0 {
+            self.outbound.remove(offset);
+        }
+        true
+    }
+
+    #[doc(hidden)]
+    pub fn retained_outbound_take(&mut self, identity: u64) -> bool {
+        if !self.retained_owner_mode || identity == 0 {
+            return false;
+        }
+        let offset = self
+            .outbound
+            .iter()
+            .position(|q| q.delivery.identity == identity);
+        offset
+            .and_then(|offset| self.outbound.remove(offset))
+            .is_some()
+    }
+
+    /// Also retire permission on rows that have never been peeked. Re-registering
+    /// this physical interface cannot bind its replacement to old queued bytes.
+    #[doc(hidden)]
+    pub fn retained_outbound_retire_interface(&mut self, interface: u8) {
+        if let Some(slot) = self.interface_slot(interface) {
+            self.interfaces.facts[slot].flags &= !2;
+        }
+        if interface >= 7 {
+            return;
+        }
+        for queued in self.outbound.iter_mut() {
+            queued.delivery.pending_targets &= !(1u8 << interface);
+        }
+    }
+
+    /// The interface behind `interface` was replaced or removed: drop every route through
+    /// it and forget its facts, as trusted does on re-registration. A reconnect keeps them.
+    #[doc(hidden)]
+    pub fn retire_replaced_interface(&mut self, interface: u8) {
+        self.retained_outbound_retire_interface(interface);
+        if let Some(slot) = self.interface_slot(interface) {
+            self.discoveries.retire_requester(slot);
+            self.interfaces.facts[slot] = InterfaceFacts::EMPTY;
+        }
+        self.paths.remove_interface(interface);
+        self.announce_schedule.remove_interface(interface);
+        self.reverse.remove_interface(interface);
+        self.links.remove_interface(interface);
+        self.announce_cache.retain_paths(&self.paths, self.clock_ms);
+        self.expire_outbound(self.clock_ms);
     }
 }
 
@@ -2240,6 +2558,7 @@ fn mode_discovers_unknown_paths(mode: crate::config::InterfaceMode) -> bool {
         crate::config::InterfaceMode::AccessPoint
             | crate::config::InterfaceMode::Gateway
             | crate::config::InterfaceMode::Roaming
+            | crate::config::InterfaceMode::Internal
     )
 }
 
@@ -2249,6 +2568,8 @@ fn announce_path_expiry_secs(mode: crate::config::InterfaceMode) -> u32 {
         crate::config::InterfaceMode::AccessPoint => AP_PATH_TIME_SECS,
         crate::config::InterfaceMode::Roaming => ROAMING_PATH_TIME_SECS,
         crate::config::InterfaceMode::Full
+        | crate::config::InterfaceMode::PointToPoint
+        | crate::config::InterfaceMode::Internal
         | crate::config::InterfaceMode::Gateway
         | crate::config::InterfaceMode::Boundary => PATHFINDER_E_SECS,
     }
@@ -2266,6 +2587,29 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use std::vec::Vec;
 
+    // Protocol-level tests inspect queue output independently of a host's seven-target
+    // retained adapter. Interface IDs in these cases cover the full u8 transport domain.
+    trait TestQueueDrain {
+        fn take_queued(&mut self) -> Option<OutboundFrame>;
+    }
+    impl<
+        const P: usize,
+        const H: usize,
+        const A: usize,
+        const R: usize,
+        const L: usize,
+        const T: usize,
+        const O: usize,
+        const K: usize,
+        const S: usize,
+    > TestQueueDrain for LiteNode<P, H, A, R, L, T, O, K, S>
+    {
+        fn take_queued(&mut self) -> Option<OutboundFrame> {
+            self.expire_outbound(self.clock_ms);
+            self.outbound.pop().map(|queued| queued.frame)
+        }
+    }
+
     #[test]
     fn recursive_capacity_and_identity_exhaustion_refuse_before_fanout() {
         let mut n = node();
@@ -2280,8 +2624,8 @@ mod tests {
                 .unwrap(),
                 IngestAction::ForwardedPathRequest
             );
-            assert!(n.poll_tx().is_some());
-            while n.poll_tx().is_some() {}
+            assert!(n.take_queued().is_some());
+            while n.take_queued().is_some() {}
         }
         let refused = path_request([99; 16], [99; 16]);
         assert_eq!(
@@ -2289,7 +2633,7 @@ mod tests {
                 .unwrap(),
             IngestAction::Dropped
         );
-        assert!(n.poll_tx().is_none());
+        assert!(n.take_queued().is_none());
         assert!(n.stats.dropped > 0);
         n.discoveries.last_identity = u64::MAX;
         let exhausted = path_request([100; 16], [100; 16]);
@@ -2298,7 +2642,7 @@ mod tests {
                 .unwrap(),
             IngestAction::Dropped
         );
-        assert!(n.poll_tx().is_none());
+        assert!(n.take_queued().is_none());
         assert_eq!(n.discoveries.last_identity, u64::MAX);
         assert!(n.discoveries.entries.iter().all(|row| row.identity == 0));
     }
@@ -2314,7 +2658,7 @@ mod tests {
                     .unwrap(),
                 IngestAction::ForwardedPathRequest
             );
-            assert!(n.poll_tx().is_some());
+            assert!(n.take_queued().is_some());
         }
         let request = path_request([99; 16], [99; 16]);
         assert_eq!(
@@ -2322,7 +2666,7 @@ mod tests {
                 .unwrap(),
             IngestAction::Dropped
         );
-        assert!(n.poll_tx().is_none());
+        assert!(n.take_queued().is_none());
         n.config.transport_enabled = false;
         n.tick(1002);
         assert!(
@@ -2436,7 +2780,7 @@ mod tests {
         let tag = [0x22u8; 16];
         node.request_path(&dest, &tag, IFACE, 1000).unwrap();
 
-        let frame = node.poll_tx().expect("path request queued");
+        let frame = node.take_queued().expect("path request queued");
         assert_eq!(frame.reason, OutboundReason::PathRequest);
         assert_eq!(frame.interface_id, IFACE);
         let view = PacketView::parse(frame.packet.as_slice()).unwrap();
@@ -2484,7 +2828,7 @@ mod tests {
         assert!(node.has_path(&ann.destination_hash, 1000));
         node.tick(5000);
         assert!(
-            node.poll_tx().is_none(),
+            node.take_queued().is_none(),
             "unforwardable announce must not rebroadcast"
         );
     }
@@ -2564,7 +2908,7 @@ mod tests {
         assert_eq!(action, IngestAction::Dropped);
         node.tick(5000);
         assert!(
-            node.poll_tx().is_none(),
+            node.take_queued().is_none(),
             "no spurious self path-request forward"
         );
     }
@@ -2599,7 +2943,7 @@ mod tests {
         assert_eq!(action, IngestAction::Dropped);
         assert!(!node.has_path(&ann.destination_hash, 1000));
         node.tick(5000);
-        assert!(node.poll_tx().is_none());
+        assert!(node.take_queued().is_none());
         // Other destinations still learn normally.
         let other = signed_announce([0x22u8; 32], "lxmf.delivery", b"peer");
         let action = node
@@ -2838,14 +3182,14 @@ mod tests {
                     .unwrap(),
                 IngestAction::Dropped
             );
-            assert!(node.poll_tx().is_none());
+            assert!(node.take_queued().is_none());
             assert_eq!(
                 node.ingest(packet.as_slice(), RxMeta::new(IFACE), 1_200)
                     .unwrap(),
                 IngestAction::ForwardedTransport,
                 "overhearing another next hop must not suppress our routed copy"
             );
-            let forwarded = node.poll_tx().unwrap();
+            let forwarded = node.take_queued().unwrap();
             let view = PacketView::parse(forwarded.packet.as_slice()).unwrap();
             assert_eq!(view.header.flags.header_type, HeaderType::Header1);
             assert_eq!(view.header.transport_id, None);
@@ -2876,7 +3220,7 @@ mod tests {
                     .unwrap(),
                 IngestAction::ForwardedTransport
             );
-            node.poll_tx().unwrap();
+            node.take_queued().unwrap();
             let packet = link_packet(link_id, 0, context);
             let view = PacketView::parse(packet.as_slice()).unwrap();
             let overheard = build_packet(
@@ -2898,13 +3242,13 @@ mod tests {
                 IngestAction::Dropped,
                 "known links and repeat contexts do not bypass next-hop ownership"
             );
-            assert!(node.poll_tx().is_none());
+            assert!(node.take_queued().is_none());
             assert_eq!(
                 node.ingest(packet.as_slice(), RxMeta::new(IFACE), 1_300)
                     .unwrap(),
                 IngestAction::ForwardedTransport
             );
-            assert!(node.poll_tx().is_some());
+            assert!(node.take_queued().is_some());
         }
     }
 
@@ -2917,7 +3261,7 @@ mod tests {
         let data = h2_data(announce.destination_hash, b"proof next hop");
         node.ingest(data.as_slice(), RxMeta::new(IFACE), 1_100)
             .unwrap();
-        node.poll_tx().unwrap();
+        node.take_queued().unwrap();
         let packet = proof(truncated_packet_hash(data.as_slice(), HeaderType::Header2));
         let view = PacketView::parse(packet.as_slice()).unwrap();
         let overheard = build_packet(
@@ -2938,13 +3282,16 @@ mod tests {
                 .unwrap(),
             IngestAction::Dropped
         );
-        assert!(node.poll_tx().is_none());
+        assert!(node.take_queued().is_none());
         assert_eq!(
             node.ingest(packet.as_slice(), RxMeta::new(IFACE), 1_300)
                 .unwrap(),
             IngestAction::ForwardedProof
         );
-        assert_eq!(node.poll_tx().unwrap().reason, OutboundReason::ProofReturn);
+        assert_eq!(
+            node.take_queued().unwrap().reason,
+            OutboundReason::ProofReturn
+        );
     }
 
     #[test]
@@ -3079,7 +3426,7 @@ mod tests {
         assert!(node.has_path(&announce.destination_hash, 1000));
 
         node.tick(3000);
-        let out = node.poll_tx().unwrap();
+        let out = node.take_queued().unwrap();
         assert!(has_ifac_flag(out.packet.as_slice()));
 
         let mut plain = PacketBuffer::new();
@@ -3119,7 +3466,7 @@ mod tests {
         assert!(node.has_path(&announce.destination_hash, 1000));
 
         node.tick(3000);
-        let out = node.poll_tx().unwrap();
+        let out = node.take_queued().unwrap();
         assert_eq!(out.reason, OutboundReason::AnnounceRebroadcast);
 
         let view = PacketView::parse(out.packet.as_slice()).unwrap();
@@ -3137,7 +3484,7 @@ mod tests {
             IngestAction::ScheduledAnnounce
         );
         relay_node.tick(now_ms + 500);
-        relay_node.poll_tx().expect("relay rebroadcast").packet
+        relay_node.take_queued().expect("relay rebroadcast").packet
     }
 
     #[test]
@@ -3151,18 +3498,21 @@ mod tests {
         );
 
         node.tick(1500);
-        let first = node.poll_tx().expect("first rebroadcast");
+        let first = node.take_queued().expect("first rebroadcast");
         assert_eq!(first.reason, OutboundReason::AnnounceRebroadcast);
 
         node.tick(6499);
-        assert!(node.poll_tx().is_none(), "the retry waits PATHFINDER_G");
+        assert!(node.take_queued().is_none(), "the retry waits PATHFINDER_G");
         node.tick(7000);
-        let retry = node.poll_tx().expect("one retry");
+        let retry = node.take_queued().expect("one retry");
         assert_eq!(retry.reason, OutboundReason::AnnounceRebroadcast);
         assert_eq!(retry.packet, first.packet);
 
         node.tick(60_000);
-        assert!(node.poll_tx().is_none(), "PATHFINDER_R allows one retry");
+        assert!(
+            node.take_queued().is_none(),
+            "PATHFINDER_R allows one retry"
+        );
         assert_eq!(node.announce_schedule.entries.iter().flatten().count(), 0);
     }
 
@@ -3181,7 +3531,7 @@ mod tests {
             IngestAction::AnnounceIgnored
         );
         node.tick(1500);
-        assert!(node.poll_tx().is_some());
+        assert!(node.take_queued().is_some());
 
         node.ingest(neighbour.as_slice(), RxMeta::new(IFACE), 2000)
             .unwrap();
@@ -3194,7 +3544,7 @@ mod tests {
             .unwrap();
         node.tick(10_000);
         assert!(
-            node.poll_tx().is_none(),
+            node.take_queued().is_none(),
             "LOCAL_REBROADCASTS_MAX copies cancel the retry"
         );
     }
@@ -3208,7 +3558,7 @@ mod tests {
         node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
         node.tick(1500);
-        assert!(node.poll_tx().is_some());
+        assert!(node.take_queued().is_some());
 
         assert_eq!(
             node.ingest(second_hop.as_slice(), RxMeta::new(IFACE), 2000)
@@ -3217,7 +3567,7 @@ mod tests {
         );
         node.tick(10_000);
         assert!(
-            node.poll_tx().is_none(),
+            node.take_queued().is_none(),
             "a hops+1 copy before the retry means it was passed on"
         );
     }
@@ -3266,10 +3616,10 @@ mod tests {
         // Exactly one rebroadcast was scheduled (the duplicate did not amplify).
         node.tick(3000);
         assert_eq!(
-            node.poll_tx().unwrap().reason,
+            node.take_queued().unwrap().reason,
             OutboundReason::AnnounceRebroadcast
         );
-        assert!(node.poll_tx().is_none());
+        assert!(node.take_queued().is_none());
     }
 
     #[test]
@@ -3286,7 +3636,7 @@ mod tests {
         let fresh = signed_announce_rh([0x44; 32], "lxmf.delivery", b"fresh", rh(0x01, 100));
         node.ingest(fresh.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
-        let _ = node.poll_tx();
+        let _ = node.take_queued();
         // Older-emitted re-announce for the same destination: rejected by the gate.
         let stale = signed_announce_rh([0x44; 32], "lxmf.delivery", b"stale", rh(0x02, 50));
         assert_eq!(
@@ -3301,7 +3651,7 @@ mod tests {
             node.ingest(req.as_slice(), RxMeta::new(9), 1200).unwrap(),
             IngestAction::AnsweredPathRequest
         );
-        let out = node.poll_tx().unwrap();
+        let out = node.take_queued().unwrap();
         let view = PacketView::parse(out.packet.as_slice()).unwrap();
         let app_data = &view.payload[view.payload.len() - 5..];
         assert_eq!(app_data, b"fresh");
@@ -3330,7 +3680,7 @@ mod tests {
         );
         node.tick(3000);
         assert_eq!(
-            node.poll_tx().unwrap().reason,
+            node.take_queued().unwrap().reason,
             OutboundReason::AnnounceRebroadcast
         );
 
@@ -3341,7 +3691,7 @@ mod tests {
             .unwrap();
         assert_eq!(action, IngestAction::AnnounceIgnored);
         node.tick(4000);
-        assert!(node.poll_tx().is_none());
+        assert!(node.take_queued().is_none());
 
         // Fresher announce (newer emission 20): accepted, replaces + rebroadcasts.
         let newer = mk(0x03, 20);
@@ -3352,7 +3702,7 @@ mod tests {
         );
         node.tick(6000);
         assert_eq!(
-            node.poll_tx().unwrap().reason,
+            node.take_queued().unwrap().reason,
             OutboundReason::AnnounceRebroadcast
         );
     }
@@ -3401,13 +3751,13 @@ mod tests {
         );
 
         node.tick(10_000);
-        let queued = node.poll_tx().expect("freshest announce rebroadcast");
+        let queued = node.take_queued().expect("freshest announce rebroadcast");
         let view = PacketView::parse(queued.packet.as_slice()).unwrap();
         let announce =
             AnnounceView::parse(view.payload, view.header.flags.context_flag, 32).unwrap();
         assert_eq!(announce.app_data, b"newer");
         assert!(
-            node.poll_tx().is_none(),
+            node.take_queued().is_none(),
             "older copies must not remain queued"
         );
     }
@@ -3549,7 +3899,7 @@ mod tests {
         node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
         node.tick(3000);
-        let _rebroadcast = node.poll_tx();
+        let _rebroadcast = node.take_queued();
 
         let header = PacketHeader {
             flags: PacketFlags {
@@ -3571,7 +3921,7 @@ mod tests {
                 .unwrap(),
             IngestAction::Dropped
         );
-        assert!(node.poll_tx().is_none());
+        assert!(node.take_queued().is_none());
     }
 
     fn announced_key(raw: &PacketBuffer) -> [u8; 64] {
@@ -3677,13 +4027,13 @@ mod tests {
         node.ingest(first.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
         node.tick(3000);
-        while node.poll_tx().is_some() {}
+        while node.take_queued().is_some() {}
         // Second announce evicts the first from the 1-entry announce cache but
         // leaves its learned path live.
         node.ingest(second.raw.as_slice(), RxMeta::new(IFACE), 3100)
             .unwrap();
         node.tick(6000);
-        while node.poll_tx().is_some() {}
+        while node.take_queued().is_some() {}
         assert!(node.has_path(&first.destination_hash, 6100));
 
         let request = path_request(first.destination_hash, [0x51; 16]);
@@ -3693,7 +4043,7 @@ mod tests {
             IngestAction::ForwardedPathRequest
         );
         assert_eq!(
-            node.poll_tx().unwrap().reason,
+            node.take_queued().unwrap().reason,
             OutboundReason::PathRequestForward
         );
     }
@@ -3711,7 +4061,7 @@ mod tests {
             .unwrap();
         assert_eq!(action, IngestAction::AnsweredPathRequest);
 
-        let out = node.poll_tx().unwrap();
+        let out = node.take_queued().unwrap();
         assert_eq!(out.reason, OutboundReason::PathResponse);
         let view = PacketView::parse(out.packet.as_slice()).unwrap();
         assert_eq!(view.header.flags.header_type, HeaderType::Header2);
@@ -3731,7 +4081,7 @@ mod tests {
             .unwrap();
         assert_eq!(action, IngestAction::ForwardedPathRequest);
 
-        let out = node.poll_tx().unwrap();
+        let out = node.take_queued().unwrap();
         assert_eq!(out.reason, OutboundReason::PathRequestForward);
         let view = PacketView::parse(out.packet.as_slice()).unwrap();
         assert_eq!(view.header.destination_hash, path_request_destination());
@@ -3752,7 +4102,7 @@ mod tests {
             .unwrap();
         assert_eq!(action, IngestAction::ForwardedTransport);
 
-        let out = node.poll_tx().unwrap();
+        let out = node.take_queued().unwrap();
         assert_eq!(out.reason, OutboundReason::TransportForward);
         let view = PacketView::parse(out.packet.as_slice()).unwrap();
         assert_eq!(view.header.flags.header_type, HeaderType::Header1);
@@ -3767,7 +4117,7 @@ mod tests {
         let mut node = node();
         node.ingest(announce.raw.as_slice(), RxMeta::new(2), 1000)
             .unwrap();
-        let _rebroadcast = node.poll_tx();
+        let _rebroadcast = node.take_queued();
 
         let data = h2_data(announce.destination_hash, b"bridge payload");
         let proof_hash = truncated_packet_hash(data.as_slice(), HeaderType::Header2);
@@ -3776,7 +4126,7 @@ mod tests {
             IngestAction::ForwardedTransport
         );
 
-        let out = node.poll_tx().unwrap();
+        let out = node.take_queued().unwrap();
         assert_eq!(out.interface_id, 2);
         assert_eq!(out.reason, OutboundReason::TransportForward);
         let view = PacketView::parse(out.packet.as_slice()).unwrap();
@@ -3790,7 +4140,7 @@ mod tests {
             IngestAction::ForwardedProof
         );
 
-        let out = node.poll_tx().unwrap();
+        let out = node.take_queued().unwrap();
         assert_eq!(out.interface_id, 1);
         assert_eq!(out.reason, OutboundReason::ProofReturn);
     }
@@ -3806,7 +4156,7 @@ mod tests {
         let proof_hash = truncated_packet_hash(data.as_slice(), HeaderType::Header2);
         node.ingest(data.as_slice(), RxMeta::new(IFACE), 1300)
             .unwrap();
-        let _forwarded = node.poll_tx().unwrap();
+        let _forwarded = node.take_queued().unwrap();
 
         let proof = proof(proof_hash);
         let action = node
@@ -3814,7 +4164,7 @@ mod tests {
             .unwrap();
         assert_eq!(action, IngestAction::ForwardedProof);
 
-        let out = node.poll_tx().unwrap();
+        let out = node.take_queued().unwrap();
         assert_eq!(out.reason, OutboundReason::ProofReturn);
         let view = PacketView::parse(out.packet.as_slice()).unwrap();
         assert_eq!(view.header.flags.packet_type, PacketType::Proof);
@@ -3827,7 +4177,7 @@ mod tests {
         let mut node = node();
         node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
-        let _rebroadcast = node.poll_tx();
+        let _rebroadcast = node.take_queued();
         let request = |seed: u8| {
             let mut request = link_request(announce.destination_hash, 0);
             let last = request.len() - 1;
@@ -3842,7 +4192,7 @@ mod tests {
                 IngestAction::ForwardedTransport,
                 "link {seed}"
             );
-            let _ = node.poll_tx();
+            let _ = node.take_queued();
         }
         assert_eq!(
             node.ingest(request(32).as_slice(), RxMeta::new(9), 1100)
@@ -3865,7 +4215,7 @@ mod tests {
         let mut node = node();
         node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
-        let _rebroadcast = node.poll_tx();
+        let _rebroadcast = node.take_queued();
 
         let request = link_request(announce.destination_hash, 0);
         let link_id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
@@ -3874,7 +4224,7 @@ mod tests {
                 .unwrap(),
             IngestAction::ForwardedTransport
         );
-        let _forwarded_request = node.poll_tx().unwrap();
+        let _forwarded_request = node.take_queued().unwrap();
 
         let packet = link_packet(link_id, 0, PacketContext::Channel);
         assert_eq!(
@@ -3883,7 +4233,7 @@ mod tests {
             IngestAction::ForwardedTransport
         );
 
-        let out = node.poll_tx().unwrap();
+        let out = node.take_queued().unwrap();
         assert_eq!(out.interface_id, IFACE);
         assert_eq!(out.reason, OutboundReason::TransportForward);
         let view = PacketView::parse(out.packet.as_slice()).unwrap();
@@ -3899,13 +4249,13 @@ mod tests {
         let mut node = node();
         node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
-        let _rebroadcast = node.poll_tx();
+        let _rebroadcast = node.take_queued();
 
         let request = link_request(announce.destination_hash, 0);
         let link_id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
         node.ingest(request.as_slice(), RxMeta::new(9), 1100)
             .unwrap();
-        let _forwarded_request = node.poll_tx().unwrap();
+        let _forwarded_request = node.take_queued().unwrap();
 
         let packet = link_packet(link_id, 0, PacketContext::Resource);
         assert_eq!(
@@ -3914,7 +4264,7 @@ mod tests {
             IngestAction::ForwardedTransport
         );
 
-        let out = node.poll_tx().unwrap();
+        let out = node.take_queued().unwrap();
         assert_eq!(out.interface_id, 9);
         assert_eq!(out.reason, OutboundReason::TransportForward);
         let view = PacketView::parse(out.packet.as_slice()).unwrap();
@@ -3929,13 +4279,13 @@ mod tests {
         let mut node = node();
         node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
-        let _rebroadcast = node.poll_tx();
+        let _rebroadcast = node.take_queued();
 
         let request = link_request(announce.destination_hash, 0);
         let link_id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
         node.ingest(request.as_slice(), RxMeta::new(9), 1100)
             .unwrap();
-        let _forwarded_request = node.poll_tx().unwrap();
+        let _forwarded_request = node.take_queued().unwrap();
 
         let packet = link_packet(link_id, 1, PacketContext::Channel);
         assert_eq!(
@@ -3943,7 +4293,7 @@ mod tests {
                 .unwrap(),
             IngestAction::ForwardedTransport
         );
-        assert!(node.poll_tx().is_none());
+        assert!(node.take_queued().is_none());
     }
 
     #[test]
@@ -3952,13 +4302,13 @@ mod tests {
         let mut node = node();
         node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
-        let _rebroadcast = node.poll_tx();
+        let _rebroadcast = node.take_queued();
 
         let request = link_request(announce.destination_hash, 0);
         let link_id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
         node.ingest(request.as_slice(), RxMeta::new(9), 1100)
             .unwrap();
-        let _forwarded_request = node.poll_tx().unwrap();
+        let _forwarded_request = node.take_queued().unwrap();
 
         let packet = link_packet(link_id, 0, PacketContext::None);
         assert_eq!(
@@ -3966,7 +4316,7 @@ mod tests {
                 .unwrap(),
             IngestAction::ForwardedTransport
         );
-        let forwarded = node.poll_tx().unwrap();
+        let forwarded = node.take_queued().unwrap();
         assert_eq!(forwarded.interface_id, IFACE);
 
         assert_eq!(
@@ -3974,7 +4324,7 @@ mod tests {
                 .unwrap(),
             IngestAction::ForwardedTransport
         );
-        assert!(node.poll_tx().is_none());
+        assert!(node.take_queued().is_none());
         assert_eq!(node.stats().duplicates, 0);
     }
 
@@ -3984,13 +4334,13 @@ mod tests {
         let mut node = node();
         node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
-        let _rebroadcast = node.poll_tx();
+        let _rebroadcast = node.take_queued();
 
         let request = link_request(announce.destination_hash, 0);
         let link_id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
         node.ingest(request.as_slice(), RxMeta::new(9), 1100)
             .unwrap();
-        let _forwarded_request = node.poll_tx().unwrap();
+        let _forwarded_request = node.take_queued().unwrap();
 
         let packet = link_packet(link_id, 0, PacketContext::ResourceReq);
         assert_eq!(
@@ -3998,13 +4348,13 @@ mod tests {
                 .unwrap(),
             IngestAction::ForwardedTransport
         );
-        assert!(node.poll_tx().is_some());
+        assert!(node.take_queued().is_some());
         assert_eq!(
             node.ingest(packet.as_slice(), RxMeta::new(IFACE), 1300)
                 .unwrap(),
             IngestAction::ForwardedTransport
         );
-        assert!(node.poll_tx().is_some());
+        assert!(node.take_queued().is_some());
     }
 
     #[test]
@@ -4013,13 +4363,13 @@ mod tests {
         let mut node = node();
         node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
-        let _rebroadcast = node.poll_tx();
+        let _rebroadcast = node.take_queued();
 
         let request = link_request(announce.destination_hash, 0);
         let link_id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
         node.ingest(request.as_slice(), RxMeta::new(9), 1100)
             .unwrap();
-        let _forwarded_request = node.poll_tx().unwrap();
+        let _forwarded_request = node.take_queued().unwrap();
 
         let proof = link_proof(link_id, 0, PacketContext::LinkProof);
         assert_eq!(
@@ -4028,7 +4378,7 @@ mod tests {
             IngestAction::ForwardedProof
         );
 
-        let out = node.poll_tx().unwrap();
+        let out = node.take_queued().unwrap();
         assert_eq!(out.interface_id, 9);
         assert_eq!(out.reason, OutboundReason::ProofReturn);
         let view = PacketView::parse(out.packet.as_slice()).unwrap();
@@ -4043,13 +4393,13 @@ mod tests {
         let mut node = node();
         node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
-        let _rebroadcast = node.poll_tx();
+        let _rebroadcast = node.take_queued();
 
         let request = link_request(announce.destination_hash, 0);
         let link_id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
         node.ingest(request.as_slice(), RxMeta::new(9), 1100)
             .unwrap();
-        let _forwarded_request = node.poll_tx().unwrap();
+        let _forwarded_request = node.take_queued().unwrap();
 
         let proof = lrproof(link_id, 0, announce.signing_seed);
         assert_eq!(
@@ -4057,7 +4407,7 @@ mod tests {
                 .unwrap(),
             IngestAction::ForwardedProof
         );
-        let out = node.poll_tx().unwrap();
+        let out = node.take_queued().unwrap();
         assert_eq!(out.interface_id, 9);
         assert_eq!(out.reason, OutboundReason::ProofReturn);
 
@@ -4067,7 +4417,7 @@ mod tests {
                 .unwrap(),
             IngestAction::ForwardedTransport
         );
-        assert_eq!(node.poll_tx().unwrap().interface_id, IFACE);
+        assert_eq!(node.take_queued().unwrap().interface_id, IFACE);
     }
 
     #[test]
@@ -4076,13 +4426,13 @@ mod tests {
         let mut node = node();
         node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
-        let _rebroadcast = node.poll_tx();
+        let _rebroadcast = node.take_queued();
 
         let request = link_request(announce.destination_hash, 0);
         let link_id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
         node.ingest(request.as_slice(), RxMeta::new(9), 1100)
             .unwrap();
-        let _forwarded_request = node.poll_tx().unwrap();
+        let _forwarded_request = node.take_queued().unwrap();
 
         let proof = lrproof(link_id, 0, [0xE1; 32]);
         assert_eq!(
@@ -4090,7 +4440,7 @@ mod tests {
                 .unwrap(),
             IngestAction::Dropped
         );
-        assert!(node.poll_tx().is_none());
+        assert!(node.take_queued().is_none());
 
         let packet = link_packet(link_id, 0, PacketContext::None);
         assert_eq!(
@@ -4098,7 +4448,7 @@ mod tests {
                 .unwrap(),
             IngestAction::Dropped
         );
-        assert!(node.poll_tx().is_none());
+        assert!(node.take_queued().is_none());
     }
 
     #[test]
@@ -4110,13 +4460,13 @@ mod tests {
         let mut node = node();
         node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
-        let _rebroadcast = node.poll_tx();
+        let _rebroadcast = node.take_queued();
 
         let request = link_request(announce.destination_hash, 0);
         let link_id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
         node.ingest(request.as_slice(), RxMeta::new(9), 1100)
             .unwrap();
-        let _forwarded_request = node.poll_tx().unwrap();
+        let _forwarded_request = node.take_queued().unwrap();
 
         // Correctly-signed proof, but arriving on the wrong interface (not the link's outbound
         // interface) fails the strict gate. Before the fix this fell through to the generic router
@@ -4126,7 +4476,7 @@ mod tests {
             node.ingest(proof.as_slice(), RxMeta::new(7), 1200).unwrap(),
             IngestAction::Dropped
         );
-        assert!(node.poll_tx().is_none());
+        assert!(node.take_queued().is_none());
     }
 
     #[test]
@@ -4210,7 +4560,7 @@ mod tests {
             node.ingest(data.as_slice(), RxMeta::new(9), 1_100).unwrap(),
             IngestAction::ForwardedTransport
         );
-        let out = node.poll_tx().unwrap();
+        let out = node.take_queued().unwrap();
         let view = PacketView::parse(out.packet.as_slice()).unwrap();
         assert_eq!(view.header.flags.header_type, HeaderType::Header2);
         assert_eq!(view.header.flags.transport_type, TransportType::Transport);
@@ -4235,7 +4585,7 @@ mod tests {
         let full = PacketBuffer::from_slice(&[0x5A; crate::constants::MTU]).unwrap();
         assert!(node.enqueue(1, full, OutboundReason::TransportForward));
         assert_eq!(node.outbound_len(), 1);
-        let frame = node.poll_tx().unwrap();
+        let frame = node.take_queued().unwrap();
         assert_eq!(frame.packet.len(), crate::constants::WIRE_MTU_MAX);
         assert_eq!(node.stats.outbound_dropped, 0);
     }
@@ -4244,7 +4594,7 @@ mod tests {
         let mut node = node();
         node.request_path(&[0x21; 16], &[0x31; 16], IFACE, 1000)
             .unwrap();
-        let held = node.poll_tx().unwrap();
+        let held = node.take_queued().unwrap();
         assert!(node.outbound_lifetime_is_live(IFACE, held.lifetime, 120_999));
         assert!(!node.outbound_lifetime_is_live(IFACE, held.lifetime, 121_000));
         node.request_path(&[0x22; 16], &[0x32; 16], IFACE, 1000)
@@ -4264,7 +4614,7 @@ mod tests {
         let data = h2_data(announce.destination_hash, b"return path");
         let hash = truncated_packet_hash(data.as_slice(), HeaderType::Header2);
         node.ingest(data.as_slice(), RxMeta::new(9), 1100).unwrap();
-        node.poll_tx().unwrap();
+        node.take_queued().unwrap();
         // A nearly expired reverse entry makes ownership transfer observable.
         let mut reverse = node.reverse.get(&hash, 1100).copied().unwrap();
         reverse.expires_ms = 2000;
@@ -4276,7 +4626,7 @@ mod tests {
             IngestAction::ForwardedProof
         );
         assert!(node.reverse.get(&hash, 1500).is_none());
-        let held = node.poll_tx().unwrap();
+        let held = node.take_queued().unwrap();
         assert_eq!(held.lifetime.expires_ms, 2000);
         assert!(node.outbound_lifetime_is_live(9, held.lifetime, 1999));
         assert!(!node.outbound_lifetime_is_live(9, held.lifetime, 2000));
@@ -4291,7 +4641,7 @@ mod tests {
         let data = h2_data(announce.destination_hash, b"payload");
         let hash = truncated_packet_hash(data.as_slice(), HeaderType::Header2);
         node.ingest(data.as_slice(), RxMeta::new(9), 1100).unwrap();
-        let held = node.poll_tx().unwrap();
+        let held = node.take_queued().unwrap();
         assert!(node.outbound_lifetime_is_live(IFACE, held.lifetime, 1200));
         let reverse = node.reverse.remove(&hash, 1200).unwrap();
         assert!(!node.outbound_lifetime_is_live(IFACE, held.lifetime, 1200));
@@ -4340,7 +4690,7 @@ mod tests {
         let request = link_request(announce.destination_hash, 0);
         node.ingest(request.as_slice(), RxMeta::new(9), 1100)
             .unwrap();
-        let held = node.poll_tx().unwrap();
+        let held = node.take_queued().unwrap();
         assert!(node.outbound_lifetime_is_live(IFACE, held.lifetime, 1200));
         let id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
         let same_entry = *node.links.get(&id, 1200).unwrap();
@@ -4357,7 +4707,7 @@ mod tests {
         let request = link_request(announce.destination_hash, 0);
         node.ingest(request.as_slice(), RxMeta::new(9), 1100)
             .unwrap();
-        let held = node.poll_tx().unwrap();
+        let held = node.take_queued().unwrap();
         assert_eq!(held.lifetime.expires_ms, 7100);
         assert!(node.outbound_lifetime_is_live(IFACE, held.lifetime, 7099));
         assert!(!node.outbound_lifetime_is_live(IFACE, held.lifetime, 7100));
@@ -4399,7 +4749,7 @@ mod tests {
             4,
             "schedule bound is independent of cache coverage"
         );
-        while node.poll_tx().is_some() {}
+        while node.take_queued().is_some() {}
         for (index, destination) in destinations.into_iter().enumerate() {
             assert!(node.has_path(&destination, 3000));
             let request = path_request(destination, [index as u8 + 1; 16]);
@@ -4408,7 +4758,10 @@ mod tests {
                     .unwrap(),
                 IngestAction::AnsweredPathRequest
             );
-            assert_eq!(node.poll_tx().unwrap().reason, OutboundReason::PathResponse);
+            assert_eq!(
+                node.take_queued().unwrap().reason,
+                OutboundReason::PathResponse
+            );
         }
         // Churn evicts the matching cache slot even when mode-dependent route
         // deadlines differ; every still-retained route remains answerable.
@@ -4438,12 +4791,12 @@ mod tests {
             node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
                 .unwrap();
             node.tick(1500);
-            while node.poll_tx().is_some() {}
+            while node.take_queued().is_some() {}
             let request = link_request(announce.destination_hash, 0);
             let id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
             node.ingest(request.as_slice(), RxMeta::new(9), 1600)
                 .unwrap();
-            node.poll_tx().unwrap();
+            node.take_queued().unwrap();
             node.links.mark_validated(&id, 2000, 1700);
 
             // Ordinary traffic arrives one millisecond before the previous idle
@@ -4469,7 +4822,7 @@ mod tests {
                 1,
                 "renewed activity survives the previous idle deadline while queued"
             );
-            let held = node.poll_tx().unwrap();
+            let held = node.take_queued().unwrap();
             assert_eq!(
                 held.lifetime.expires_ms, 121_999,
                 "renewal retains the independent 120-second queue bound"
@@ -4490,7 +4843,7 @@ mod tests {
             node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
                 .unwrap();
             node.tick(1500);
-            while node.poll_tx().is_some() {}
+            while node.take_queued().is_some() {}
             let packet = if is_link {
                 node.links.last_generation = u64::MAX;
                 link_request(announce.destination_hash, 0)
@@ -4519,7 +4872,7 @@ mod tests {
             node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
                 .unwrap();
             node.tick(1500);
-            while node.poll_tx().is_some() {}
+            while node.take_queued().is_some() {}
             node.last_delivery_identity = u64::MAX;
             let packet = if is_link {
                 link_request(announce.destination_hash, 0)
@@ -4606,7 +4959,7 @@ mod tests {
             assert_eq!(n.require_link_capacity(IFACE).is_ok(), size <= 8);
             let data = h2_data([0x55; 16], b"fitting non-Link packet");
             assert!(n.enqueue(IFACE, data, OutboundReason::TransportForward));
-            let frame = n.poll_tx().unwrap();
+            let frame = n.take_queued().unwrap();
             assert_eq!(frame.packet.len(), data.len() + tag);
             let request = link_request([0x66; 16], 0);
             let mut wire = WireBuffer::new();
@@ -4640,7 +4993,7 @@ mod tests {
         let ann = signed_announce([0x71; 32], "lxmf.delivery", b"receiver");
         n.ingest(ann.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
-        while n.poll_tx().is_some() {}
+        while n.take_queued().is_some() {}
         let request = link_request(ann.destination_hash, 0);
         let id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
         n.ingest(request.as_slice(), RxMeta::new(9), 1100).unwrap();
@@ -4649,7 +5002,7 @@ mod tests {
         assert!(n.links.get(&id, 1100).is_some());
         assert!(n.update_interface_packet_capacity(IFACE, 7, 499));
         assert!(n.links.get(&id, 1100).is_none());
-        assert!(n.poll_tx().is_none());
+        assert!(n.take_queued().is_none());
         assert!(n.update_interface_packet_capacity(IFACE, 7, 500));
         n.ingest(request.as_slice(), RxMeta::new(9), 1200).unwrap();
         assert!(n.links.get(&id, 1200).is_some());
@@ -4668,7 +5021,7 @@ mod tests {
             let ann = signed_announce([0x71; 32], "lxmf.delivery", b"receiver");
             n.ingest(ann.raw.as_slice(), RxMeta::new(IFACE), now)
                 .unwrap();
-            while n.poll_tx().is_some() {}
+            while n.take_queued().is_some() {}
             let request = link_request(ann.destination_hash, 0);
             let link = link_id_from_raw(request.as_slice(), HeaderType::Header2);
             n.ingest(request.as_slice(), RxMeta::new(9), now).unwrap();
@@ -4687,7 +5040,7 @@ mod tests {
                     .unwrap(),
                 IngestAction::ForwardedPathRequest
             );
-            while n.poll_tx().is_some() {}
+            while n.take_queued().is_some() {}
             (ann.destination_hash, link)
         };
         let routes = |n: &SmallNode, destination: &Hash16, link: &Hash16, now: u64| {
@@ -4727,7 +5080,7 @@ mod tests {
                 let ann = signed_announce([0x71; 32], "lxmf.delivery", b"receiver");
                 n.ingest(ann.raw.as_slice(), RxMeta::new(IFACE), 1000)
                     .unwrap();
-                while n.poll_tx().is_some() {}
+                while n.take_queued().is_some() {}
                 let mut request = link_request(ann.destination_hash, 0);
                 request
                     .extend_from_slice(&crate::link::SignallingData::new(mode, mtu).pack())
@@ -4742,7 +5095,7 @@ mod tests {
                     assert_eq!(n.packet_hashes, before);
                 } else {
                     assert_eq!(result, Ok(IngestAction::ForwardedTransport));
-                    let forwarded = n.poll_tx().unwrap();
+                    let forwarded = n.take_queued().unwrap();
                     let view = PacketView::parse(forwarded.packet.as_slice()).unwrap();
                     assert_eq!(
                         link_id_from_raw(
@@ -4764,7 +5117,7 @@ mod tests {
                     // Same ID with a different suffix cannot replace ownership/deadline.
                     let _ = n.ingest(request.as_slice(), RxMeta::new(9), 1200);
                     assert_eq!(*n.links.get(&id, 1200).unwrap(), pending);
-                    assert!(n.poll_tx().is_none());
+                    assert!(n.take_queued().is_none());
                 }
             }
         }
@@ -4777,11 +5130,11 @@ mod tests {
         let ann = signed_announce(seed, "lxmf.delivery", b"receiver");
         n.ingest(ann.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
-        while n.poll_tx().is_some() {}
+        while n.take_queued().is_some() {}
         let request = link_request(ann.destination_hash, 0);
         let id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
         n.ingest(request.as_slice(), RxMeta::new(9), 1100).unwrap();
-        while n.poll_tx().is_some() {}
+        while n.take_queued().is_some() {}
         let pending = *n.links.get(&id, 1100).unwrap();
         for (mode, mtu) in [(0, 500), (7, 500), (1, 499), (1, 501)] {
             let mut proof = lrproof(id, 0, seed);
@@ -4802,7 +5155,7 @@ mod tests {
                 IngestAction::Dropped
             );
             assert_eq!(*n.links.get(&id, 1200).unwrap(), pending);
-            assert!(n.poll_tx().is_none());
+            assert!(n.take_queued().is_none());
         }
         let valid = lrproof(id, 0, seed);
         assert_eq!(
@@ -4811,6 +5164,443 @@ mod tests {
             IngestAction::ForwardedProof
         );
         assert!(n.links.get(&id, 1300).unwrap().validated);
+    }
+
+    type TestRouter = LiteNode<8, 32, 8, 8, 4, 8, 8, 0, 8, Router>;
+
+    fn router(interfaces: &[InterfaceConfig]) -> TestRouter {
+        let mut config = LiteConfig::ESP32_LORA_TRANSPORT_MICRO;
+        config.table_caps.path_entries = 8;
+        config.table_caps.packet_hashes = 32;
+        config.table_caps.tx_queue_depth = 8;
+        let mut registry = InterfaceRegistry::new();
+        for interface in interfaces {
+            registry.register(*interface).unwrap();
+        }
+        TestRouter::new_router(config, TRANSPORT_ID, registry, None).unwrap()
+    }
+
+    fn plain(destination_hash: Hash16, payload: &[u8]) -> PacketBuffer {
+        build_packet(
+            PacketHeader {
+                flags: PacketFlags {
+                    header_type: HeaderType::Header1,
+                    context_flag: false,
+                    transport_type: TransportType::Broadcast,
+                    destination_type: DestinationType::Plain,
+                    packet_type: PacketType::Data,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash,
+                context: PacketContext::None,
+            },
+            payload,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn router_local_link_packets_have_no_transit_dependency_and_retire_on_reset() {
+        let mut n = router(&[InterfaceConfig::lora_repeater(1, 1000, 4)]);
+        let link_id = [0x55; 16];
+        assert!(n.register_local_link(link_id));
+        assert!(n.send_local(1, lrproof(link_id, 0, [0x71; 32])));
+        let held = n
+            .poll_tx_for_interface(1)
+            .expect("local LRPROOF survives without transit row");
+        assert_eq!(held.lifetime.state, OutboundState::Independent);
+        assert!(n.router_outbound_is_live(1, held.lifetime, held.target_generation, 1));
+        let delivery_identity = n.last_delivery_identity;
+        n.reset_in_place(n.config, TRANSPORT_ID).unwrap();
+        assert_eq!(n.last_delivery_identity, delivery_identity);
+        assert!(!n.router_outbound_is_live(1, held.lifetime, held.target_generation, 1));
+        assert!(n.send_local(1, link_packet(link_id, 0, PacketContext::None)));
+        assert!(n.poll_tx_for_interface(1).is_some());
+        assert!(n.last_delivery_identity > delivery_identity);
+    }
+
+    #[test]
+    fn transit_lrproof_retains_the_admitted_key_after_path_eviction() {
+        let mut n = router(&[
+            InterfaceConfig::lora_repeater(1, 1000, 4),
+            InterfaceConfig::backbone(2, 100000, 4),
+        ]);
+        let ann = signed_announce([0x71; 32], "lxmf.delivery", b"receiver");
+        n.ingest(ann.raw.as_slice(), RxMeta::new(1), 1000).unwrap();
+        assert_eq!(n.known_destination_count(), 0);
+        let request = link_request(ann.destination_hash, 0);
+        let id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
+        assert_eq!(
+            n.ingest(request.as_slice(), RxMeta::new(2), 1100),
+            Ok(IngestAction::ForwardedTransport)
+        );
+        let forwarded = n.poll_tx_for_interface(1).unwrap();
+        assert_eq!(forwarded.reason, OutboundReason::TransportForward);
+        let key = n.links.get(&id, 1100).unwrap().destination_ed25519;
+        assert_eq!(
+            key,
+            Some(
+                SigningKey::from_bytes(&ann.signing_seed)
+                    .verifying_key()
+                    .to_bytes()
+            )
+        );
+        // The bounded path cache can churn during the handshake. No cached path or
+        // known-destination row is needed to authenticate the already admitted Link.
+        n.paths.clear();
+        assert_eq!(
+            n.ingest(lrproof(id, 0, [0x72; 32]).as_slice(), RxMeta::new(1), 1200),
+            Ok(IngestAction::Dropped)
+        );
+        assert!(!n.links.get(&id, 1200).unwrap().validated);
+        assert!(n.poll_tx_for_interface(2).is_none());
+        assert_eq!(
+            n.ingest(
+                lrproof(id, 0, ann.signing_seed).as_slice(),
+                RxMeta::new(1),
+                1300
+            ),
+            Ok(IngestAction::ForwardedProof)
+        );
+        assert!(n.links.get(&id, 1300).unwrap().validated);
+        assert_eq!(
+            n.poll_tx_for_interface(2).unwrap().reason,
+            OutboundReason::ProofReturn
+        );
+    }
+
+    #[test]
+    fn same_route_reannounce_keeps_held_data_live_but_relearn_does_not() {
+        let mut n = router(&[
+            InterfaceConfig::lora_repeater(1, 1000, 4),
+            InterfaceConfig::backbone(2, 100000, 4),
+        ]);
+        let ann = signed_announce_rh([0x71; 32], "lxmf.delivery", b"old", [1; 10]);
+        n.ingest(ann.raw.as_slice(), RxMeta::new(1), 1000).unwrap();
+        assert_eq!(
+            n.ingest(
+                h2_data(ann.destination_hash, b"held").as_slice(),
+                RxMeta::new(2),
+                1100
+            ),
+            Ok(IngestAction::ForwardedTransport)
+        );
+        let held = n.poll_tx_for_interface(1).unwrap();
+        let generation = n.paths.generation(&ann.destination_hash, 1100).unwrap();
+        let renewed = signed_announce_rh([0x71; 32], "lxmf.delivery", b"new", [2; 10]);
+        n.ingest(renewed.raw.as_slice(), RxMeta::new(1), 1200)
+            .unwrap();
+        assert_eq!(
+            n.paths.generation(&ann.destination_hash, 1200),
+            Some(generation)
+        );
+        assert!(n.router_outbound_is_live(1, held.lifetime, held.target_generation, 1200));
+        n.paths.clear();
+        n.ingest(renewed.raw.as_slice(), RxMeta::new(1), 1300)
+            .unwrap();
+        assert_ne!(
+            n.paths.generation(&ann.destination_hash, 1300),
+            Some(generation)
+        );
+        assert!(!n.router_outbound_is_live(1, held.lifetime, held.target_generation, 1300));
+    }
+
+    #[test]
+    fn only_successful_forwarding_touches_the_path() {
+        let mut n = router(&[
+            InterfaceConfig::lora_repeater(1, 1000, 4),
+            InterfaceConfig::backbone(2, 100000, 4),
+        ]);
+        let ann = signed_announce([0x71; 32], "lxmf.delivery", b"receiver");
+        n.ingest(ann.raw.as_slice(), RxMeta::new(1), 1000).unwrap();
+        let original = *n.path(&ann.destination_hash, 1000).unwrap();
+        n.last_delivery_identity = u64::MAX;
+        assert_eq!(
+            n.ingest(
+                h2_data(ann.destination_hash, b"refused").as_slice(),
+                RxMeta::new(2),
+                1100
+            ),
+            Ok(IngestAction::Dropped)
+        );
+        assert_eq!(*n.path(&ann.destination_hash, 1100).unwrap(), original);
+        // Counter exhaustion above is terminal in production. A fresh node is used
+        // for successful admission rather than resetting a monotonic counter.
+        let mut n = router(&[
+            InterfaceConfig::lora_repeater(1, 1000, 4),
+            InterfaceConfig::backbone(2, 100000, 4),
+        ]);
+        n.ingest(ann.raw.as_slice(), RxMeta::new(1), 1000).unwrap();
+        assert_eq!(
+            n.ingest(
+                h2_data(ann.destination_hash, b"admitted").as_slice(),
+                RxMeta::new(2),
+                1100
+            ),
+            Ok(IngestAction::ForwardedTransport)
+        );
+        let touched = n.path(&ann.destination_hash, 1100).unwrap();
+        assert_eq!(touched.last_seen_ms, 1100);
+        assert_eq!(touched.expires_ms, original.expires_ms + 100);
+    }
+
+    #[test]
+    fn failed_delivery_proof_admission_restores_original_reverse_generation() {
+        let mut n = router(&[
+            InterfaceConfig::lora_repeater(1, 1000, 4),
+            InterfaceConfig::backbone(2, 100000, 4),
+        ]);
+        let ann = signed_announce([0x71; 32], "lxmf.delivery", b"receiver");
+        n.ingest(ann.raw.as_slice(), RxMeta::new(1), 1000).unwrap();
+        let data = h2_data(ann.destination_hash, b"proof undo");
+        n.ingest(data.as_slice(), RxMeta::new(2), 1100).unwrap();
+        let held = n.poll_tx_for_interface(1).unwrap();
+        let hash = truncated_packet_hash(data.as_slice(), HeaderType::Header2);
+        let generation = n.reverse.generation(&hash, 1100).unwrap();
+        let reverse = *n.reverse.get(&hash, 1100).unwrap();
+        n.last_delivery_identity = u64::MAX;
+        assert_eq!(
+            n.ingest(proof(hash).as_slice(), RxMeta::new(1), 1200),
+            Ok(IngestAction::Dropped)
+        );
+        assert_eq!(n.reverse.generation(&hash, 1200), Some(generation));
+        assert_eq!(*n.reverse.get(&hash, 1200).unwrap(), reverse);
+        assert!(n.router_outbound_is_live(1, held.lifetime, held.target_generation, 1200));
+    }
+
+    #[test]
+    fn router_plain_sink_captures_ifac_payload_without_accounting_or_bridge() {
+        let key = [0x63; 64];
+        let mut radio = InterfaceConfig::lora_repeater(1, 1000, 4);
+        radio.ifac = Some(IfacConfig { key, size: 8 });
+        let mut n = router(&[radio, InterfaceConfig::local_client(2, 100000, 4)]);
+        n.config.transport_enabled = false;
+        let destination = [0x51; 16];
+        n.set_local_plain_sink(Some(destination));
+        let packet = plain(destination, b"opaque local payload");
+        let mut wire = WireBuffer::new();
+        ifac_sign_into(packet.as_slice(), &key, 8, &mut wire).unwrap();
+        let mut capture = PacketBuffer::new();
+        for _ in 0..2 {
+            assert_eq!(
+                n.ingest_endpoint(wire.as_slice(), RxMeta::new(1), 1000, &mut capture),
+                Ok(IngestAction::LocalPlain)
+            );
+            assert_eq!(capture.as_slice(), b"opaque local payload");
+        }
+        assert_eq!(n.stats(), TransportStats::default());
+        assert_eq!(n.packet_hashes, PacketHashTable::new());
+        assert_eq!(n.outbound_len(), 0);
+        assert_eq!(
+            n.ingest(wire.as_slice(), RxMeta::new(1), 1000),
+            Ok(IngestAction::Dropped)
+        );
+        assert_eq!(n.stats(), TransportStats::default());
+        let mut relayed = packet;
+        relayed.as_mut_slice()[1] = 1;
+        ifac_sign_into(relayed.as_slice(), &key, 8, &mut wire).unwrap();
+        assert_eq!(
+            n.ingest_endpoint(wire.as_slice(), RxMeta::new(1), 1100, &mut capture),
+            Ok(IngestAction::Dropped)
+        );
+        assert_eq!(
+            n.outbound_len(),
+            0,
+            "a relayed sink packet cannot bridge to local clients"
+        );
+    }
+
+    #[test]
+    fn router_local_capture_preserves_hops_and_path_request_dedup() {
+        let mut n = router(&[InterfaceConfig::lora_repeater(1, 1000, 4)]);
+        let own = [0x51; 16];
+        assert!(n.register_local_destination(own));
+        let mut capture = PacketBuffer::new();
+        let request = link_request(own, 1);
+        assert_eq!(
+            n.ingest_endpoint(request.as_slice(), RxMeta::new(1), 1000, &mut capture),
+            Ok(IngestAction::LocalEndpoint)
+        );
+        assert_eq!(
+            PacketView::parse(capture.as_slice()).unwrap().header.hops,
+            2
+        );
+        let invalid_destination_type = retyped(request, DestinationType::Plain, 0);
+        assert_ne!(
+            n.ingest_endpoint(
+                invalid_destination_type.as_slice(),
+                RxMeta::new(1),
+                1050,
+                &mut capture
+            ),
+            Ok(IngestAction::LocalEndpoint)
+        );
+        let request = path_request(own, [0x52; 16]);
+        assert_eq!(
+            n.ingest_endpoint(request.as_slice(), RxMeta::new(1), 1100, &mut capture),
+            Ok(IngestAction::LocalEndpoint)
+        );
+        assert_eq!(
+            n.ingest_endpoint(request.as_slice(), RxMeta::new(1), 1200, &mut capture),
+            Ok(IngestAction::Duplicate)
+        );
+        assert_eq!(n.outbound_len(), 0);
+    }
+
+    #[test]
+    fn router_single_radio_discovery_and_ifac_fanout_are_explicit() {
+        let mut repeater = InterfaceConfig::lora_repeater(1, 1000, 4);
+        repeater.ifac = Some(IfacConfig {
+            key: [0x11; 64],
+            size: 8,
+        });
+        let mut peer = InterfaceConfig::backbone(2, 100000, 4);
+        peer.ifac = Some(IfacConfig {
+            key: [0x22; 64],
+            size: 16,
+        });
+        let mut n = router(&[repeater, peer]);
+        let request = path_request([0x61; 16], [0x62; 16]);
+        let mut input = WireBuffer::new();
+        ifac_sign_into(request.as_slice(), &[0x11; 64], 8, &mut input).unwrap();
+        assert_eq!(
+            n.ingest(input.as_slice(), RxMeta::new(1), 1000),
+            Ok(IngestAction::ForwardedPathRequest)
+        );
+        let mut clear = PacketBuffer::new();
+        for (id, key, size) in [(1, [0x11; 64], 8), (2, [0x22; 64], 16)] {
+            let frame = n.poll_tx_for_interface(id).unwrap();
+            assert_eq!(frame.reason, OutboundReason::PathRequestForward);
+            assert_eq!(frame.lifetime.expires_ms, 16000);
+            ifac_verify_into(frame.packet.as_slice(), &key, size, &mut clear).unwrap();
+            assert_eq!(
+                PacketView::parse(clear.as_slice())
+                    .unwrap()
+                    .header
+                    .destination_hash,
+                path_request_destination()
+            );
+        }
+        let mut n = router(&[InterfaceConfig::lora(1, 1000, 4)]);
+        assert_eq!(
+            n.ingest(request.as_slice(), RxMeta::new(1), 1000),
+            Ok(IngestAction::Dropped)
+        );
+        assert_eq!(n.outbound_len(), 0);
+        assert_eq!(
+            n.request_path(&[0x71; 16], &[0x72; 16], 9, 1000),
+            Err(TransportError::UnknownInterface)
+        );
+    }
+
+    #[test]
+    fn router_queue_is_per_interface_and_prefers_ungated_traffic() {
+        let mut n = router(&[
+            InterfaceConfig::lora_repeater(1, 1000, 2),
+            InterfaceConfig::backbone(2, 100000, 2),
+        ]);
+        let packet = plain([0x51; 16], b"queue");
+        assert!(n.enqueue(1, packet, OutboundReason::AnnounceRebroadcast));
+        assert!(n.send_local(1, packet));
+        assert_eq!(
+            n.poll_tx_for_interface(1).unwrap().reason,
+            OutboundReason::Local
+        );
+        assert!(n.send_local(1, packet));
+        assert!(n.send_local(1, packet));
+        assert_eq!(n.outbound_len_for_interface(1), 2);
+        assert!(!n.enqueue(1, packet, OutboundReason::AnnounceRebroadcast));
+        assert!(n.send_local(2, packet));
+        n.last_delivery_identity = u64::MAX;
+        let queue_before = n.outbound;
+        assert!(!n.send_local(1, packet));
+        assert_eq!(
+            n.outbound, queue_before,
+            "counter exhaustion cannot evict a queued row"
+        );
+        let held = n.poll_tx_for_interface(2).unwrap();
+        n.set_interface_online(2, false).unwrap();
+        n.set_interface_online(2, true).unwrap();
+        assert!(!n.router_outbound_is_live(2, held.lifetime, held.target_generation, 1));
+    }
+
+    #[test]
+    fn router_header_growth_checks_each_ifac_wire_budget() {
+        let mut radio = InterfaceConfig::lora_repeater(1, 1000, 4);
+        radio.ifac = Some(IfacConfig {
+            key: [0x73; 64],
+            size: 64,
+        });
+        let mut n = router(&[radio, InterfaceConfig::backbone(2, 100000, 4)]);
+        let ann = signed_announce([0x71; 32], "lxmf.delivery", &[0x51; 262]);
+        assert_eq!(ann.raw.len(), 429);
+        n.ingest(ann.raw.as_slice(), RxMeta::new(2), 1000).unwrap();
+        n.tick(2000);
+        assert!(n.poll_tx_for_interface(1).is_none());
+        assert_eq!(n.router_stats().mtu_dropped, 1);
+        assert_eq!(n.stats().outbound_dropped, 1);
+    }
+
+    #[test]
+    fn endpoint_layout_and_transit_key_storage_remain_bounded() {
+        assert_eq!(core::mem::size_of::<MicroNode>(), 32664);
+        assert_eq!(core::mem::size_of::<SmallNode>(), 202040);
+        assert_eq!(core::mem::size_of::<LinkEntry>(), 72);
+        type ConstrainedRouter = LiteNode<16, 64, 16, 8, 4, 16, 8, 0, 4, Router>;
+        type PsramRouter = LiteNode<128, 512, 32, 32, 16, 64, 16, 0, 16, Router>;
+        if cfg!(target_pointer_width = "64") {
+            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 24848);
+            assert_eq!(core::mem::size_of::<PsramRouter>(), 90448);
+        } else if cfg!(target_pointer_width = "32") {
+            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 24504);
+            assert_eq!(core::mem::size_of::<PsramRouter>(), 89816);
+        }
+    }
+
+    #[test]
+    fn router_interface_generation_exhaustion_is_transactional() {
+        let mut n = router(&[InterfaceConfig::lora_repeater(1, 1000, 4)]);
+        assert!(n.send_local(1, plain([0x51; 16], b"queued")));
+        n.interfaces.last_generation = u64::MAX;
+        let before = n.clone();
+        assert_eq!(
+            n.register_interface(InterfaceConfig::backbone(2, 100000, 4)),
+            Err(ConfigError::InterfaceGenerationExhausted)
+        );
+        assert_eq!(n, before);
+        assert_eq!(
+            n.reset_in_place(n.config, [0x77; 16]),
+            Err(TransportError::InvalidConfig)
+        );
+        assert_eq!(n, before);
+        let mut invalid = n.config;
+        invalid.table_caps.path_entries = 0;
+        assert_eq!(
+            n.reset_in_place(invalid, [0x77; 16]),
+            Err(TransportError::InvalidConfig)
+        );
+        assert_eq!(n, before);
+    }
+
+    #[test]
+    fn internal_mode_recursively_discovers_unknown_paths() {
+        // Trusted actor/mod.rs mode_discovers_unknown_paths includes Internal.
+        let mut source = InterfaceConfig::network_peer(1, 100000, 4);
+        source.mode = InterfaceMode::Internal;
+        let mut n = router(&[source, InterfaceConfig::lora_repeater(2, 1000, 4)]);
+        assert_eq!(
+            n.ingest(
+                path_request([0x61; 16], [0x62; 16]).as_slice(),
+                RxMeta::new(1),
+                1000
+            ),
+            Ok(IngestAction::ForwardedPathRequest)
+        );
+        assert_eq!(
+            n.poll_tx_for_interface(2).unwrap().reason,
+            OutboundReason::PathRequestForward
+        );
     }
 }
 
@@ -5011,6 +5801,7 @@ mod retained_queue_tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Explicit compatibility contract until the Rust method is removed.
     fn legacy_poll_is_unchanged_until_exclusive_retained_mode() {
         let mut n = node();
         enqueue(&mut n, 1, OutboundReason::PathRequest, 0);

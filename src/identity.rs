@@ -96,8 +96,7 @@ impl<'a> AnnounceView<'a> {
         if &expected_dest != destination_hash {
             return Err(AnnounceError::DestinationHashMismatch);
         }
-        // Spine file: nested (not let-chained) so the byte-identical rsNode copy still
-        // compiles at this crate's MSRV 1.85; newer clippy would collapse it.
+        // Keep nested conditions for this crate's Rust 1.87 minimum.
         #[allow(clippy::collapsible_if)]
         if let Some(known) = known_public_key {
             if known != &self.public_key {

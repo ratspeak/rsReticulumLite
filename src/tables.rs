@@ -293,6 +293,21 @@ impl<const N: usize> PathTable<N> {
             .and_then(|entry| entry.is_live(now_ms).then_some(entry))
     }
 
+    /// Refresh a successfully used route without changing its incarnation or lifetime span.
+    /// Adapted from trusted `PathEntry::touch`; queue wait alone never refreshes a route.
+    pub fn touch(&mut self, destination_hash: &Hash16, now_ms: u64) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| &entry.destination_hash == destination_hash && entry.is_live(now_ms))
+        {
+            let lifetime = entry.expires_ms.saturating_sub(entry.last_seen_ms);
+            entry.last_seen_ms = now_ms;
+            entry.expires_ms = now_ms.saturating_add(lifetime);
+        }
+    }
+
     /// Borrow a stored path's public key without checking expiry or authenticity.
     /// This is path-cache state, not a separate trusted identity store.
     pub fn known_public_key(&self, destination_hash: &Hash16) -> Option<&[u8; PUBLIC_KEY_LENGTH]> {
@@ -379,6 +394,17 @@ impl<const N: usize> PathTable<N> {
     }
 
     fn replace_entry(&mut self, idx: usize, entry: PathEntry) -> bool {
+        // A fresh announce over the same live route does not invalidate queued bytes.
+        // Removal/expiry clears the slot first, so a later relearn still mints a new owner.
+        if self.entries[idx].is_some_and(|old| {
+            old.destination_hash == entry.destination_hash
+                && old.interface_id == entry.interface_id
+                && old.next_hop == entry.next_hop
+                && old.hops == entry.hops
+        }) {
+            self.entries[idx] = Some(entry);
+            return true;
+        }
         let Some(generation) = self.next_generation() else {
             return false;
         };
@@ -756,12 +782,32 @@ impl<const N: usize> ReverseTable<N> {
     }
 
     pub fn remove(&mut self, proof_hash: &Hash16, now_ms: u64) -> Option<ReverseEntry> {
+        self.take_with_generation(proof_hash, now_ms)
+            .map(|(entry, _)| entry)
+    }
+
+    pub(crate) fn take_with_generation(
+        &mut self,
+        proof_hash: &Hash16,
+        now_ms: u64,
+    ) -> Option<(ReverseEntry, u64)> {
         self.expire(now_ms);
         let idx = self
             .entries
             .iter()
             .position(|slot| slot.is_some_and(|entry| &entry.proof_hash == proof_hash))?;
-        self.entries[idx].take()
+        self.entries[idx]
+            .take()
+            .map(|entry| (entry, self.generations[idx]))
+    }
+
+    /// Undo a just-consumed reverse entry after queue admission failed. No table mutation
+    /// may intervene: enqueue only changes outbound storage, leaving the original slot free.
+    pub(crate) fn restore_consumed(&mut self, entry: ReverseEntry, generation: u64) {
+        if let Some(idx) = self.entries.iter().position(Option::is_none) {
+            self.entries[idx] = Some(entry);
+            self.generations[idx] = generation;
+        }
     }
 
     pub fn remove_interface(&mut self, interface: InterfaceId) {
@@ -792,10 +838,11 @@ impl<const N: usize> Default for ReverseTable<N> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LinkEntry {
     pub link_id: Hash16,
-    pub destination_hash: Hash16,
+    /// Identity authenticated by the destination's announce when the request was admitted.
+    /// Retained independently of the route table so path churn cannot break LRPROOF validation.
+    pub destination_ed25519: Option<[u8; 32]>,
     pub receiving_interface: InterfaceId,
     pub outbound_interface: InterfaceId,
-    pub next_hop: Option<Hash16>,
     pub remaining_hops: u8,
     pub taken_hops: u8,
     pub requested_mode: u8,
@@ -1396,10 +1443,9 @@ mod tests {
         table.insert(
             LinkEntry {
                 link_id: [1; 16],
-                destination_hash: [0xAA; 16],
+                destination_ed25519: Some([0xAA; 32]),
                 receiving_interface: 1,
                 outbound_interface: 2,
-                next_hop: Some([0x11; 16]),
                 remaining_hops: 1,
                 taken_hops: 1,
                 requested_mode: 1,
@@ -1412,10 +1458,9 @@ mod tests {
         table.insert(
             LinkEntry {
                 link_id: [2; 16],
-                destination_hash: [0xBB; 16],
+                destination_ed25519: Some([0xBB; 32]),
                 receiving_interface: 1,
                 outbound_interface: 2,
-                next_hop: Some([0x22; 16]),
                 remaining_hops: 1,
                 taken_hops: 1,
                 requested_mode: 1,
@@ -1428,10 +1473,9 @@ mod tests {
         table.insert(
             LinkEntry {
                 link_id: [3; 16],
-                destination_hash: [0xCC; 16],
+                destination_ed25519: Some([0xCC; 32]),
                 receiving_interface: 1,
                 outbound_interface: 2,
-                next_hop: Some([0x33; 16]),
                 remaining_hops: 1,
                 taken_hops: 1,
                 requested_mode: 1,
@@ -1489,10 +1533,9 @@ mod tests {
     fn link(key: u8, expires_ms: u64) -> LinkEntry {
         LinkEntry {
             link_id: [key; 16],
-            destination_hash: [3; 16],
+            destination_ed25519: Some([3; 32]),
             receiving_interface: 1,
             outbound_interface: 2,
-            next_hop: None,
             remaining_hops: 1,
             taken_hops: 1,
             requested_mode: 1,
@@ -1514,8 +1557,9 @@ mod tests {
         let mut newer = original;
         newer.random_hash = [3; RANDOM_HASH_LENGTH];
         assert!(table.insert_or_update(newer, 0));
-        assert!(table.get_generation(first, 0).is_none());
+        assert!(table.get_generation(first, 0).is_some());
         let second = table.generation(&[1; 16], 0).unwrap();
+        assert_eq!(first, second);
         assert!(table.drop_path(&[1; 16]));
         assert!(table.insert_or_update(newer, 0));
         assert!(table.get_generation(second, 0).is_none());
@@ -1591,9 +1635,13 @@ mod tests {
         paths.last_generation = u64::MAX - 1;
         assert!(paths.insert_or_update(path(1, 100), 0));
         assert_eq!(paths.generation(&[1; 16], 0), Some(u64::MAX));
-        let saved = paths;
         let mut newer = path(1, 100);
         newer.random_hash = [3; RANDOM_HASH_LENGTH];
+        assert!(paths.insert_or_update(newer, 0));
+        assert_eq!(paths.generation(&[1; 16], 0), Some(u64::MAX));
+        let saved = paths;
+        newer.random_hash = [4; RANDOM_HASH_LENGTH];
+        newer.interface_id = 2;
         assert!(!paths.insert_or_update(newer, 0));
         assert!(!paths.insert_or_update(path(2, 200), 0));
         assert_eq!(paths, saved);

@@ -182,6 +182,23 @@ impl LoraModemConfig {
         low_data_rate_optimize: false,
     };
 
+    /// Estimate nominal bitrate as `sf * 4 * bandwidth / (cr * 2^sf)` using
+    /// integer arithmetic. Zero inputs or an out-of-range shift return zero.
+    /// This does not validate a radio profile or measure throughput.
+    pub fn nominal_bitrate_bps(self) -> u64 {
+        if self.bandwidth_hz == 0 || self.spreading_factor == 0 || self.coding_rate_denominator == 0
+        {
+            return 0;
+        }
+        let Some(chips_per_symbol) = 1u64.checked_shl(self.spreading_factor.into()) else {
+            return 0;
+        };
+        u64::from(self.spreading_factor)
+            .saturating_mul(4)
+            .saturating_mul(u64::from(self.bandwidth_hz))
+            / (u64::from(self.coding_rate_denominator).saturating_mul(chips_per_symbol))
+    }
+
     /// Estimate one physical frame's airtime in milliseconds, rounding up.
     /// Supply valid radio settings and a frame length no greater than 255 bytes,
     /// including the framing byte. This helper does not validate the full radio
@@ -240,6 +257,13 @@ impl AirtimeLimiter {
             window_start_ms: 0,
             used_airtime_ms: 0,
         }
+    }
+
+    pub const fn window_ms(&self) -> u64 {
+        self.window_ms
+    }
+    pub const fn max_utilization_bps(&self) -> u16 {
+        self.max_utilization_bps
     }
 
     /// Check admission after refreshing the window; this does not charge airtime.
@@ -309,170 +333,6 @@ impl AirtimeLimiter {
             .saturating_mul(self.max_utilization_bps as u64)
             / BASIS_POINTS_DENOMINATOR
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CarrierSenseConfig {
-    pub difs_ms: u32,
-    pub slot_ms: u32,
-    pub cw_min_slots: u8,
-    pub cw_max_slots: u8,
-}
-
-impl CarrierSenseConfig {
-    pub const HELTEC_V3_LONG_FAST: Self = Self {
-        difs_ms: 48,
-        slot_ms: 24,
-        cw_min_slots: 0,
-        cw_max_slots: 15,
-    };
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MediumObservation {
-    Free,
-    BusyRssi,
-    BusyCad,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CarrierSenseDeferReason {
-    MediumRssi,
-    MediumCad,
-    Difs,
-    Contention,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CarrierSenseDecision {
-    Ready,
-    Defer {
-        reason: CarrierSenseDeferReason,
-        wait_ms: u32,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CarrierSenseState {
-    Idle,
-    Difs { started_ms: u64 },
-    Contention { started_ms: u64, wait_ms: u32 },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CarrierSenseBackoff {
-    config: CarrierSenseConfig,
-    state: CarrierSenseState,
-}
-
-impl CarrierSenseBackoff {
-    pub const fn new(config: CarrierSenseConfig) -> Self {
-        Self {
-            config,
-            state: CarrierSenseState::Idle,
-        }
-    }
-
-    pub const fn config(&self) -> CarrierSenseConfig {
-        self.config
-    }
-
-    pub fn reset(&mut self) {
-        self.state = CarrierSenseState::Idle;
-    }
-
-    /// Advance backoff using the caller's current medium observation and clock.
-    /// Busy observations restart the wait. After DIFS, the random byte selects
-    /// a slot by modulo within the configured inclusive contention range; later
-    /// polls retain that wait. `Ready` resets state and permits an attempt, but
-    /// does not sense, reserve or transmit on the radio. Supply valid timing values
-    /// and a fresh random byte when selecting a contention wait.
-    pub fn poll(
-        &mut self,
-        now_ms: u64,
-        observation: MediumObservation,
-        random: u8,
-    ) -> CarrierSenseDecision {
-        match observation {
-            MediumObservation::BusyRssi => {
-                return self.defer_busy(CarrierSenseDeferReason::MediumRssi);
-            }
-            MediumObservation::BusyCad => {
-                return self.defer_busy(CarrierSenseDeferReason::MediumCad);
-            }
-            MediumObservation::Free => {}
-        }
-
-        match self.state {
-            CarrierSenseState::Idle => {
-                self.state = CarrierSenseState::Difs { started_ms: now_ms };
-                CarrierSenseDecision::Defer {
-                    reason: CarrierSenseDeferReason::Difs,
-                    wait_ms: self.config.difs_ms,
-                }
-            }
-            CarrierSenseState::Difs { started_ms } => {
-                let elapsed = elapsed_u32(now_ms, started_ms);
-                if elapsed < self.config.difs_ms {
-                    return CarrierSenseDecision::Defer {
-                        reason: CarrierSenseDeferReason::Difs,
-                        wait_ms: self.config.difs_ms - elapsed,
-                    };
-                }
-
-                let wait_ms = self.contention_wait_ms(random);
-                if wait_ms == 0 {
-                    self.state = CarrierSenseState::Idle;
-                    CarrierSenseDecision::Ready
-                } else {
-                    self.state = CarrierSenseState::Contention {
-                        started_ms: now_ms,
-                        wait_ms,
-                    };
-                    CarrierSenseDecision::Defer {
-                        reason: CarrierSenseDeferReason::Contention,
-                        wait_ms,
-                    }
-                }
-            }
-            CarrierSenseState::Contention {
-                started_ms,
-                wait_ms,
-            } => {
-                let elapsed = elapsed_u32(now_ms, started_ms);
-                if elapsed < wait_ms {
-                    CarrierSenseDecision::Defer {
-                        reason: CarrierSenseDeferReason::Contention,
-                        wait_ms: wait_ms - elapsed,
-                    }
-                } else {
-                    self.state = CarrierSenseState::Idle;
-                    CarrierSenseDecision::Ready
-                }
-            }
-        }
-    }
-
-    fn defer_busy(&mut self, reason: CarrierSenseDeferReason) -> CarrierSenseDecision {
-        self.state = CarrierSenseState::Idle;
-        CarrierSenseDecision::Defer {
-            reason,
-            wait_ms: self.config.difs_ms,
-        }
-    }
-
-    fn contention_wait_ms(self, random: u8) -> u32 {
-        let min = self.config.cw_min_slots.min(self.config.cw_max_slots);
-        let max = self.config.cw_min_slots.max(self.config.cw_max_slots);
-        // u16: min==0 / max==255 must not wrap the span to 0 (mod-by-zero panics).
-        let span = (max as u16 - min as u16) + 1;
-        let slots = min as u16 + (random as u16 % span);
-        slots as u32 * self.config.slot_ms
-    }
-}
-
-fn elapsed_u32(now_ms: u64, started_ms: u64) -> u32 {
-    now_ms.saturating_sub(started_ms).min(u32::MAX as u64) as u32
 }
 
 fn ceil_div_u64(numerator: u64, denominator: u64) -> u64 {
@@ -548,6 +408,7 @@ mod tests {
     fn long_fast_airtime_matches_known_frame_sizes() {
         let modem = LoraModemConfig::HELTEC_V3_LONG_FAST;
 
+        assert_eq!(modem.nominal_bitrate_bps(), 1_074);
         assert_eq!(modem.frame_airtime_ms(52), 658);
         assert_eq!(modem.frame_airtime_ms(84), 904);
         assert_eq!(modem.frame_airtime_ms(192), 1682);
@@ -574,120 +435,6 @@ mod tests {
 
         assert!(limiter.reserve(2_000, 0));
         assert!(!limiter.reserve(1, 1));
-    }
-
-    #[test]
-    fn carrier_sense_busy_resets_wait() {
-        let mut backoff = CarrierSenseBackoff::new(CarrierSenseConfig::HELTEC_V3_LONG_FAST);
-
-        assert_eq!(
-            backoff.poll(0, MediumObservation::Free, 4),
-            CarrierSenseDecision::Defer {
-                reason: CarrierSenseDeferReason::Difs,
-                wait_ms: 48,
-            }
-        );
-        assert_eq!(
-            backoff.poll(24, MediumObservation::BusyRssi, 4),
-            CarrierSenseDecision::Defer {
-                reason: CarrierSenseDeferReason::MediumRssi,
-                wait_ms: 48,
-            }
-        );
-        assert_eq!(
-            backoff.poll(25, MediumObservation::Free, 4),
-            CarrierSenseDecision::Defer {
-                reason: CarrierSenseDeferReason::Difs,
-                wait_ms: 48,
-            }
-        );
-    }
-
-    #[test]
-    fn carrier_sense_waits_difs_then_deterministic_contention() {
-        let mut backoff = CarrierSenseBackoff::new(CarrierSenseConfig::HELTEC_V3_LONG_FAST);
-
-        assert!(matches!(
-            backoff.poll(100, MediumObservation::Free, 3),
-            CarrierSenseDecision::Defer {
-                reason: CarrierSenseDeferReason::Difs,
-                wait_ms: 48,
-            }
-        ));
-        assert_eq!(
-            backoff.poll(148, MediumObservation::Free, 3),
-            CarrierSenseDecision::Defer {
-                reason: CarrierSenseDeferReason::Contention,
-                wait_ms: 72,
-            }
-        );
-        assert_eq!(
-            backoff.poll(184, MediumObservation::Free, 99),
-            CarrierSenseDecision::Defer {
-                reason: CarrierSenseDeferReason::Contention,
-                wait_ms: 36,
-            }
-        );
-        assert_eq!(
-            backoff.poll(220, MediumObservation::Free, 99),
-            CarrierSenseDecision::Ready
-        );
-    }
-
-    #[test]
-    fn carrier_sense_zero_contention_slot_can_send_after_difs() {
-        let mut backoff = CarrierSenseBackoff::new(CarrierSenseConfig::HELTEC_V3_LONG_FAST);
-
-        assert!(matches!(
-            backoff.poll(0, MediumObservation::Free, 0),
-            CarrierSenseDecision::Defer {
-                reason: CarrierSenseDeferReason::Difs,
-                wait_ms: 48,
-            }
-        ));
-        assert_eq!(
-            backoff.poll(48, MediumObservation::Free, 0),
-            CarrierSenseDecision::Ready
-        );
-    }
-
-    #[test]
-    fn carrier_sense_cad_busy_defers_medium() {
-        let mut backoff = CarrierSenseBackoff::new(CarrierSenseConfig::HELTEC_V3_LONG_FAST);
-
-        assert_eq!(
-            backoff.poll(0, MediumObservation::BusyCad, 0),
-            CarrierSenseDecision::Defer {
-                reason: CarrierSenseDeferReason::MediumCad,
-                wait_ms: 48,
-            }
-        );
-    }
-
-    #[test]
-    fn carrier_sense_contention_simulation_staggers_two_nodes() {
-        let mut a = CarrierSenseBackoff::new(CarrierSenseConfig::HELTEC_V3_LONG_FAST);
-        let mut b = CarrierSenseBackoff::new(CarrierSenseConfig::HELTEC_V3_LONG_FAST);
-
-        let mut ready_a = None;
-        let mut ready_b = None;
-
-        for now in (0..=500).step_by(24) {
-            if ready_a.is_none()
-                && a.poll(now, MediumObservation::Free, 2) == CarrierSenseDecision::Ready
-            {
-                ready_a = Some(now);
-            }
-            if ready_b.is_none()
-                && b.poll(now, MediumObservation::Free, 7) == CarrierSenseDecision::Ready
-            {
-                ready_b = Some(now);
-            }
-        }
-
-        assert_eq!(ready_a, Some(96));
-        assert_eq!(ready_b, Some(216));
-        assert_ne!(ready_a, ready_b);
     }
 
     #[test]

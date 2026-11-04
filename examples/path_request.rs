@@ -13,7 +13,14 @@ fn main() {
     node.request_path(&destination, &request_tag, 1, 0)
         .expect("request packet fits the fixed buffer");
 
-    let frame = node.poll_tx().expect("path request was queued");
+    // One available host interface. Generations retire permission when its driver changes.
+    let queued = *node
+        .retained_outbound_select(0, 0, [0, 1, 0, 0, 0, 0, 0])
+        .expect("path request was queued");
+    let frame = queued.frame;
+    // Transfer ownership before handing bytes to a driver. A real driver retains the
+    // lifetime and interface generation and rechecks both before transmission.
+    assert!(node.retained_outbound_take(queued.delivery.identity));
     assert_eq!(frame.reason, OutboundReason::PathRequest);
     println!(
         "queued {}-byte path request for interface {}",

@@ -1,13 +1,15 @@
-use rns_lite_core::config::LiteConfig;
+use rns_lite_core::config::{InterfaceConfig, InterfaceRegistry, LiteConfig};
 use rns_lite_core::packet_buffer::{PacketBuffer, WireBuffer};
-use rns_lite_core::transport::{IngestAction, OutboundReason, RxMeta, SmallNode};
+use rns_lite_core::transport::{IngestAction, OutboundReason, RxMeta};
 use rns_lite_core::wire::{
     DestinationType, HeaderType, PacketContext, PacketFlags, PacketHeader, PacketType, PacketView,
     TransportType, build_packet, link_id_from_raw, truncated_packet_hash,
 };
+use rns_lite_core::{LiteNode, Router};
 
 const HELTEC_TRANSPORT_ID: [u8; 16] = *b"rslite-heltec-v3";
 const LORA_IFACE: u8 = 1;
+type Relay = LiteNode<256, 512, 64, 64, 32, 64, 64, 0, 64, Router>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Endpoint {
@@ -16,7 +18,7 @@ enum Endpoint {
 }
 
 struct VirtualRelayTopology {
-    relay: SmallNode,
+    relay: Relay,
     injector_observed: Vec<WireBuffer>,
     receiver_observed: Vec<WireBuffer>,
     now_ms: u64,
@@ -24,9 +26,18 @@ struct VirtualRelayTopology {
 
 impl VirtualRelayTopology {
     fn new() -> Self {
+        let mut interfaces = InterfaceRegistry::new();
+        interfaces
+            .register(InterfaceConfig::lora_repeater(LORA_IFACE, 1000, 4))
+            .unwrap();
         Self {
-            relay: SmallNode::new(LiteConfig::ESP32_LORA_TRANSPORT_SMALL, HELTEC_TRANSPORT_ID)
-                .unwrap(),
+            relay: Relay::new_router(
+                LiteConfig::ESP32_LORA_TRANSPORT_SMALL,
+                HELTEC_TRANSPORT_ID,
+                interfaces,
+                None,
+            )
+            .unwrap(),
             injector_observed: Vec::new(),
             receiver_observed: Vec::new(),
             now_ms: 1_000,
@@ -69,7 +80,7 @@ impl VirtualRelayTopology {
 
     fn pump_relay_broadcast(&mut self) -> Vec<OutboundReason> {
         let mut reasons = Vec::new();
-        while let Some(outbound) = self.relay.poll_tx() {
+        while let Some(outbound) = self.relay.poll_tx_for_interface(LORA_IFACE) {
             assert_eq!(outbound.interface_id, LORA_IFACE);
             reasons.push(outbound.reason);
             let packet = outbound.packet;

@@ -10,7 +10,13 @@ pub fn originate_path_request(
     node: &mut MicroNode,
 ) -> Result<Option<OutboundFrame>, TransportError> {
     node.request_path(&[0x22; 16], &[0x33; 16], 1, 0)?;
-    Ok(node.poll_tx())
+    let queued = node
+        .retained_outbound_select(0, 0, [0, 1, 0, 0, 0, 0, 0])
+        .copied();
+    Ok(queued.map(|queued| {
+        assert!(node.retained_outbound_take(queued.delivery.identity));
+        queued.frame
+    }))
 }
 
 pub fn roaming_ingress(interface_id: u8) -> RxMeta {

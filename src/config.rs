@@ -1,15 +1,82 @@
 use crate::announce_admission::AnnounceAdmissionConfig;
-use crate::constants::{MDU, MTU};
+use crate::announce_cap::ANNOUNCE_CAP_PERMILLE;
+use crate::constants::{LORA_SPLIT_FRAME_PAYLOAD_MAX, MDU, MTU};
 use crate::identity::MAX_ANNOUNCE_APP_DATA;
 use crate::ifac::{IFAC_KEY_LENGTH, IFAC_LORA_DEFAULT_SIZE};
+use crate::tables::InterfaceId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InterfaceMode {
     Full,
+    PointToPoint,
+    Internal,
     AccessPoint,
     Gateway,
     Roaming,
     Boundary,
+}
+
+/// Transport-level purpose of an interface.
+///
+/// `Normal` and `LocalClient` are deliberately distinct. An accepted TCP-server peer is an
+/// ordinary network interface, while a local client is a zero-hop peer sharing this Transport
+/// instance. The wire framing may be identical, but their routing semantics are not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterfaceRole {
+    LoRa,
+    Backbone,
+    Normal,
+    LocalClient,
+}
+
+/// Directional capabilities used before routing work is queued.
+///
+/// `repeat` is the explicit exception to reflection suppression. It is useful for a deliberately
+/// configured same-medium repeater, but ordinary multi-interface routing leaves it disabled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterfaceDirection {
+    pub inbound: bool,
+    pub outbound: bool,
+    pub forward: bool,
+    pub repeat: bool,
+}
+
+impl InterfaceDirection {
+    pub const BIDIRECTIONAL: Self = Self {
+        inbound: true,
+        outbound: true,
+        forward: true,
+        repeat: false,
+    };
+
+    pub const REPEATER: Self = Self {
+        repeat: true,
+        ..Self::BIDIRECTIONAL
+    };
+
+    pub const INBOUND_ONLY: Self = Self {
+        inbound: true,
+        outbound: false,
+        forward: false,
+        repeat: false,
+    };
+
+    pub const OUTBOUND_ONLY: Self = Self {
+        inbound: false,
+        outbound: true,
+        forward: true,
+        repeat: false,
+    };
+
+    const fn validate(self) -> Result<(), ConfigError> {
+        if !self.inbound && !self.outbound {
+            return Err(ConfigError::InterfaceHasNoDirection);
+        }
+        if (self.forward || self.repeat) && !self.outbound {
+            return Err(ConfigError::InvalidInterfaceDirection);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,6 +181,300 @@ impl IfacConfig {
     }
 }
 
+/// Maximum number of independently owned router interfaces.
+pub const MAX_INTERFACES: usize = 8;
+
+/// Fixed-capacity description of one Reticulum interface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterfaceConfig {
+    pub id: InterfaceId,
+    pub role: InterfaceRole,
+    pub mode: InterfaceMode,
+    pub direction: InterfaceDirection,
+    /// Plain Reticulum packet MTU, before any interface access-code bytes.
+    pub mtu: usize,
+    /// Nominal interface bitrate used for link proof timeout accounting.
+    pub bitrate_bps: u64,
+    pub ifac: Option<IfacConfig>,
+    pub online: bool,
+    /// Maximum number of frames this interface may occupy in the shared bounded TX queue.
+    pub tx_queue_depth: usize,
+    /// Target share for the announce release gate, in permille of estimated
+    /// interface airtime. Zero is floored to 0.1%; this is not a duty-cycle measurement.
+    pub announce_cap_permille: u16,
+    /// Paths learned from unsolicited announces here are bulk: an uplink to a busy hub must not
+    /// churn the paths LoRa and local peers depend on.
+    pub bulk_paths: bool,
+}
+
+impl InterfaceConfig {
+    pub const fn lora(id: InterfaceId, bitrate_bps: u64, tx_queue_depth: usize) -> Self {
+        Self {
+            id,
+            role: InterfaceRole::LoRa,
+            mode: InterfaceMode::Gateway,
+            direction: InterfaceDirection::BIDIRECTIONAL,
+            mtu: MTU,
+            bitrate_bps,
+            ifac: None,
+            online: true,
+            tx_queue_depth,
+            announce_cap_permille: ANNOUNCE_CAP_PERMILLE,
+            bulk_paths: false,
+        }
+    }
+
+    /// One-medium relay profile. Unlike [`Self::lora`], this explicitly permits transmitting a
+    /// forwarded frame back onto the receiving interface.
+    pub const fn lora_repeater(id: InterfaceId, bitrate_bps: u64, tx_queue_depth: usize) -> Self {
+        Self {
+            direction: InterfaceDirection::REPEATER,
+            ..Self::lora(id, bitrate_bps, tx_queue_depth)
+        }
+    }
+
+    pub const fn backbone(id: InterfaceId, bitrate_bps: u64, tx_queue_depth: usize) -> Self {
+        Self {
+            id,
+            role: InterfaceRole::Backbone,
+            mode: InterfaceMode::Boundary,
+            direction: InterfaceDirection::BIDIRECTIONAL,
+            mtu: MTU,
+            bitrate_bps,
+            ifac: None,
+            online: true,
+            tx_queue_depth,
+            announce_cap_permille: ANNOUNCE_CAP_PERMILLE,
+            bulk_paths: true,
+        }
+    }
+
+    pub const fn local_client(id: InterfaceId, bitrate_bps: u64, tx_queue_depth: usize) -> Self {
+        Self {
+            id,
+            role: InterfaceRole::LocalClient,
+            mode: InterfaceMode::Internal,
+            direction: InterfaceDirection::BIDIRECTIONAL,
+            mtu: MTU,
+            bitrate_bps,
+            ifac: None,
+            online: true,
+            tx_queue_depth,
+            announce_cap_permille: ANNOUNCE_CAP_PERMILLE,
+            bulk_paths: false,
+        }
+    }
+
+    /// Network-facing peer accepted by a Reticulum TCP server. Access-point
+    /// mode learns client paths and discovers unknown paths without granting
+    /// the zero-hop/shared-instance privileges of a local client.
+    pub const fn access_point(id: InterfaceId, bitrate_bps: u64, tx_queue_depth: usize) -> Self {
+        Self {
+            id,
+            role: InterfaceRole::Normal,
+            mode: InterfaceMode::AccessPoint,
+            direction: InterfaceDirection::BIDIRECTIONAL,
+            mtu: MTU,
+            bitrate_bps,
+            ifac: None,
+            online: true,
+            tx_queue_depth,
+            announce_cap_permille: ANNOUNCE_CAP_PERMILLE,
+            bulk_paths: false,
+        }
+    }
+
+    /// Network-peer descriptor using Gateway mode. Its egress mode permits
+    /// announces from other interface modes, subject to direction, availability,
+    /// queue and admission limits. Like AccessPoint mode, it can discover unknown
+    /// paths on a peer's behalf without local-client privileges.
+    pub const fn network_peer(id: InterfaceId, bitrate_bps: u64, tx_queue_depth: usize) -> Self {
+        Self {
+            mode: InterfaceMode::Gateway,
+            ..Self::access_point(id, bitrate_bps, tx_queue_depth)
+        }
+    }
+
+    /// Effective clear-packet MTU after applying this interface's wire limit.
+    ///
+    /// This core uses a 500-byte protocol MTU. Its TCP framing can carry a full
+    /// clear packet plus any supported IFAC tag. LoRa framing is limited to
+    /// 508 wire bytes, so an IFAC tag larger than eight bytes reduces the clear
+    /// limit. This helper does not validate the descriptor.
+    pub const fn clear_mtu(self) -> usize {
+        let physical_clear_mtu = match (self.role, self.ifac) {
+            (InterfaceRole::LoRa, Some(ifac)) => {
+                LORA_SPLIT_FRAME_PAYLOAD_MAX.saturating_sub(ifac.size as usize)
+            }
+            (InterfaceRole::LoRa, None) => LORA_SPLIT_FRAME_PAYLOAD_MAX,
+            _ => self.mtu,
+        };
+        if self.mtu < physical_clear_mtu {
+            self.mtu
+        } else {
+            physical_clear_mtu
+        }
+    }
+
+    /// Whether the effective clear-packet capacity is at least 500 bytes.
+    /// This is a size check, not an online-state or hardware qualification check.
+    pub const fn supports_general_links(self) -> bool {
+        self.clear_mtu() >= MTU
+    }
+
+    /// Maximum complete wire packet accepted by this interface, including an
+    /// IFAC tag when configured.
+    pub const fn wire_mtu(self) -> usize {
+        self.clear_mtu().saturating_add(match self.ifac {
+            Some(ifac) => ifac.size as usize,
+            None => 0,
+        })
+    }
+
+    #[allow(clippy::collapsible_if, clippy::question_mark)]
+    pub const fn validate(&self, total_queue_depth: usize) -> Result<(), ConfigError> {
+        if let Some(ifac) = self.ifac {
+            if let Err(error) = ifac.validate() {
+                return Err(error);
+            }
+        }
+        if self.mtu < crate::constants::HEADER_MINSIZE || self.mtu > MTU {
+            return Err(ConfigError::InvalidInterfaceMtu);
+        }
+        if self.tx_queue_depth == 0 || self.tx_queue_depth > total_queue_depth {
+            return Err(ConfigError::InvalidInterfaceQueueDepth);
+        }
+        self.direction.validate()
+    }
+}
+
+/// Small, allocation-free interface registry with stable caller-supplied IDs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterfaceRegistry {
+    entries: [Option<InterfaceConfig>; MAX_INTERFACES],
+}
+
+impl InterfaceRegistry {
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; MAX_INTERFACES],
+        }
+    }
+
+    /// Const-friendly constructor for firmware static configuration. Validation still happens in
+    /// [`InterfaceRegistry::validate`] / `LiteNode::new_router`.
+    pub const fn from_array(entries: [Option<InterfaceConfig>; MAX_INTERFACES]) -> Self {
+        Self { entries }
+    }
+
+    pub const fn len(&self) -> usize {
+        let mut count = 0;
+        let mut idx = 0;
+        while idx < MAX_INTERFACES {
+            if self.entries[idx].is_some() {
+                count += 1;
+            }
+            idx += 1;
+        }
+        count
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn slot(&self, id: InterfaceId) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|entry| entry.is_some_and(|interface| interface.id == id))
+    }
+
+    pub fn get(&self, id: InterfaceId) -> Option<&InterfaceConfig> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|interface| interface.id == id)
+    }
+
+    pub fn get_mut(&mut self, id: InterfaceId) -> Option<&mut InterfaceConfig> {
+        self.entries
+            .iter_mut()
+            .flatten()
+            .find(|interface| interface.id == id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &InterfaceConfig> {
+        self.entries.iter().flatten()
+    }
+
+    pub(crate) fn at_slot(&self, slot: usize) -> Option<&InterfaceConfig> {
+        self.entries.get(slot).and_then(Option::as_ref)
+    }
+
+    /// Insert a descriptor in the first free slot, rejecting duplicate IDs and
+    /// a full registry. Existing entries stay in place. This does not validate
+    /// the descriptor; use [`InterfaceRegistry::validate`] before applying the registry,
+    /// or `LiteNode::register_interface` for a live node.
+    pub fn register(&mut self, interface: InterfaceConfig) -> Result<(), ConfigError> {
+        if self.get(interface.id).is_some() {
+            return Err(ConfigError::DuplicateInterfaceId);
+        }
+        let Some(slot) = self.entries.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(ConfigError::InterfaceRegistryFull);
+        };
+        *slot = Some(interface);
+        Ok(())
+    }
+
+    pub fn set_online(&mut self, id: InterfaceId, online: bool) -> Result<(), ConfigError> {
+        let Some(interface) = self.get_mut(id) else {
+            return Err(ConfigError::UnknownInterface);
+        };
+        interface.online = online;
+        Ok(())
+    }
+
+    pub fn unregister(&mut self, id: InterfaceId) -> Result<InterfaceConfig, ConfigError> {
+        let Some(slot) = self
+            .entries
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|interface| interface.id == id))
+        else {
+            return Err(ConfigError::UnknownInterface);
+        };
+        slot.take().ok_or(ConfigError::UnknownInterface)
+    }
+
+    #[allow(clippy::collapsible_if, clippy::question_mark)]
+    pub const fn validate(&self, total_queue_depth: usize) -> Result<(), ConfigError> {
+        let mut idx = 0;
+        while idx < MAX_INTERFACES {
+            if let Some(interface) = self.entries[idx] {
+                if let Err(error) = interface.validate(total_queue_depth) {
+                    return Err(error);
+                }
+                let mut other_idx = idx + 1;
+                while other_idx < MAX_INTERFACES {
+                    if let Some(other) = self.entries[other_idx] {
+                        if other.id == interface.id {
+                            return Err(ConfigError::DuplicateInterfaceId);
+                        }
+                    }
+                    other_idx += 1;
+                }
+            }
+            idx += 1;
+        }
+        Ok(())
+    }
+}
+
+impl Default for InterfaceRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LiteConfig {
     pub mode: InterfaceMode,
@@ -196,6 +557,15 @@ pub enum ConfigError {
     UnsupportedMtu,
     MduExceedsMtu,
     InvalidIfacSize,
+    DuplicateInterfaceId,
+    InterfaceRegistryFull,
+    UnknownInterface,
+    InterfaceHasNoDirection,
+    InvalidInterfaceDirection,
+    InvalidInterfaceMtu,
+    InvalidInterfaceQueueDepth,
+    CannotRemoveLastInterface,
+    InterfaceGenerationExhausted,
 }
 
 #[cfg(test)]

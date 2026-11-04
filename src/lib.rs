@@ -27,6 +27,7 @@ pub mod known_destinations;
 pub mod link;
 pub mod link_session;
 pub mod lora;
+pub mod model;
 pub mod packet_buffer;
 pub mod proof;
 pub mod ratchet;
@@ -41,7 +42,10 @@ pub use announce_state::{
     ANNOUNCE_TIME_MAX, ANNOUNCE_WIRE_STATE_BLOB_LEN, AnnounceWireError, AnnounceWireState,
 };
 pub use auto::{AutoError, IPV6_TEXT_MAX, beacon_token, format_ipv6, multicast_group_for};
-pub use config::{ConfigError, IfacConfig, InterfaceMode, LiteConfig, TableCaps};
+pub use config::{
+    ConfigError, IfacConfig, InterfaceConfig, InterfaceDirection, InterfaceMode, InterfaceRegistry,
+    InterfaceRole, LiteConfig, TableCaps,
+};
 pub use identity::{AnnounceError, AnnounceView, LocalIdentity, compose_random_hash};
 pub use ifac::{
     IFAC_FLAG, IFAC_KEY_LENGTH, IFAC_LORA_DEFAULT_SIZE, IfacError, derive_ifac_key, has_ifac_flag,
@@ -55,11 +59,13 @@ pub use link::{
     LINK_MDU, LinkError, LinkKeys, LinkProofView, LinkRequestView, SignallingData,
     build_link_proof, build_link_request, compute_link_id, link_decrypt, link_encrypt, link_mdu,
 };
+pub use model::{Endpoint, Router, RouterStats};
 pub use resource::{
     InboundResource, InboundState, OutboundResource, PartRequestView, ResourceAdv, ResourceError,
     ResourceFlags, WindowState, compute_expected_proof, compute_resource_hash, get_map_hash,
 };
 pub use transport::{
-    IngestAction, LiteNode, MicroNode, OutboundFrame, OutboundReason, RxMeta, SmallNode,
-    TransportError, TransportStats, path_request_destination,
+    IngestAction, LiteNode, LocalSlot, MicroNode, OutboundFrame, OutboundReason,
+    RouterOutboundFrame, RxMeta, SmallNode, TransportError, TransportStats,
+    path_request_destination,
 };
