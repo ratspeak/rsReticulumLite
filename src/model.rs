@@ -9,7 +9,10 @@ use crate::config::{IfacConfig, InterfaceConfig, InterfaceRegistry, InterfaceRol
 use crate::discovery::REQUESTERS;
 use crate::lora::LoraModemConfig;
 use crate::tables::InterfaceId;
-use crate::transport::{InterfaceFacts, OutboundDelivery, RxMeta};
+use crate::transport::{
+    ENDPOINT_LOCAL_SLOTS, InterfaceFacts, LOCAL_LINKS_MAX, LocalSlot, OutboundDelivery,
+    ROUTER_LOCAL_SLOTS, RxMeta, WATCHED_DESTINATIONS_MAX,
+};
 
 mod sealed {
     pub trait Sealed {}
@@ -19,7 +22,12 @@ mod sealed {
 /// Sealed to the two built-in models so interface and delivery policies cannot disagree.
 pub trait Model: sealed::Sealed + Clone + core::fmt::Debug + PartialEq + Eq {
     type Delivery: Copy + core::fmt::Debug + PartialEq + Eq;
+    /// Own destination and local Link slot pool.
+    type Local: Copy + core::fmt::Debug + PartialEq + Eq + AsRef<[LocalSlot]> + AsMut<[LocalSlot]>;
     const EMPTY: Self;
+    const LOCAL_EMPTY: Self::Local;
+    /// Local Links admitted at once.
+    const LOCAL_LINKS_MAX: usize;
     const ROUTER: bool;
     fn delivery(&self, identity: u64, interface: InterfaceId) -> Self::Delivery;
     fn delivery_is_current(&self, interface: InterfaceId, delivery: Self::Delivery) -> bool;
@@ -51,9 +59,13 @@ impl sealed::Sealed for Endpoint {}
 
 impl Model for Endpoint {
     type Delivery = OutboundDelivery;
+    type Local = [LocalSlot; ENDPOINT_LOCAL_SLOTS];
     const EMPTY: Self = Self {
         facts: [InterfaceFacts::EMPTY; REQUESTERS],
     };
+    const LOCAL_EMPTY: Self::Local = [LocalSlot::Empty; ENDPOINT_LOCAL_SLOTS];
+    // Shared pool without a separate Link cap.
+    const LOCAL_LINKS_MAX: usize = ENDPOINT_LOCAL_SLOTS;
     const ROUTER: bool = false;
 
     fn delivery(&self, identity: u64, _interface: InterfaceId) -> Self::Delivery {
@@ -125,6 +137,8 @@ pub struct Router {
     pub(crate) announce_gates: [AnnounceGate; REQUESTERS],
     pub(crate) lora_modem: Option<LoraModemConfig>,
     pub(crate) plain_sink: Option<[u8; 16]>,
+    pub(crate) watched: [[u8; 16]; WATCHED_DESTINATIONS_MAX],
+    pub(crate) watched_len: u8,
     pub(crate) stats: RouterStats,
 }
 impl sealed::Sealed for Router {}
@@ -138,6 +152,8 @@ impl Router {
             announce_gates: [AnnounceGate::OPEN; REQUESTERS],
             lora_modem,
             plain_sink: None,
+            watched: [[0; 16]; WATCHED_DESTINATIONS_MAX],
+            watched_len: 0,
             stats: RouterStats {
                 interface_dropped: 0,
                 mtu_dropped: 0,
@@ -153,6 +169,14 @@ impl Router {
         self.registry.get(id).copied()
     }
 
+    pub fn watched_destinations(&self) -> &[[u8; 16]] {
+        &self.watched[..usize::from(self.watched_len)]
+    }
+
+    pub(crate) fn watches(&self, destination: &[u8; 16]) -> bool {
+        self.watched_destinations().contains(destination)
+    }
+
     pub fn generation(&self, id: InterfaceId) -> u64 {
         self.registry
             .slot(id)
@@ -162,7 +186,10 @@ impl Router {
 
 impl Model for Router {
     type Delivery = u64;
+    type Local = [LocalSlot; ROUTER_LOCAL_SLOTS];
     const EMPTY: Self = Self::new(InterfaceRegistry::new(), None);
+    const LOCAL_EMPTY: Self::Local = [LocalSlot::Empty; ROUTER_LOCAL_SLOTS];
+    const LOCAL_LINKS_MAX: usize = LOCAL_LINKS_MAX;
     const ROUTER: bool = true;
     fn delivery(&self, _identity: u64, interface: InterfaceId) -> Self::Delivery {
         self.generation(interface)

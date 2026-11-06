@@ -1562,3 +1562,193 @@ fn link_request_route_retention_samples_registered_bitrate_once() {
         assert!(!node.router_outbound_is_live(1, held.lifetime, held.target_generation, deadline));
     }
 }
+
+fn ingest_watch(
+    node: &mut TestRouter,
+    raw: &[u8],
+    interface: InterfaceId,
+    now_ms: u64,
+) -> (IngestAction, PacketBuffer) {
+    let mut endpoint = PacketBuffer::new();
+    let action = node
+        .ingest_endpoint(raw, RxMeta::new(interface), now_ms, &mut endpoint)
+        .unwrap();
+    (action, endpoint)
+}
+
+fn with_context(raw: &PacketBuffer, context: PacketContext) -> PacketBuffer {
+    let view = PacketView::parse(raw.as_slice()).unwrap();
+    let mut header = view.header;
+    header.context = context;
+    build_packet(header, view.payload).unwrap()
+}
+
+fn drain(node: &mut TestRouter, interface: InterfaceId) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    while let Some(frame) = node.poll_tx_for_interface(interface) {
+        frames.push(frame.packet.as_slice().to_vec());
+    }
+    frames
+}
+
+#[test]
+fn two_own_destinations_and_six_links_share_the_router_pool() {
+    let (manage, delivery) = ([0x6D; 16], [0x6E; 16]);
+    let mut node = node();
+    assert!(node.register_local_destination(manage));
+    assert!(node.register_local_destination(delivery));
+    for index in 0..LOCAL_LINKS_MAX as u8 {
+        assert!(node.register_local_link([index; 16]));
+    }
+    assert_eq!(node.local_link_count(), LOCAL_LINKS_MAX);
+    // The Link cap holds even with free slots; a registered Link stays idempotent.
+    assert!(!node.register_local_link([0xEE; 16]));
+    assert!(node.register_local_link([0; 16]));
+    assert!(node.is_own_destination(&manage) && node.is_own_destination(&delivery));
+    assert_eq!(
+        node.own_destinations().collect::<Vec<_>>(),
+        [manage, delivery]
+    );
+    assert_eq!(node.own_destination(), None);
+
+    for (index, destination) in [manage, delivery].into_iter().enumerate() {
+        let request = link_request(destination, 0);
+        let (action, _) = endpoint_ingest(&mut node, request.as_slice(), 1_000 + index as u64);
+        assert_eq!(action, IngestAction::LocalEndpoint);
+    }
+    for index in 0..LOCAL_LINKS_MAX as u8 {
+        let packet = link_packet([index; 16], 0, PacketContext::None);
+        let (action, endpoint) = endpoint_ingest(&mut node, packet.as_slice(), 1_100);
+        assert_eq!(action, IngestAction::LocalEndpoint);
+        assert_eq!(&endpoint.as_slice()[2..18], &[index; 16]);
+    }
+
+    node.unregister_local_destination(&manage);
+    assert_eq!(node.own_destination(), Some(delivery));
+    node.unregister_local_link(&[0; 16]);
+    assert!(node.register_local_link([0xEE; 16]));
+    // `set_own_destination` replaces every destination and keeps the Links.
+    assert!(node.register_local_destination(manage));
+    node.set_own_destination(Some([0x70; 16]));
+    assert_eq!(node.own_destinations().collect::<Vec<_>>(), [[0x70; 16]]);
+    assert_eq!(node.local_link_count(), LOCAL_LINKS_MAX);
+}
+
+#[test]
+fn path_requests_for_every_own_destination_reach_the_endpoint() {
+    let destinations = [[0x6D; 16], [0x6E; 16]];
+    let mut node = node();
+    for destination in destinations {
+        assert!(node.register_local_destination(destination));
+    }
+    for (index, destination) in destinations.into_iter().enumerate() {
+        let request = path_request(destination, [0x7E + index as u8; 16]);
+        let (action, endpoint) = endpoint_ingest(&mut node, request.as_slice(), 1_000);
+        assert_eq!(action, IngestAction::LocalEndpoint);
+        assert_eq!(&endpoint.as_slice()[19..35], &destination);
+    }
+    assert_eq!(node.outbound_len(), 0);
+    assert_eq!(
+        endpoint_ingest(
+            &mut node,
+            path_request([0x12; 16], [0x7E; 16]).as_slice(),
+            1_100
+        )
+        .0,
+        IngestAction::ForwardedPathRequest
+    );
+}
+
+#[test]
+fn watched_announces_surface_once_without_changing_routing() {
+    let manager = signed_announce([0x2B; 32], "lxmf.delivery", b"\x93\xc4\x01m\x08\x90");
+    let stranger = signed_announce([0x2C; 32], "lxmf.delivery", b"other");
+    let mut watched = gateway_node(1000);
+    let mut plain = gateway_node(1000);
+    assert!(watched.set_watched_destinations(&[manager.destination_hash]));
+    assert_eq!(watched.watched_destinations(), [manager.destination_hash]);
+
+    let (action, endpoint) = ingest_watch(&mut watched, manager.raw.as_slice(), LORA, 1_000);
+    assert_eq!(action, IngestAction::WatchedAnnounce { scheduled: true });
+    let mut expected = manager.raw;
+    expected.as_mut_slice()[1] = 1;
+    assert_eq!(endpoint.as_slice(), expected.as_slice());
+    assert_eq!(
+        heard(&mut plain, &manager, LORA, 1_000),
+        IngestAction::ScheduledAnnounce
+    );
+    // The same emission again updates nothing, so it is not surfaced a second time.
+    let (action, endpoint) = ingest_watch(&mut watched, manager.raw.as_slice(), UPLINK, 1_050);
+    assert_eq!(action, IngestAction::AnnounceIgnored);
+    assert!(endpoint.as_slice().is_empty());
+    heard(&mut plain, &manager, UPLINK, 1_050);
+    // Strangers keep their ordinary action and leave the buffer empty.
+    let (action, endpoint) = ingest_watch(&mut watched, stranger.raw.as_slice(), LORA, 1_060);
+    assert_eq!(action, IngestAction::ScheduledAnnounce);
+    assert!(endpoint.as_slice().is_empty());
+    heard(&mut plain, &stranger, LORA, 1_060);
+    // A host ingesting without an endpoint buffer sees the ordinary action.
+    let renewed = signed_announce_rh([0x2B; 32], "lxmf.delivery", b"\xc0", [0xBD; 10]);
+    assert_eq!(
+        heard(&mut watched, &renewed, LORA, 1_070),
+        IngestAction::ScheduledAnnounce
+    );
+    heard(&mut plain, &renewed, LORA, 1_070);
+
+    let mut forwarded = 0;
+    for now_ms in [2_000, 8_000, 20_000] {
+        watched.tick(now_ms);
+        plain.tick(now_ms);
+        for interface in [LORA, UPLINK] {
+            let frames = drain(&mut watched, interface);
+            forwarded += frames.len();
+            assert_eq!(frames, drain(&mut plain, interface));
+        }
+    }
+    assert!(forwarded > 0);
+    for destination in [manager.destination_hash, stranger.destination_hash] {
+        assert_eq!(
+            watched.path(&destination, 20_000),
+            plain.path(&destination, 20_000)
+        );
+    }
+    assert_eq!(watched.stats(), plain.stats());
+}
+
+#[test]
+fn watched_path_responses_surface_and_invalid_announces_do_not() {
+    let manager = signed_announce([0x2D; 32], "lxmf.delivery", b"m");
+    let mut node = gateway_node(1000);
+    assert!(node.set_watched_destinations(&[[0x01; 16], manager.destination_hash]));
+
+    let mut forged = manager.raw.as_slice().to_vec();
+    let last = forged.len() - 1;
+    forged[last] ^= 1;
+    let mut endpoint = PacketBuffer::new();
+    assert!(
+        node.ingest_endpoint(&forged, RxMeta::new(LORA), 1_000, &mut endpoint)
+            .is_err()
+    );
+    assert!(endpoint.as_slice().is_empty());
+    assert!(!node.has_path(&manager.destination_hash, 1_000));
+
+    let response = with_context(&manager.raw, PacketContext::PathResponse);
+    let (action, endpoint) = ingest_watch(&mut node, response.as_slice(), UPLINK, 1_100);
+    assert_eq!(action, IngestAction::WatchedAnnounce { scheduled: false });
+    assert_eq!(&endpoint.as_slice()[2..18], &manager.destination_hash);
+    assert_eq!(
+        node.cached_announce(&manager.destination_hash, 1_100),
+        Some(response.as_slice())
+    );
+    node.tick(2_000);
+    assert!(node.poll_tx_for_interface(LORA).is_none());
+
+    assert!(!node.set_watched_destinations(&[[0x02; 16]; 5]));
+    assert_eq!(node.watched_destinations().len(), 2);
+    assert!(node.set_watched_destinations(&[]));
+    let renewed = signed_announce_rh([0x2D; 32], "lxmf.delivery", b"m", [0xBD; 10]);
+    assert!(matches!(
+        ingest_watch(&mut node, renewed.raw.as_slice(), LORA, 2_100).0,
+        IngestAction::LearnedAnnounce | IngestAction::ScheduledAnnounce
+    ));
+}

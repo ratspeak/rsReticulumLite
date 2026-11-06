@@ -43,12 +43,17 @@ pub type Esp32PsramNode = LiteNode<1024, 2048, 128, 128, 64, 256, 128, KNOWN_DES
 /// construction temporaries and available device memory before allocating it.
 pub type MicroNode = LiteNode<48, 64, 8, 8, 4, 8, 8, KNOWN_DESTINATIONS_MICRO>;
 
-/// Fixed slot count for a node's own registered destination hashes (endpoint destinations
-/// living on the same device as the relay, e.g. lxmf.delivery — one per local identity).
-pub const OWN_DESTINATIONS_MAX: usize = 4;
-pub const LOCAL_LINKS_MAX: usize = 3;
+/// Endpoint local slots, shared by own destinations and local Links without a Link cap.
+pub const ENDPOINT_LOCAL_SLOTS: usize = 4;
+/// Router local slots: [`LOCAL_LINKS_MAX`] Links plus at least two own destinations.
+pub const ROUTER_LOCAL_SLOTS: usize = 8;
+/// Local Links a router admits at once; [`LiteNode::register_local_link`] enforces it so
+/// Links never take the slots its own destinations need.
+pub const LOCAL_LINKS_MAX: usize = 6;
+/// Destinations whose learned announces a router surfaces to its host.
+pub const WATCHED_DESTINATIONS_MAX: usize = 4;
 
-/// Local ownership slots share the endpoint's existing 68-byte budget.
+/// Own destination or local Link ownership slot; the pool size is the model's.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalSlot {
     Empty,
@@ -253,6 +258,12 @@ pub enum IngestAction {
     ForwardedProof,
     LocalEndpoint,
     LocalPlain,
+    /// Router [`LiteNode::ingest_endpoint`] only: a signature-valid announce for a watched
+    /// destination that updated its path, copied to the endpoint buffer. Routing is unchanged;
+    /// `scheduled` is true where the action would otherwise be `ScheduledAnnounce`.
+    WatchedAnnounce {
+        scheduled: bool,
+    },
     Dropped,
 }
 
@@ -385,7 +396,7 @@ pub struct LiteNode<
     #[doc(hidden)]
     pub transport_id: Hash16,
     #[doc(hidden)]
-    pub local: [LocalSlot; OWN_DESTINATIONS_MAX],
+    pub local: M::Local,
     #[doc(hidden)]
     pub announce_admission: AnnounceAdmission,
     #[doc(hidden)]
@@ -481,7 +492,7 @@ impl<
             config,
             clock_ms: 0,
             transport_id,
-            local: [LocalSlot::Empty; OWN_DESTINATIONS_MAX],
+            local: M::LOCAL_EMPTY,
             announce_admission: AnnounceAdmission::new(),
             known_destinations: KnownDestinations::new(),
             packet_hashes: PacketHashTable::new(),
@@ -535,16 +546,31 @@ impl<
         self.register_local_slot(LocalSlot::Destination(destination_hash))
     }
 
+    /// Idempotent; false when the pool is full or, on a router, [`LOCAL_LINKS_MAX`] Links
+    /// are already registered.
     pub fn register_local_link(&mut self, link_id: Hash16) -> bool {
-        self.register_local_slot(LocalSlot::Link(link_id))
+        let value = LocalSlot::Link(link_id);
+        if !self.local.as_ref().contains(&value) && self.local_link_count() >= M::LOCAL_LINKS_MAX {
+            return false;
+        }
+        self.register_local_slot(value)
+    }
+
+    pub fn local_link_count(&self) -> usize {
+        self.local
+            .as_ref()
+            .iter()
+            .filter(|slot| matches!(slot, LocalSlot::Link(_)))
+            .count()
     }
 
     fn register_local_slot(&mut self, value: LocalSlot) -> bool {
-        if self.local.contains(&value) {
+        if self.local.as_ref().contains(&value) {
             return true;
         }
         if let Some(slot) = self
             .local
+            .as_mut()
             .iter_mut()
             .find(|slot| **slot == LocalSlot::Empty)
         {
@@ -556,7 +582,7 @@ impl<
     }
 
     pub fn unregister_local_destination(&mut self, destination: &Hash16) {
-        for slot in &mut self.local {
+        for slot in self.local.as_mut() {
             if *slot == LocalSlot::Destination(*destination) {
                 *slot = LocalSlot::Empty;
             }
@@ -564,7 +590,7 @@ impl<
     }
 
     pub fn unregister_local_link(&mut self, link: &Hash16) {
-        for slot in &mut self.local {
+        for slot in self.local.as_mut() {
             if *slot == LocalSlot::Link(*link) {
                 *slot = LocalSlot::Empty;
             }
@@ -572,20 +598,39 @@ impl<
     }
 
     pub fn is_own_destination(&self, destination: &Hash16) -> bool {
-        self.local.contains(&LocalSlot::Destination(*destination))
+        self.local
+            .as_ref()
+            .contains(&LocalSlot::Destination(*destination))
+    }
+
+    /// Registered own destinations, in slot order.
+    pub fn own_destinations(&self) -> impl Iterator<Item = Hash16> {
+        self.local.as_ref().iter().filter_map(|slot| match slot {
+            LocalSlot::Destination(destination) => Some(*destination),
+            _ => None,
+        })
     }
 
     pub fn clear_local(&mut self) {
-        self.local.fill(LocalSlot::Empty);
+        self.local.as_mut().fill(LocalSlot::Empty);
     }
 
     /// Remove destination ownership without disturbing independently owned local Links.
     pub fn clear_own_destinations(&mut self) {
-        for slot in &mut self.local {
+        for slot in self.local.as_mut() {
             if matches!(slot, LocalSlot::Destination(_)) {
                 *slot = LocalSlot::Empty;
             }
         }
+    }
+
+    /// The signed announce behind a live path, with its received wire hops, for hosts that
+    /// need app data learned before they watched the destination.
+    pub fn cached_announce(&self, destination_hash: &Hash16, now_ms: u64) -> Option<&[u8]> {
+        self.paths.get_live(destination_hash, now_ms)?;
+        self.announce_cache
+            .get(destination_hash, now_ms)
+            .map(|cached| cached.raw.as_slice())
     }
 
     /// Clear runtime traffic state in place while keeping all incarnation counters monotonic.
@@ -608,6 +653,8 @@ impl<
                 .fill(crate::announce_cap::AnnounceGate::OPEN);
             router.stats = RouterStats::default();
             router.plain_sink = None;
+            router.watched = [[0; 16]; WATCHED_DESTINATIONS_MAX];
+            router.watched_len = 0;
         }
         self.config = config;
         self.transport_id = transport_id;
@@ -1261,6 +1308,7 @@ impl<
                 && (local_link == Some(&view.header.destination_hash)
                     || self
                         .local
+                        .as_ref()
                         .contains(&LocalSlot::Link(view.header.destination_hash))));
         if !view.header.context.skip_hashlist() && !defer_hashlist {
             let hash = packet_hash(raw, view.header.flags.header_type);
@@ -1295,6 +1343,7 @@ impl<
                 && ((header.flags.destination_type == DestinationType::Link
                     && self
                         .local
+                        .as_ref()
                         .contains(&LocalSlot::Link(header.destination_hash)))
                     || (header.flags.destination_type == DestinationType::Single
                         && self.is_own_destination(&header.destination_hash))))
@@ -1331,6 +1380,23 @@ impl<
 
         if result == Ok(IngestAction::LocalEndpoint) {
             return Self::capture_endpoint(raw, header.hops, endpoint);
+        }
+        // As upstream announce handlers: only an announce that updated the path, so a
+        // replayed or older copy cannot overwrite what the host learned.
+        if let Ok(learned @ (IngestAction::LearnedAnnounce | IngestAction::ScheduledAnnounce)) =
+            result
+        {
+            if self
+                .interfaces
+                .router()
+                .is_some_and(|router| router.watches(&header.destination_hash))
+                && endpoint.is_some()
+                && Self::capture_endpoint(raw, header.hops, endpoint).is_ok()
+            {
+                return Ok(IngestAction::WatchedAnnounce {
+                    scheduled: learned == IngestAction::ScheduledAnnounce,
+                });
+            }
         }
         if matches!(result, Err(TransportError::Announce(_))) {
             self.stats.validation_failures = self.stats.validation_failures.saturating_add(1);
@@ -2953,9 +3019,9 @@ mod tests {
             action,
             IngestAction::LearnedAnnounce | IngestAction::ScheduledAnnounce
         ));
-        // Registration is idempotent and bounded to OWN_DESTINATIONS_MAX slots.
+        // Registration is idempotent and bounded to ENDPOINT_LOCAL_SLOTS slots.
         assert!(node.register_own_destination(ann.destination_hash));
-        for i in 0..(OWN_DESTINATIONS_MAX - 1) {
+        for i in 0..(ENDPOINT_LOCAL_SLOTS - 1) {
             assert!(node.register_own_destination([i as u8; 16]));
         }
         assert!(!node.register_own_destination([0x99u8; 16]));
@@ -5543,6 +5609,34 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_local_pool_and_announce_actions_are_unchanged() {
+        assert_eq!(core::mem::size_of::<<Endpoint as Model>::Local>(), 68);
+        let mut node =
+            SmallNode::new(LiteConfig::ESP32_LORA_TRANSPORT_SMALL, TRANSPORT_ID).unwrap();
+        // The four shared slots still take Links alone; there is no separate Link cap.
+        for i in 0..ENDPOINT_LOCAL_SLOTS as u8 {
+            assert!(node.register_local_link([i; 16]));
+        }
+        assert!(!node.register_local_link([0xEE; 16]));
+        assert!(!node.register_local_destination([0xDD; 16]));
+        node.clear_local();
+        assert!(node.register_own_destination([0x01; 16]));
+        assert!(node.register_own_destination([0x02; 16]));
+        assert_eq!(node.own_destinations().count(), 2);
+        // No watch list exists on an endpoint: announces keep their ordinary actions.
+        let ann = signed_announce([0x31u8; 32], "lxmf.delivery", b"peer");
+        let mut endpoint = PacketBuffer::new();
+        let action = node
+            .ingest_endpoint(ann.raw.as_slice(), RxMeta::new(IFACE), 1000, &mut endpoint)
+            .unwrap();
+        assert!(matches!(
+            action,
+            IngestAction::LearnedAnnounce | IngestAction::ScheduledAnnounce
+        ));
+        assert!(endpoint.as_slice().is_empty());
+    }
+
+    #[test]
     fn endpoint_layout_and_transit_key_storage_remain_bounded() {
         assert_eq!(core::mem::size_of::<MicroNode>(), 32664);
         assert_eq!(core::mem::size_of::<SmallNode>(), 202040);
@@ -5550,11 +5644,11 @@ mod tests {
         type ConstrainedRouter = LiteNode<16, 64, 16, 8, 4, 16, 8, 0, 4, Router>;
         type PsramRouter = LiteNode<128, 512, 32, 32, 16, 64, 16, 0, 16, Router>;
         if cfg!(target_pointer_width = "64") {
-            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 24848);
-            assert_eq!(core::mem::size_of::<PsramRouter>(), 90448);
+            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 24984);
+            assert_eq!(core::mem::size_of::<PsramRouter>(), 90584);
         } else if cfg!(target_pointer_width = "32") {
-            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 24504);
-            assert_eq!(core::mem::size_of::<PsramRouter>(), 89816);
+            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 24632);
+            assert_eq!(core::mem::size_of::<PsramRouter>(), 89944);
         }
     }
 

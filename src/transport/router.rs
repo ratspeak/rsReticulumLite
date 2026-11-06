@@ -74,18 +74,38 @@ impl<
         Ok(())
     }
 
-    /// Replace local destination ownership while preserving independently registered Links.
+    /// Replace ALL own destinations with at most one, keeping registered Links. Hosts serving
+    /// several destinations use `register_local_destination`/`unregister_local_destination`.
     pub fn set_own_destination(&mut self, destination: Option<Hash16>) {
         self.clear_own_destinations();
         if let Some(destination) = destination {
             self.register_local_destination(destination);
         }
     }
+    /// The sole own destination: `None` when none or several are registered.
     pub fn own_destination(&self) -> Option<Hash16> {
-        self.local.iter().find_map(|slot| match slot {
-            LocalSlot::Destination(destination) => Some(*destination),
+        let mut destinations = self.own_destinations();
+        match (destinations.next(), destinations.next()) {
+            (Some(destination), None) => Some(destination),
             _ => None,
-        })
+        }
+    }
+
+    /// Replace the destinations whose path-updating announces `ingest_endpoint` also copies to
+    /// the host as [`IngestAction::WatchedAnnounce`]. Not retroactive: a path learned earlier
+    /// is in [`Self::cached_announce`]. False, unchanged, beyond [`WATCHED_DESTINATIONS_MAX`].
+    pub fn set_watched_destinations(&mut self, destinations: &[Hash16]) -> bool {
+        if destinations.len() > WATCHED_DESTINATIONS_MAX {
+            return false;
+        }
+        let router = &mut self.interfaces;
+        router.watched = [[0; 16]; WATCHED_DESTINATIONS_MAX];
+        router.watched[..destinations.len()].copy_from_slice(destinations);
+        router.watched_len = destinations.len() as u8;
+        true
+    }
+    pub fn watched_destinations(&self) -> &[Hash16] {
+        self.interfaces.watched_destinations()
     }
     pub fn set_local_plain_sink(&mut self, destination: Option<Hash16>) {
         self.interfaces.plain_sink = destination;
