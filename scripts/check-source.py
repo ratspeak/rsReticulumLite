@@ -58,7 +58,8 @@ def check_metadata() -> None:
         "name": "rns-lite-core",
         "version": EXPECTED_VERSION,
         "rust_version": EXPECTED_RUST_VERSION,
-        "license": "AGPL-3.0-or-later",
+        "license": None,
+        "license_file": "LICENSE",
         "repository": REPOSITORY,
     }
     for key, value in expected.items():
