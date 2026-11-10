@@ -15,8 +15,8 @@ use crate::discovery::{
     BeginDiscovery, Discoveries, REQUEST_GATE_MS, REQUESTERS, discovery_timeout, link_deadline,
 };
 use crate::identity::{
-    AnnounceError, AnnounceView, LXMF_DELIVERY_NAME, SIGNED_DATA_MAX, destination_hash_from_name,
-    name_hash,
+    AnnounceError, AnnounceStampCheck, AnnounceView, LXMF_DELIVERY_NAME, SIGNED_DATA_MAX,
+    destination_hash_from_name, name_hash,
 };
 use crate::ifac::{IfacError, has_ifac_flag, ifac_sign_into, ifac_verify_into};
 use crate::known_destinations::{
@@ -708,6 +708,22 @@ impl<
             .learn(destination_hash, public_key, now)
     }
 
+    /// Link-request cost a delivery destination last announced, in fixed point.
+    pub fn known_destination_link_cost_fp(&self, destination_hash: &Hash16) -> Option<u16> {
+        self.known_destinations.link_cost_fp(destination_hash)
+    }
+
+    /// Check an announce's stamp extension against this node's `destination_cost_fp`.
+    /// Use [`AnnounceStampCheck::app_data`] on `announce.signed_app_data` for the app_data
+    /// upstream hands to announce handlers; relayed bytes are never changed.
+    pub fn announce_stamp_check(
+        &self,
+        destination_hash: &Hash16,
+        announce: &AnnounceView<'_>,
+    ) -> AnnounceStampCheck {
+        announce.check_stamp(destination_hash, self.config.destination_cost_fp)
+    }
+
     pub const fn known_destination_count(&self) -> usize {
         self.known_destinations.len()
     }
@@ -756,7 +772,7 @@ impl<
     }
 
     /// Build a path request with a caller-supplied random 16-byte tag and attempt to queue it.
-    /// Payload is `dest_hash || [transport_id when transport is enabled] || tag`, addressed to
+    /// Payload is `dest_hash || transport_id || tag`, as every 1.6.0 node sends it, addressed to
     /// `rnstransport.path.request`. A successful queue attempt records the tag for echo filtering.
     /// Queue refusal returns a typed error. `Ok(())` confirms admission only, not
     /// transmission or a discovered path.
@@ -771,7 +787,7 @@ impl<
     ) -> Result<(), TransportError> {
         self.clock_ms = now_ms;
         self.expire_outbound(now_ms);
-        let request = self.build_path_request(*destination_hash, tag)?;
+        let request = self.build_path_request(*destination_hash, tag, None)?;
         // Send before recording: a request that never queued must not burn the
         // duplicate gate or register its tag (trusted send-before-record ordering).
         if !self.enqueue(interface_id, request, OutboundReason::PathRequest) {
@@ -1457,8 +1473,13 @@ impl<
         // Python remembers every validated announce, replays and path responses included,
         // before it decides the path (Transport.py:2172, Identity.py:589), as trusted inbound.rs.
         if KNOWN_DESTINATIONS != 0 && announce.name_hash == name_hash(LXMF_DELIVERY_NAME) {
-            self.known_destinations
-                .learn(header.destination_hash, announce.public_key, now_ms)?;
+            let stamp = self.announce_stamp_check(&header.destination_hash, &announce);
+            self.known_destinations.learn_announce(
+                header.destination_hash,
+                announce.public_key,
+                now_ms,
+                stamp.lr_cost_fp,
+            )?;
         }
         // Trusted inbound.rs announce gate on POST-INCREMENT hops, a deliberate tightening beyond
         // Python's `< M+1`: a path stored at PATHFINDER_M hops is provably dead under the parse
@@ -1610,31 +1631,25 @@ impl<
     ) -> Result<IngestAction, TransportError> {
         let interface_id = meta.interface_id;
         let mode = meta.interface_mode.unwrap_or(self.config.mode);
-        if payload.len() <= 16 {
+        // Transport.py:2073-2086@1.6.0: tagless, oversized and odd-length requests are dropped.
+        if !matches!(
+            payload.len(),
+            PR_LEGACY_LENGTH | PR_LENGTH | PR_STAMPED_LENGTH
+        ) {
             self.stats.dropped = self.stats.dropped.saturating_add(1);
             return Ok(IngestAction::Dropped);
         }
 
         let mut requested = [0u8; 16];
         requested.copy_from_slice(&payload[..16]);
-
-        let requestor_transport_id = if payload.len() > 32 {
+        let (requestor_transport_id, tag, ext) = if payload.len() == PR_LEGACY_LENGTH {
+            (None, &payload[16..32], None)
+        } else {
             let mut id = [0u8; 16];
             id.copy_from_slice(&payload[16..32]);
-            Some(id)
-        } else {
-            None
+            let ext = <&[u8; PR_EXT_PAYLOAD_LENGTH]>::try_from(&payload[PR_LENGTH..]).ok();
+            (Some(id), &payload[32..48], ext)
         };
-
-        let tag = if payload.len() > 32 {
-            &payload[32..payload.len().min(48)]
-        } else {
-            &payload[16..payload.len().min(32)]
-        };
-        if tag.is_empty() {
-            self.stats.dropped = self.stats.dropped.saturating_add(1);
-            return Ok(IngestAction::Dropped);
-        }
 
         let mut tag_key = [0u8; 32];
         tag_key[..16].copy_from_slice(&requested);
@@ -1688,7 +1703,7 @@ impl<
         }
 
         if M::ROUTER && self.is_local_client_interface(interface_id) {
-            let request = self.build_path_request(requested, tag)?;
+            let request = self.build_path_request(requested, tag, ext)?;
             return Ok(
                 if self.enqueue_packet_broadcast(
                     interface_id,
@@ -1718,7 +1733,7 @@ impl<
                     return Ok(IngestAction::Dropped);
                 }
                 BeginDiscovery::New(identity) => {
-                    let request = self.build_path_request(requested, tag)?;
+                    let request = self.build_path_request(requested, tag, ext)?;
                     let lifetime = OutboundLifetime {
                         enqueued_ms: now_ms,
                         expires_ms: now_ms
@@ -1743,7 +1758,7 @@ impl<
         }
 
         if M::ROUTER {
-            let request = self.build_path_request(requested, tag)?;
+            let request = self.build_path_request(requested, tag, ext)?;
             if self.enqueue_packet_broadcast(
                 interface_id,
                 request,
@@ -2238,15 +2253,18 @@ impl<
         &self,
         destination_hash: Hash16,
         tag: &[u8],
+        ext: Option<&[u8; PR_EXT_PAYLOAD_LENGTH]>,
     ) -> Result<PacketBuffer, TransportError> {
+        // Transport.py:3699-3704@1.6.0: dst | own transport id | tag | received extension.
         let mut payload: PacketBuffer = PacketBuffer::new();
         payload.extend_from_slice(&destination_hash)?;
-        if self.config.transport_enabled {
-            payload.extend_from_slice(&self.transport_id)?;
-        }
+        payload.extend_from_slice(&self.transport_id)?;
         let mut tag_buf = [0u8; 16];
         tag_buf[..tag.len().min(16)].copy_from_slice(&tag[..tag.len().min(16)]);
         payload.extend_from_slice(&tag_buf)?;
+        if let Some(ext) = ext {
+            payload.extend_from_slice(ext)?;
+        }
 
         let flags = PacketFlags {
             header_type: HeaderType::Header1,
@@ -2603,6 +2621,12 @@ impl<
         self.expire_outbound(self.clock_ms);
     }
 }
+
+/// Path-request payload lengths (Transport.py:3975-3980@1.6.0).
+pub const PR_LEGACY_LENGTH: usize = 32;
+pub const PR_LENGTH: usize = 48;
+pub const PR_STAMPED_LENGTH: usize = 64;
+pub const PR_EXT_PAYLOAD_LENGTH: usize = PR_STAMPED_LENGTH - PR_LENGTH;
 
 pub fn path_request_destination() -> Hash16 {
     destination_hash_from_name("rnstransport.path.request", None)
@@ -3821,7 +3845,7 @@ mod tests {
         let view = PacketView::parse(queued.packet.as_slice()).unwrap();
         let announce =
             AnnounceView::parse(view.payload, view.header.flags.context_flag, 32).unwrap();
-        assert_eq!(announce.app_data, b"newer");
+        assert_eq!(announce.signed_app_data, b"newer");
         assert!(
             node.take_queued().is_none(),
             "older copies must not remain queued"

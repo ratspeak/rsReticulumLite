@@ -1,7 +1,7 @@
 use crate::announce_admission::AnnounceAdmissionConfig;
 use crate::announce_cap::ANNOUNCE_CAP_PERMILLE;
 use crate::constants::{LORA_SPLIT_FRAME_PAYLOAD_MAX, MDU, MTU};
-use crate::identity::MAX_ANNOUNCE_APP_DATA;
+use crate::identity::{DESTINATION_COST_FP, MAX_ANNOUNCE_APP_DATA};
 use crate::ifac::{IFAC_KEY_LENGTH, IFAC_LORA_DEFAULT_SIZE};
 use crate::tables::InterfaceId;
 
@@ -486,6 +486,9 @@ pub struct LiteConfig {
     pub probe_destination_enabled: bool,
     pub ifac: Option<IfacConfig>,
     pub announce_admission: AnnounceAdmissionConfig,
+    /// Required announce stamp value in fixed point (1.0 = 256), clamped to 25600.
+    /// Python's interface `destination_cost`, defaulting to 23.5 (Transport.py:200@1.6.0).
+    pub destination_cost_fp: u16,
 }
 
 impl LiteConfig {
@@ -501,6 +504,7 @@ impl LiteConfig {
         probe_destination_enabled: true,
         ifac: None,
         announce_admission: AnnounceAdmissionConfig::DISABLED,
+        destination_cost_fp: DESTINATION_COST_FP,
     };
 
     pub const ESP32_LORA_TRANSPORT_SMALL: Self = Self {
@@ -513,6 +517,7 @@ impl LiteConfig {
         probe_destination_enabled: true,
         ifac: None,
         announce_admission: AnnounceAdmissionConfig::DISABLED,
+        destination_cost_fp: DESTINATION_COST_FP,
     };
 
     pub const ESP32_LORA_TRANSPORT_MICRO: Self = Self {
@@ -525,6 +530,7 @@ impl LiteConfig {
         probe_destination_enabled: true,
         ifac: None,
         announce_admission: AnnounceAdmissionConfig::DISABLED,
+        destination_cost_fp: DESTINATION_COST_FP,
     };
 
     pub const fn validate(self) -> Result<(), ConfigError> {

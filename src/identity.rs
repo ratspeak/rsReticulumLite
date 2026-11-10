@@ -5,6 +5,7 @@ use crate::constants::{
     DESTINATION_LENGTH, HEADER_MINSIZE, MTU, NAME_HASH_LENGTH, PRIVATE_KEY_LENGTH,
     PUBLIC_KEY_LENGTH, RANDOM_HASH_LENGTH, SIGNATURE_LENGTH,
 };
+use crate::stamps;
 use crate::wire::truncated_hash;
 
 const ANNOUNCE_BASE_SIZE: usize =
@@ -19,7 +20,10 @@ pub struct AnnounceView<'a> {
     pub random_hash: [u8; RANDOM_HASH_LENGTH],
     pub ratchet: Option<[u8; RATCHET_SIZE]>,
     pub signature: [u8; SIGNATURE_LENGTH],
-    pub app_data: &'a [u8],
+    /// Signed app_data exactly as received, including any stamp extension.
+    /// Relays keep these bytes; applications use [`Self::check_stamp`] and
+    /// [`AnnounceStampCheck::app_data`] for the app_data upstream hands to handlers.
+    pub signed_app_data: &'a [u8],
 }
 
 impl<'a> AnnounceView<'a> {
@@ -73,7 +77,7 @@ impl<'a> AnnounceView<'a> {
             random_hash,
             ratchet,
             signature,
-            app_data: &payload[pos..],
+            signed_app_data: &payload[pos..],
         })
     }
 
@@ -120,7 +124,7 @@ impl<'a> AnnounceView<'a> {
             + NAME_HASH_LENGTH
             + RANDOM_HASH_LENGTH
             + self.ratchet.map_or(0, |_| RATCHET_SIZE)
-            + self.app_data.len();
+            + self.signed_app_data.len();
 
         if scratch.len() < signed_len {
             return Err(AnnounceError::ScratchTooSmall);
@@ -139,8 +143,8 @@ impl<'a> AnnounceView<'a> {
             scratch[pos..pos + RATCHET_SIZE].copy_from_slice(&ratchet);
             pos += RATCHET_SIZE;
         }
-        scratch[pos..pos + self.app_data.len()].copy_from_slice(self.app_data);
-        pos += self.app_data.len();
+        scratch[pos..pos + self.signed_app_data.len()].copy_from_slice(self.signed_app_data);
+        pos += self.signed_app_data.len();
 
         let mut ed_pub = [0u8; 32];
         ed_pub.copy_from_slice(&self.public_key[32..]);
@@ -152,6 +156,117 @@ impl<'a> AnnounceView<'a> {
         // network-valid edge-case (low-order/non-canonical) signatures and black-hole them.
         key.verify(&scratch[..pos], &signature)
             .map_err(|_| AnnounceError::SignatureInvalid)
+    }
+
+    /// Check the trailing stamp extension against `required_fp`, a fixed-point
+    /// cost clamped to 25600 (Identity.py:840-870@1.6.0). The workblock is
+    /// `destination_hash || public_key || name_hash`, unexpanded.
+    pub fn check_stamp(
+        &self,
+        destination_hash: &[u8; DESTINATION_LENGTH],
+        required_fp: u16,
+    ) -> AnnounceStampCheck {
+        let mut check = AnnounceStampCheck::default();
+        let AnnounceExtParse::Present(ext) = parse_announce_ext(self.signed_app_data) else {
+            return check;
+        };
+        check.stamped = true;
+        check.stamp = Some(*ext.stamp);
+        let mut material = [0u8; DESTINATION_LENGTH + PUBLIC_KEY_LENGTH + NAME_HASH_LENGTH];
+        material[..DESTINATION_LENGTH].copy_from_slice(destination_hash);
+        material[DESTINATION_LENGTH..DESTINATION_LENGTH + PUBLIC_KEY_LENGTH]
+            .copy_from_slice(&self.public_key);
+        material[DESTINATION_LENGTH + PUBLIC_KEY_LENGTH..].copy_from_slice(&self.name_hash);
+        let hash = stamps::stamp_hash(&stamps::workblock_prefix(&material), ext.stamp);
+        check.value_fp = Some(stamps::stamp_value_fp_from_hash(&hash));
+        let required_fp = required_fp.min(stamps::STAMP_COST_CAP_FP);
+        if stamps::target_from_fp(required_fp).is_ok_and(|target| target.accepts(&hash)) {
+            check.validated = true;
+            check.lr_cost_fp = Some(ext.lr_cost_fp);
+        }
+        check
+    }
+}
+
+/// Trailing announce stamp extension: marker, flags, stamp, lr_cost (Identity.py:86-90@1.6.0).
+pub const ANNOUNCE_EXT_LENGTH: usize = 18;
+pub const ANNOUNCE_EXT_HEADER_LENGTH: usize = 2;
+pub const ANNOUNCE_EXT_MARKER: u8 = 0xC1;
+/// Required announce stamp value when nothing else is configured, 23.5 in fixed point
+/// (`Transport.DESTINATION_COST`, Transport.py:200@1.6.0).
+pub const DESTINATION_COST_FP: u16 = 23 * 256 + 128;
+
+/// A known-format stamp extension, borrowed from the announce app_data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnnounceExtView<'a> {
+    pub flags: u8,
+    pub stamp: &'a [u8; stamps::NETWORK_STAMP_SIZE],
+    /// Link-request cost in fixed point, at most 25600.
+    pub lr_cost_fp: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnnounceExtParse<'a> {
+    /// Fewer than 18 bytes of app_data.
+    Absent,
+    /// Wrong marker, reserved anchor bit set, or lr_cost above the cap.
+    Unknown,
+    Present(AnnounceExtView<'a>),
+}
+
+/// Parse the last 18 bytes of app_data as a stamp extension (Identity.py:840-856@1.6.0).
+pub fn parse_announce_ext(app_data: &[u8]) -> AnnounceExtParse<'_> {
+    if app_data.len() < ANNOUNCE_EXT_LENGTH {
+        return AnnounceExtParse::Absent;
+    }
+    let ext = &app_data[app_data.len() - ANNOUNCE_EXT_LENGTH..];
+    let anchor = ext[ANNOUNCE_EXT_LENGTH - 1];
+    let extended = anchor & 0x80 != 0;
+    let lr_cost_fp = stamps::fp_from_bytes([anchor & 0x7F, ext[ANNOUNCE_EXT_LENGTH - 2]]);
+    if ext[0] != ANNOUNCE_EXT_MARKER || extended || lr_cost_fp > stamps::STAMP_COST_CAP_FP {
+        return AnnounceExtParse::Unknown;
+    }
+    let Ok(stamp) = <&[u8; stamps::NETWORK_STAMP_SIZE]>::try_from(
+        &ext[ANNOUNCE_EXT_HEADER_LENGTH..ANNOUNCE_EXT_HEADER_LENGTH + stamps::NETWORK_STAMP_SIZE],
+    ) else {
+        return AnnounceExtParse::Unknown;
+    };
+    AnnounceExtParse::Present(AnnounceExtView {
+        flags: ext[1],
+        stamp,
+        lr_cost_fp,
+    })
+}
+
+/// Outcome of the announce stamp check, as upstream records it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AnnounceStampCheck {
+    /// A known-format extension was present.
+    pub stamped: bool,
+    /// The stamp met the required value; the extension is stripped.
+    pub validated: bool,
+    /// Recorded for any known-format extension, valid or not.
+    pub stamp: Option<[u8; stamps::NETWORK_STAMP_SIZE]>,
+    /// Fixed-point stamp value, `0..=65536`.
+    pub value_fp: Option<u32>,
+    /// Recorded only when the stamp is valid.
+    pub lr_cost_fp: Option<u16>,
+}
+
+impl AnnounceStampCheck {
+    /// The app_data upstream remembers and hands to handlers: the extension is
+    /// removed only when the stamp validated. Empty means no app_data.
+    pub fn app_data<'a>(&self, signed_app_data: &'a [u8]) -> &'a [u8] {
+        if self.validated && signed_app_data.len() >= ANNOUNCE_EXT_LENGTH {
+            &signed_app_data[..signed_app_data.len() - ANNOUNCE_EXT_LENGTH]
+        } else {
+            signed_app_data
+        }
+    }
+
+    /// Stamp value as upstream remembers it: 0 when the announce carried no stamp.
+    pub fn recorded_value_fp(&self) -> u32 {
+        self.value_fp.unwrap_or(0)
     }
 }
 
@@ -496,7 +611,7 @@ mod create_tests {
         let returned = view.validate(&dest, None, &mut scratch).unwrap();
         assert_eq!(&returned, id.identity_hash());
         assert_eq!(view.public_key, *id.public_key());
-        assert_eq!(view.app_data, &app_data[..]);
+        assert_eq!(view.signed_app_data, &app_data[..]);
         assert!(view.ratchet.is_none());
     }
 
@@ -516,7 +631,7 @@ mod create_tests {
         let mut scratch = [0u8; 512];
         view.validate(&dest, None, &mut scratch).unwrap();
         assert_eq!(view.ratchet, Some(ratchet));
-        assert!(view.app_data.is_empty());
+        assert!(view.signed_app_data.is_empty());
     }
 
     #[test]
@@ -571,7 +686,7 @@ mod create_tests {
         let dest = id.lxmf_delivery_hash();
         let mut scratch = [0u8; SIGNED_DATA_MAX];
         view.validate(&dest, None, &mut scratch).unwrap();
-        assert_eq!(view.app_data.len(), MAX_ANNOUNCE_APP_DATA);
+        assert_eq!(view.signed_app_data.len(), MAX_ANNOUNCE_APP_DATA);
     }
 
     #[test]

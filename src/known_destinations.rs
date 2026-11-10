@@ -5,22 +5,89 @@ pub const KNOWN_DESTINATIONS_SMALL: usize = 128;
 pub const KNOWN_DESTINATIONS_MICRO: usize = 64;
 
 const BLOB_MAGIC: [u8; 4] = *b"RKD1";
-const BLOB_VERSION: u8 = 1;
+const BLOB_VERSION_V1: u8 = 1;
+/// v2 appends each entry's link-request cost (`0xFFFF` when none).
+const BLOB_VERSION: u8 = 2;
 const BLOB_HEADER_LEN: usize = 7;
-const ENTRY_LEN: usize = DESTINATION_LENGTH + PUBLIC_KEY_LENGTH + 8;
+const ENTRY_LEN_V1: usize = DESTINATION_LENGTH + PUBLIC_KEY_LENGTH + 8;
+const ENTRY_LEN: usize = ENTRY_LEN_V1 + 2;
+const NO_LR_COST: u16 = u16::MAX;
+/// Recency shares one word with the link-request cost; 48 bits of milliseconds is ~8900 years.
+pub const RECENCY_MAX: u64 = (1 << 48) - 1;
 
+/// One remembered delivery destination.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KnownDestination {
     pub destination_hash: [u8; DESTINATION_LENGTH],
     pub public_key: [u8; PUBLIC_KEY_LENGTH],
+    /// Eviction recency, at most [`RECENCY_MAX`].
     pub last_seen: u64,
+    /// Fixed-point link-request cost from the last announce, set only when its
+    /// stamp validated (Identity.py:866-870, 109-124@1.6.0).
+    pub lr_cost_fp: Option<u16>,
 }
 
-const EMPTY_ENTRY: KnownDestination = KnownDestination {
-    destination_hash: [0; DESTINATION_LENGTH],
-    public_key: [0; PUBLIC_KEY_LENGTH],
-    last_seen: 0,
-};
+/// Stored form: recency in the high 48 bits, link-request cost in the low 16,
+/// so an entry stays 88 bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Slot {
+    destination_hash: [u8; DESTINATION_LENGTH],
+    public_key: [u8; PUBLIC_KEY_LENGTH],
+    recency_lr_cost: u64,
+}
+
+impl Slot {
+    const fn new(
+        destination_hash: [u8; DESTINATION_LENGTH],
+        public_key: [u8; PUBLIC_KEY_LENGTH],
+        last_seen: u64,
+        lr_cost_fp: Option<u16>,
+    ) -> Self {
+        let lr = match lr_cost_fp {
+            Some(fp) => fp,
+            None => NO_LR_COST,
+        };
+        let recency = if last_seen > RECENCY_MAX {
+            RECENCY_MAX
+        } else {
+            last_seen
+        };
+        Self {
+            destination_hash,
+            public_key,
+            recency_lr_cost: (recency << 16) | lr as u64,
+        }
+    }
+
+    const fn last_seen(&self) -> u64 {
+        self.recency_lr_cost >> 16
+    }
+
+    fn set_last_seen(&mut self, last_seen: u64) {
+        *self = Self::new(
+            self.destination_hash,
+            self.public_key,
+            last_seen,
+            self.lr_cost_fp(),
+        );
+    }
+
+    fn lr_cost_fp(&self) -> Option<u16> {
+        let lr = self.recency_lr_cost as u16;
+        (lr != NO_LR_COST).then_some(lr)
+    }
+
+    fn view(&self) -> KnownDestination {
+        KnownDestination {
+            destination_hash: self.destination_hash,
+            public_key: self.public_key,
+            last_seen: self.last_seen(),
+            lr_cost_fp: self.lr_cost_fp(),
+        }
+    }
+}
+
+const EMPTY_ENTRY: Slot = Slot::new([0; DESTINATION_LENGTH], [0; PUBLIC_KEY_LENGTH], 0, None);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KnownDestinationError {
@@ -33,11 +100,13 @@ pub enum KnownDestinationError {
     InvalidLength,
     DestinationHashMismatch,
     DuplicateDestination,
+    /// A v2 entry's link-request cost is above 25600 and not the "none" marker.
+    InvalidLinkCost,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KnownDestinations<const N: usize> {
-    entries: [KnownDestination; N],
+    entries: [Slot; N],
     len: usize,
 }
 
@@ -71,6 +140,23 @@ impl<const N: usize> KnownDestinations<N> {
             .map(|entry| &entry.public_key)
     }
 
+    /// The stored entry for `destination_hash`, without refreshing its recency.
+    pub fn peek_entry(
+        &self,
+        destination_hash: &[u8; DESTINATION_LENGTH],
+    ) -> Option<KnownDestination> {
+        self.entries[..self.len]
+            .iter()
+            .find(|entry| &entry.destination_hash == destination_hash)
+            .map(Slot::view)
+    }
+
+    /// Fixed-point link-request cost last announced by `destination_hash`
+    /// (`Identity.recall_link_cost`, Identity.py:201-212@1.6.0).
+    pub fn link_cost_fp(&self, destination_hash: &[u8; DESTINATION_LENGTH]) -> Option<u16> {
+        self.peek_entry(destination_hash)?.lr_cost_fp
+    }
+
     pub fn recall(
         &mut self,
         destination_hash: &[u8; DESTINATION_LENGTH],
@@ -79,7 +165,8 @@ impl<const N: usize> KnownDestinations<N> {
             .iter()
             .position(|entry| &entry.destination_hash == destination_hash)?;
         let public_key = self.entries[index].public_key;
-        self.entries[index].last_seen = self.next_recency();
+        let recency = self.next_recency();
+        self.entries[index].set_last_seen(recency);
         Some(public_key)
     }
 
@@ -93,28 +180,63 @@ impl<const N: usize> KnownDestinations<N> {
         public_key: [u8; PUBLIC_KEY_LENGTH],
         now: u64,
     ) -> Result<bool, KnownDestinationError> {
+        self.learn_inner(destination_hash, public_key, now, None)
+    }
+
+    /// Learn from a validated announce, as [`Self::learn`], and record the
+    /// link-request cost it carried. Every announce replaces the stored cost,
+    /// so `None` clears it (Identity.remember, Identity.py:109-124@1.6.0).
+    /// Returns `true` when the table changed.
+    pub fn learn_announce(
+        &mut self,
+        destination_hash: [u8; DESTINATION_LENGTH],
+        public_key: [u8; PUBLIC_KEY_LENGTH],
+        now: u64,
+        lr_cost_fp: Option<u16>,
+    ) -> Result<bool, KnownDestinationError> {
+        self.learn_inner(destination_hash, public_key, now, Some(lr_cost_fp))
+    }
+
+    fn learn_inner(
+        &mut self,
+        destination_hash: [u8; DESTINATION_LENGTH],
+        public_key: [u8; PUBLIC_KEY_LENGTH],
+        now: u64,
+        lr_cost_fp: Option<Option<u16>>,
+    ) -> Result<bool, KnownDestinationError> {
         if N == 0 {
             return Err(KnownDestinationError::EmptyCapacity);
         }
         if let Some(entry) = self.entries[..self.len]
-            .iter()
+            .iter_mut()
             .find(|entry| entry.destination_hash == destination_hash)
         {
-            return if entry.public_key == public_key {
-                Ok(false)
-            } else {
-                Err(KnownDestinationError::KeyConflict)
-            };
+            if entry.public_key != public_key {
+                return Err(KnownDestinationError::KeyConflict);
+            }
+            return Ok(match lr_cost_fp {
+                Some(lr_cost_fp) if lr_cost_fp != entry.lr_cost_fp() => {
+                    *entry = Slot::new(
+                        entry.destination_hash,
+                        entry.public_key,
+                        entry.last_seen(),
+                        lr_cost_fp,
+                    );
+                    true
+                }
+                _ => false,
+            });
         }
         if delivery_destination_hash(&public_key) != destination_hash {
             return Err(KnownDestinationError::DestinationHashMismatch);
         }
 
-        let entry = KnownDestination {
+        let entry = Slot::new(
             destination_hash,
             public_key,
-            last_seen: now.max(self.next_recency()),
-        };
+            now.max(self.next_recency()),
+            lr_cost_fp.flatten(),
+        );
         if self.len < N {
             self.entries[self.len] = entry;
             self.len += 1;
@@ -122,7 +244,7 @@ impl<const N: usize> KnownDestinations<N> {
             let oldest = self.entries[..self.len]
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, entry)| entry.last_seen)
+                .min_by_key(|(_, entry)| entry.last_seen())
                 .map(|(index, _)| index)
                 .unwrap_or(0);
             self.entries[oldest] = entry;
@@ -145,13 +267,16 @@ impl<const N: usize> KnownDestinations<N> {
             pos += DESTINATION_LENGTH;
             out[pos..pos + PUBLIC_KEY_LENGTH].copy_from_slice(&entry.public_key);
             pos += PUBLIC_KEY_LENGTH;
-            out[pos..pos + 8].copy_from_slice(&entry.last_seen.to_be_bytes());
+            out[pos..pos + 8].copy_from_slice(&entry.last_seen().to_be_bytes());
             pos += 8;
+            let lr = entry.lr_cost_fp().unwrap_or(NO_LR_COST);
+            out[pos..pos + 2].copy_from_slice(&lr.to_be_bytes());
+            pos += 2;
         }
         Ok(pos)
     }
 
-    /// Import a complete v1 blob. Validation is non-mutating: every entry is
+    /// Import a complete v2 blob, or a v1 blob whose entries carry no link cost. Validation is non-mutating: every entry is
     /// destination-bound and duplicate-free before live state is replaced.
     /// Stored recency values are clamped to `now`. Hash binding does not prove
     /// announcement authenticity; use trusted stored input.
@@ -159,25 +284,29 @@ impl<const N: usize> KnownDestinations<N> {
         if blob.len() < BLOB_HEADER_LEN || blob[..4] != BLOB_MAGIC {
             return Err(KnownDestinationError::InvalidHeader);
         }
-        if blob[4] != BLOB_VERSION {
-            return Err(KnownDestinationError::UnsupportedVersion);
-        }
+        let entry_len = match blob[4] {
+            BLOB_VERSION => ENTRY_LEN,
+            BLOB_VERSION_V1 => ENTRY_LEN_V1,
+            _ => return Err(KnownDestinationError::UnsupportedVersion),
+        };
         let count = u16::from_be_bytes([blob[5], blob[6]]) as usize;
         if count > N {
             return Err(KnownDestinationError::CountTooLarge);
         }
-        let expected = BLOB_HEADER_LEN + count * ENTRY_LEN;
+        let expected = BLOB_HEADER_LEN + count * entry_len;
         if blob.len() != expected {
             return Err(KnownDestinationError::InvalidLength);
         }
 
         for index in 0..count {
-            let entry = decode_entry(blob, index, now);
+            let entry = decode_entry(blob, entry_len, index, now)?;
             if delivery_destination_hash(&entry.public_key) != entry.destination_hash {
                 return Err(KnownDestinationError::DestinationHashMismatch);
             }
             for prior in 0..index {
-                if decode_entry(blob, prior, now).destination_hash == entry.destination_hash {
+                if decode_entry(blob, entry_len, prior, now)?.destination_hash
+                    == entry.destination_hash
+                {
                     return Err(KnownDestinationError::DuplicateDestination);
                 }
             }
@@ -186,7 +315,7 @@ impl<const N: usize> KnownDestinations<N> {
         self.entries = [EMPTY_ENTRY; N];
         self.len = count;
         for index in 0..count {
-            self.entries[index] = decode_entry(blob, index, now);
+            self.entries[index] = decode_entry(blob, entry_len, index, now)?;
         }
         Ok(())
     }
@@ -194,7 +323,7 @@ impl<const N: usize> KnownDestinations<N> {
     fn next_recency(&self) -> u64 {
         self.entries[..self.len]
             .iter()
-            .map(|entry| entry.last_seen)
+            .map(Slot::last_seen)
             .max()
             .unwrap_or(0)
             .saturating_add(1)
@@ -207,8 +336,13 @@ impl<const N: usize> Default for KnownDestinations<N> {
     }
 }
 
-fn decode_entry(blob: &[u8], index: usize, now: u64) -> KnownDestination {
-    let mut pos = BLOB_HEADER_LEN + index * ENTRY_LEN;
+fn decode_entry(
+    blob: &[u8],
+    entry_len: usize,
+    index: usize,
+    now: u64,
+) -> Result<Slot, KnownDestinationError> {
+    let mut pos = BLOB_HEADER_LEN + index * entry_len;
     let mut destination_hash = [0u8; DESTINATION_LENGTH];
     destination_hash.copy_from_slice(&blob[pos..pos + DESTINATION_LENGTH]);
     pos += DESTINATION_LENGTH;
@@ -217,11 +351,22 @@ fn decode_entry(blob: &[u8], index: usize, now: u64) -> KnownDestination {
     pos += PUBLIC_KEY_LENGTH;
     let mut last_seen = [0u8; 8];
     last_seen.copy_from_slice(&blob[pos..pos + 8]);
-    KnownDestination {
+    pos += 8;
+    let lr_cost_fp = if entry_len == ENTRY_LEN {
+        match u16::from_be_bytes([blob[pos], blob[pos + 1]]) {
+            NO_LR_COST => None,
+            fp if fp <= crate::stamps::STAMP_COST_CAP_FP => Some(fp),
+            _ => return Err(KnownDestinationError::InvalidLinkCost),
+        }
+    } else {
+        None
+    };
+    Ok(Slot::new(
         destination_hash,
         public_key,
-        last_seen: u64::from_be_bytes(last_seen).min(now),
-    }
+        u64::from_be_bytes(last_seen).min(now),
+        lr_cost_fp,
+    ))
 }
 
 fn delivery_destination_hash(public_key: &[u8; PUBLIC_KEY_LENGTH]) -> [u8; DESTINATION_LENGTH] {
@@ -349,6 +494,68 @@ mod tests {
             target.import(&blob[..len], 100),
             Err(KnownDestinationError::CountTooLarge)
         );
+    }
+
+    #[test]
+    fn announce_link_cost_is_replaced_by_every_announce_and_persisted() {
+        let mut table = KnownDestinations::<2>::new();
+        let (dest, key) = identity(12);
+        assert_eq!(table.learn_announce(dest, key, 10, Some(832)), Ok(true));
+        assert_eq!(table.link_cost_fp(&dest), Some(832));
+        assert_eq!(table.learn_announce(dest, key, 20, Some(832)), Ok(false));
+        assert_eq!(table.learn(dest, key, 30), Ok(false));
+        assert_eq!(table.link_cost_fp(&dest), Some(832));
+
+        let mut blob = [0u8; KnownDestinations::<2>::blob_capacity()];
+        let len = table.export_into(&mut blob).unwrap();
+        assert_eq!(blob[4], BLOB_VERSION);
+        let mut restored = KnownDestinations::<2>::new();
+        restored.import(&blob[..len], 100).unwrap();
+        assert_eq!(restored.peek_entry(&dest), table.peek_entry(&dest));
+
+        assert_eq!(table.learn_announce(dest, key, 40, None), Ok(true));
+        assert_eq!(table.link_cost_fp(&dest), None);
+        assert_eq!(table.peek(&dest), Some(&key));
+    }
+
+    #[test]
+    fn version_one_blob_imports_without_link_costs() {
+        let (dest, key) = identity(13);
+        let mut v1 = [0u8; BLOB_HEADER_LEN + ENTRY_LEN_V1];
+        v1[..4].copy_from_slice(&BLOB_MAGIC);
+        v1[4] = BLOB_VERSION_V1;
+        v1[5..7].copy_from_slice(&1u16.to_be_bytes());
+        v1[7..23].copy_from_slice(&dest);
+        v1[23..87].copy_from_slice(&key);
+        v1[87..95].copy_from_slice(&55u64.to_be_bytes());
+        let mut table = KnownDestinations::<1>::new();
+        table.import(&v1, 100).unwrap();
+        assert_eq!(
+            table.peek_entry(&dest),
+            Some(KnownDestination {
+                destination_hash: dest,
+                public_key: key,
+                last_seen: 55,
+                lr_cost_fp: None,
+            })
+        );
+    }
+
+    #[test]
+    fn import_rejects_link_cost_above_the_cap() {
+        let mut table = KnownDestinations::<1>::new();
+        let (dest, key) = identity(14);
+        table.learn_announce(dest, key, 10, Some(25600)).unwrap();
+        let mut blob = [0u8; KnownDestinations::<1>::blob_capacity()];
+        let len = table.export_into(&mut blob).unwrap();
+        let mut target = KnownDestinations::<1>::new();
+        target.import(&blob[..len], 100).unwrap();
+        blob[len - 2..len].copy_from_slice(&25601u16.to_be_bytes());
+        assert_eq!(
+            target.import(&blob[..len], 100),
+            Err(KnownDestinationError::InvalidLinkCost)
+        );
+        assert_eq!(target.link_cost_fp(&dest), Some(25600));
     }
 
     #[test]
