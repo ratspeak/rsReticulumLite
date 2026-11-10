@@ -1,6 +1,6 @@
 use rns_identity::identity::Identity;
 use rns_lite_core::crypto::{
-    CryptoError, ECIES_PLAINTEXT_OFFSET, MAX_ECIES_PLAINTEXT, ecies_ciphertext_len,
+    CryptoError, ECIES_PLAINTEXT_OFFSET, MAX_ECIES_PACKET_PLAINTEXT, ecies_ciphertext_len,
     ecies_decrypt_in_place, ecies_encrypt, ecies_encrypt_in_place,
 };
 
@@ -18,7 +18,7 @@ fn large_ecies_interoperates_with_trusted_identity_both_directions() {
                 .unwrap();
         assert_eq!(n, total);
         assert_eq!(recipient.decrypt(&buf, None, false).unwrap(), plaintext);
-        if size <= MAX_ECIES_PLAINTEXT {
+        if size <= MAX_ECIES_PACKET_PLAINTEXT {
             let mut packet = vec![0; total];
             assert_eq!(
                 ecies_encrypt(
@@ -62,7 +62,7 @@ fn bounds_do_not_modify_input_or_relax_packet_admission() {
     }
     assert_eq!(
         ecies_encrypt(
-            &[0; 384],
+            &[0; MAX_ECIES_PACKET_PLAINTEXT + 1],
             &public,
             &recipient.hash,
             &[9; 32],

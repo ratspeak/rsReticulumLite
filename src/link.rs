@@ -140,6 +140,8 @@ pub enum LinkError {
     UnsupportedMode,
     /// MTU is outside the checked protocol domain or fixed 500-byte endpoint budget.
     InvalidMtu,
+    /// The peer's X25519 key is a low-order point.
+    LowOrderPoint,
 }
 
 /// MTU + encryption-mode signalling, packed into 3 big-endian bytes:
@@ -433,20 +435,22 @@ pub struct LinkKeys {
 impl LinkKeys {
     /// Derive `HMAC key(32) || AES key(32)` with HKDF-SHA256 over the X25519
     /// shared secret, using `link_id` as salt and empty info. This does not
-    /// authenticate the handshake, validate key provenance or reject an all-zero
-    /// shared secret. The caller must complete the role's handshake checks.
+    /// authenticate the handshake or validate key provenance; a low-order peer
+    /// key fails with [`LinkError::LowOrderPoint`]. The caller must complete the
+    /// role's handshake checks.
     pub fn derive(
         my_x25519_priv: &[u8; KEYSIZE],
         peer_x25519_pub: &[u8; KEYSIZE],
         link_id: &[u8; DESTINATION_LENGTH],
-    ) -> Self {
+    ) -> Result<Self, LinkError> {
         let secret = StaticSecret::from(*my_x25519_priv);
-        let shared = secret.diffie_hellman(&PublicKey::from(*peer_x25519_pub));
+        let shared = crate::crypto::contributory_shared_secret(&secret, peer_x25519_pub)
+            .ok_or(LinkError::LowOrderPoint)?;
         let hk = Hkdf::<Sha256>::new(Some(link_id), shared.as_bytes());
         let mut key = [0u8; LINK_KEY_LENGTH];
         // 64 <= 255*32, so expand never fails.
         let _ = hk.expand(b"", &mut key);
-        Self { key }
+        Ok(Self { key })
     }
 
     /// Copy a previously derived `HMAC key(32) || AES key(32)`.
@@ -595,8 +599,9 @@ mod tests {
         );
 
         // Both sides derive the same session key.
-        let init_keys = LinkKeys::derive(&init_x, &proof_view.responder_x25519_pub, &link_id);
-        let resp_keys = LinkKeys::derive(&resp_x, &req.peer_x25519_pub, &link_id);
+        let init_keys =
+            LinkKeys::derive(&init_x, &proof_view.responder_x25519_pub, &link_id).unwrap();
+        let resp_keys = LinkKeys::derive(&resp_x, &req.peer_x25519_pub, &link_id).unwrap();
         assert_eq!(init_keys.combined(), resp_keys.combined());
 
         // Encrypt one way, decrypt the other.

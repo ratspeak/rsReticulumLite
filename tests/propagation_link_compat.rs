@@ -56,7 +56,7 @@ fn matched_response_resource_interoperates_without_relaxing_plain_admission() {
     let a = X25519PrivateKey::from_bytes(&[0x33; 32]);
     let b = X25519PrivateKey::from_bytes(&[0x55; 32]);
     let link_id = [0xCD; 16];
-    let keys = LinkKeys::derive(&[0x33; 32], &b.public_key().to_bytes(), &link_id);
+    let keys = LinkKeys::derive(&[0x33; 32], &b.public_key().to_bytes(), &link_id).unwrap();
     let trusted = rns_link::key_derivation::LinkKeys::derive(
         &b,
         &X25519PublicKey::from_bytes(&a.public_key().to_bytes()),

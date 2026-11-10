@@ -304,6 +304,8 @@ pub struct TransportStats {
     pub announces_rate_dropped: u64,
     /// Announces and path requests dropped for a missing or insufficient stamp under enforcement.
     pub stamp_dropped: u64,
+    /// Inbound packets dropped as protocol violations: a header with no data field.
+    pub protocol_violations: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -546,6 +548,7 @@ impl<
                 outbound_expired: 0,
                 announces_rate_dropped: 0,
                 stamp_dropped: 0,
+                protocol_violations: 0,
             },
             pr_stamper: PathRequestStamper::new(),
         }
@@ -1433,6 +1436,12 @@ impl<
             return Ok(IngestAction::Dropped);
         }
         let view = PacketView::parse(raw)?;
+        // The reference rejects a zero-length data field as malformed (Packet.py:275).
+        if view.payload.is_empty() {
+            self.stats.protocol_violations = self.stats.protocol_violations.saturating_add(1);
+            self.stats.dropped = self.stats.dropped.saturating_add(1);
+            return Ok(IngestAction::Dropped);
+        }
         if view.header.flags.packet_type == PacketType::LinkRequest {
             crate::link::LinkRequestView::parse(view.payload)
                 .map_err(|_| TransportError::InvalidLinkSignalling)?;
@@ -4849,8 +4858,8 @@ mod tests {
         // Cardputer budget (no PSRAM, ~55 KB free heap): the MICRO node must stay <= 32 KB so
         // cap drift can't silently blow the internal-heap allocation.
         let micro = core::mem::size_of::<MicroNode>();
-        // 32,736 since the stamp policy joined the config; MicroNode carries no stamper.
-        assert_eq!(micro, 32_736, "MicroNode layout changed unexpectedly");
+        // 32,744 since the protocol-violation counter joined the stats; MicroNode carries no stamper.
+        assert_eq!(micro, 32_744, "MicroNode layout changed unexpectedly");
         assert!(micro <= 32 * 1024, "MicroNode grew to {micro} B (> 32 KB)");
         std::println!(
             "MicroNode={micro} SmallNode={} Esp32PsramNode={} OutboundFrame={} OutboundLifetime={} token={}",
@@ -5937,17 +5946,17 @@ mod tests {
 
     #[test]
     fn endpoint_layout_and_transit_key_storage_remain_bounded() {
-        assert_eq!(core::mem::size_of::<MicroNode>(), 32736);
-        assert_eq!(core::mem::size_of::<SmallNode>(), 216256);
+        assert_eq!(core::mem::size_of::<MicroNode>(), 32744);
+        assert_eq!(core::mem::size_of::<SmallNode>(), 216264);
         assert_eq!(core::mem::size_of::<LinkEntry>(), 72);
         type ConstrainedRouter = LiteNode<16, 64, 16, 8, 4, 16, 8, 0, 4, Router>;
         type PsramRouter = LiteNode<128, 512, 32, 32, 16, 64, 16, 0, 16, Router>;
         if cfg!(target_pointer_width = "64") {
-            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 39264);
-            assert_eq!(core::mem::size_of::<PsramRouter>(), 104864);
+            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 39272);
+            assert_eq!(core::mem::size_of::<PsramRouter>(), 104872);
         } else if cfg!(target_pointer_width = "32") {
-            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 38896);
-            assert_eq!(core::mem::size_of::<PsramRouter>(), 104208);
+            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 38904);
+            assert_eq!(core::mem::size_of::<PsramRouter>(), 104216);
         }
     }
 

@@ -12,8 +12,8 @@
 //! identity hash as salt and empty info. The first 32 bytes are the HMAC key and
 //! the last 32 are the AES key. Successful decryption checks the Token's HMAC and
 //! padding; it does not authenticate a sender identity or detect replay. Validate
-//! the enclosing protocol's signature and policy separately. The ECIES helpers
-//! do not reject an all-zero X25519 shared secret.
+//! the enclosing protocol's signature and policy separately. A low-order peer
+//! key, which gives an all-zero X25519 shared secret, is rejected.
 
 use aes::Aes256;
 use cbc::cipher::block_padding::NoPadding;
@@ -23,7 +23,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
-use x25519_dalek::{PublicKey, StaticSecret};
+use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 use zeroize::Zeroize;
 
 // AES round keys and CBC state are wiped on drop (the `zeroize` features of `aes` and `cbc`).
@@ -43,17 +43,24 @@ pub const ECIES_FIXED_OVERHEAD: usize = 32 + TOKEN_OVERHEAD;
 /// Plaintext/ciphertext offset inside an in-place ECIES buffer (ephemeral + IV).
 pub const ECIES_PLAINTEXT_OFFSET: usize = 32 + 16;
 
-/// Largest plaintext accepted by [`ecies_encrypt`]: 383 bytes.
+/// The reference `Packet.ENCRYPTED_MDU`: 383 bytes.
 ///
 /// The 464-byte MDU reserves room for forwarding headers and IFAC. After the
 /// 80 fixed ECIES bytes, 384 bytes remain for PKCS7-padded ciphertext, so the
 /// plaintext limit is `floor((MDU - ECIES_FIXED_OVERHEAD) / 16) * 16 - 1`.
-/// The helper returns `PlaintextTooLong` above this limit; the caller chooses
-/// another delivery method.
+/// This is advisory: LXMF sizes opportunistic messages by it, but packets are
+/// only limited by the MTU (see [`MAX_ECIES_PACKET_PLAINTEXT`]).
 pub const MAX_ECIES_PLAINTEXT: usize = (crate::constants::MDU - ECIES_FIXED_OVERHEAD) / 16 * 16 - 1;
 const _: () = assert!(MAX_ECIES_PLAINTEXT == 383);
-/// PKCS7-padded ciphertext budget: one full block past the max plaintext (383 pads to 384).
-const PADDED_MAX: usize = MAX_ECIES_PLAINTEXT + 1;
+
+/// Largest plaintext whose ECIES payload fits one HEADER_1 packet within the
+/// MTU: 399 bytes. [`ecies_encrypt`] and [`ecies_decrypt`] accept up to this
+/// limit. A HEADER_2 packet has 16 bytes less room, which packet building checks.
+pub const MAX_ECIES_PACKET_PLAINTEXT: usize =
+    (crate::constants::MTU - crate::constants::HEADER_MINSIZE - ECIES_FIXED_OVERHEAD) / 16 * 16 - 1;
+const _: () = assert!(MAX_ECIES_PACKET_PLAINTEXT == 399);
+/// PKCS7-padded ciphertext budget: one full block past the max plaintext (399 pads to 400).
+const PADDED_MAX: usize = MAX_ECIES_PACKET_PLAINTEXT + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CryptoError {
@@ -61,9 +68,12 @@ pub enum CryptoError {
     PlaintextTooLong,
     /// Caller's output buffer is too small for the result.
     OutputTooSmall,
-    /// Ciphertext shape, HMAC or padding validation failed.
-    /// An insufficient caller output buffer instead returns `OutputTooSmall`.
+    /// Ciphertext shape, HMAC or padding validation failed, or the ephemeral
+    /// key is a low-order point. An insufficient caller output buffer instead
+    /// returns `OutputTooSmall`.
     AuthenticationFailed,
+    /// The recipient key is a low-order point, so encryption is refused.
+    LowOrderPoint,
 }
 
 /// PKCS7-pad `plaintext` into `out` (16-byte block). Block-aligned input gets a full 0x10 block,
@@ -107,6 +117,15 @@ fn derive_token_key(shared: &[u8; 32], salt: &[u8; 16]) -> [u8; 64] {
     // 64 <= 255*32, so expand never fails.
     let _ = hk.expand(b"", &mut okm);
     okm
+}
+
+/// X25519 with the reference backend's rejection of a non-contributory result.
+pub(crate) fn contributory_shared_secret(
+    secret: &StaticSecret,
+    peer: &[u8; 32],
+) -> Option<SharedSecret> {
+    let shared = secret.diffie_hellman(&PublicKey::from(*peer));
+    shared.was_contributory().then_some(shared)
 }
 
 /// Encrypt a Token as `IV(16) || AES-256-CBC(PKCS7(pt)) || HMAC-SHA256(IV || ct)(32)`.
@@ -307,13 +326,13 @@ pub fn token_decrypt_in_place(key: &[u8; 64], buf: &mut [u8]) -> Result<usize, C
     }
 }
 
-/// Encrypt up to [`MAX_ECIES_PLAINTEXT`] bytes to a recipient, writing
+/// Encrypt up to [`MAX_ECIES_PACKET_PLAINTEXT`] bytes to a recipient, writing
 /// `ephemeral_pub(32) || IV(16) || ct || HMAC(32)` into `out` and returning its length.
 ///
 /// Use the recipient's X25519 public key, or its selected ratchet public key,
 /// as `target_x25519_pub`; `recipient_identity_hash` remains the HKDF salt.
 /// The caller must authenticate that key/hash association. This function does
-/// not check key provenance or reject an all-zero shared secret.
+/// not check key provenance; a low-order target key returns `LowOrderPoint`.
 ///
 /// Supply a fresh cryptographically random `ephemeral_priv` and unpredictable
 /// `iv` for each message. Fixed values are for deterministic tests only.
@@ -327,13 +346,14 @@ pub fn ecies_encrypt(
     iv: &[u8; 16],
     out: &mut [u8],
 ) -> Result<usize, CryptoError> {
-    if plaintext.len() > MAX_ECIES_PLAINTEXT {
+    if plaintext.len() > MAX_ECIES_PACKET_PLAINTEXT {
         return Err(CryptoError::PlaintextTooLong);
     }
 
     let secret = StaticSecret::from(*ephemeral_priv);
     let ephemeral_pub = PublicKey::from(&secret);
-    let shared = secret.diffie_hellman(&PublicKey::from(*target_x25519_pub));
+    let shared =
+        contributory_shared_secret(&secret, target_x25519_pub).ok_or(CryptoError::LowOrderPoint)?;
     let mut token_key = derive_token_key(shared.as_bytes(), recipient_identity_hash);
 
     // ephemeral_pub(32) || token(IV || ct || HMAC). The token reuses the shared inner layer.
@@ -368,7 +388,7 @@ pub fn ecies_ciphertext_len(plaintext_len: usize) -> Result<usize, CryptoError> 
 /// On success `buf[..returned_length]` is the full encrypted blob.
 ///
 /// Fresh ephemeral key and IV requirements are identical to [`ecies_encrypt`].
-/// Packet callers must continue using that function's 383-byte admission limit.
+/// Packet callers must continue using that function's admission limit.
 pub fn ecies_encrypt_in_place(
     target_x25519_pub: &[u8; 32],
     recipient_identity_hash: &[u8; 16],
@@ -383,7 +403,8 @@ pub fn ecies_encrypt_in_place(
     }
     let secret = StaticSecret::from(*ephemeral_priv);
     let ephemeral_pub = PublicKey::from(&secret);
-    let shared = secret.diffie_hellman(&PublicKey::from(*target_x25519_pub));
+    let shared =
+        contributory_shared_secret(&secret, target_x25519_pub).ok_or(CryptoError::LowOrderPoint)?;
     let mut token_key = derive_token_key(shared.as_bytes(), recipient_identity_hash);
     buf[..32].copy_from_slice(ephemeral_pub.as_bytes());
     let result = token_encrypt_in_place(&token_key, iv, &mut buf[32..total], plaintext_len);
@@ -409,7 +430,8 @@ pub fn ecies_decrypt_in_place(
     }
     let ephemeral_pub: [u8; 32] = buf[..32].try_into().unwrap();
     let secret = StaticSecret::from(*my_x25519_priv);
-    let shared = secret.diffie_hellman(&PublicKey::from(ephemeral_pub));
+    let shared = contributory_shared_secret(&secret, &ephemeral_pub)
+        .ok_or(CryptoError::AuthenticationFailed)?;
     let mut token_key = derive_token_key(shared.as_bytes(), my_identity_hash);
     let result = token_decrypt_in_place(&token_key, &mut buf[32..]);
     token_key.zeroize();
@@ -420,8 +442,8 @@ pub fn ecies_decrypt_in_place(
 ///
 /// `my_x25519_priv` is the identity or selected ratchet private key;
 /// `my_identity_hash` is the HKDF salt. The ciphertext budget matches
-/// [`ecies_encrypt`]. Shape, HMAC and padding failures return
-/// [`CryptoError::AuthenticationFailed`]; insufficient `out` capacity returns
+/// [`ecies_encrypt`]. Shape, HMAC and padding failures and a low-order
+/// ephemeral key return [`CryptoError::AuthenticationFailed`]; insufficient `out` capacity returns
 /// [`CryptoError::OutputTooSmall`]. `out` is unchanged on error. Success does not
 /// authenticate a sender identity or check replay.
 pub fn ecies_decrypt(
@@ -439,7 +461,8 @@ pub fn ecies_decrypt(
     let token = &data[32..];
 
     let secret = StaticSecret::from(*my_x25519_priv);
-    let shared = secret.diffie_hellman(&PublicKey::from(ephemeral_pub));
+    let shared = contributory_shared_secret(&secret, &ephemeral_pub)
+        .ok_or(CryptoError::AuthenticationFailed)?;
     let mut token_key = derive_token_key(shared.as_bytes(), my_identity_hash);
 
     let result = token_decrypt::<PADDED_MAX>(token, &token_key, out);

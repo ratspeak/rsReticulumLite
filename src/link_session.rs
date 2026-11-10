@@ -153,8 +153,9 @@ impl ResponderSession {
         }
         let signalling = SignallingData::try_new(MODE_AES256_CBC, MTU as u32)?;
         let link_id = compute_link_id(destination_hash, request);
+        // The reference handshakes before it proves, so a low-order key gets no proof.
+        let keys = LinkKeys::derive(ephemeral_x25519, &view.peer_x25519_pub, &link_id)?;
         let proof_len = build_link_proof(identity, ephemeral_x25519, &link_id, signalling, proof)?;
-        let keys = LinkKeys::derive(ephemeral_x25519, &view.peer_x25519_pub, &link_id);
         let session = Self {
             link_id,
             keys,
@@ -431,7 +432,8 @@ mod tests {
         .unwrap();
         let view = LinkProofView::parse(&proof[..len]).unwrap();
         assert!(view.validate(responder().public_key(), &session.link_id()));
-        let keys = LinkKeys::derive(&INITIATOR_X, &view.responder_x25519_pub, &session.link_id());
+        let keys =
+            LinkKeys::derive(&INITIATOR_X, &view.responder_x25519_pub, &session.link_id()).unwrap();
         (session, keys)
     }
 

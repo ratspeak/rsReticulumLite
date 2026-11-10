@@ -555,7 +555,7 @@ fn lite_link_keys_match_rsreticulum() {
         .public_key()
         .to_bytes();
 
-    let lite_init = rns_lite_core::link::LinkKeys::derive(&init_x, &resp_pub, &link_id);
+    let lite_init = rns_lite_core::link::LinkKeys::derive(&init_x, &resp_pub, &link_id).unwrap();
 
     let trusted_init = rns_link::key_derivation::LinkKeys::derive(
         &rns_crypto::x25519::X25519PrivateKey::from_bytes(&init_x),
@@ -577,7 +577,7 @@ fn lite_link_keys_match_rsreticulum() {
     );
 
     // The responder end also matches (closes the handshake loop with the trusted impl).
-    let lite_resp = rns_lite_core::link::LinkKeys::derive(&resp_x, &init_pub, &link_id);
+    let lite_resp = rns_lite_core::link::LinkKeys::derive(&resp_x, &init_pub, &link_id).unwrap();
     assert_eq!(lite_resp.combined(), lite_init.combined());
 }
 
@@ -600,7 +600,7 @@ fn resource_test_keys() -> (
     let resp_pub = rns_crypto::x25519::X25519PrivateKey::from_bytes(&resp_x)
         .public_key()
         .to_bytes();
-    let lite = rns_lite_core::link::LinkKeys::derive(&init_x, &resp_pub, &link_id);
+    let lite = rns_lite_core::link::LinkKeys::derive(&init_x, &resp_pub, &link_id).unwrap();
     let trusted = rns_link::key_derivation::LinkKeys::derive(
         &rns_crypto::x25519::X25519PrivateKey::from_bytes(&resp_x),
         &rns_crypto::x25519::X25519PublicKey::from_bytes(&init_pub),
@@ -966,7 +966,7 @@ fn lite_link_encryption_interops_with_rsreticulum() {
         .public_key()
         .to_bytes();
 
-    let lite_keys = rns_lite_core::link::LinkKeys::derive(&init_x, &resp_pub, &link_id);
+    let lite_keys = rns_lite_core::link::LinkKeys::derive(&init_x, &resp_pub, &link_id).unwrap();
     let trusted_keys = rns_link::key_derivation::LinkKeys::derive(
         &rns_crypto::x25519::X25519PrivateKey::from_bytes(&resp_x),
         &rns_crypto::x25519::X25519PublicKey::from_bytes(&init_pub),

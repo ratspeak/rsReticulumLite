@@ -1323,7 +1323,7 @@ mod tests {
     use super::*;
 
     fn test_keys() -> LinkKeys {
-        LinkKeys::derive(&[0x33; 32], &[0x55; 32], &[0xCD; 16])
+        LinkKeys::derive(&[0x33; 32], &[0x55; 32], &[0xCD; 16]).unwrap()
     }
 
     fn sample_outbound(len: usize) -> OutboundResource {
@@ -1756,7 +1756,7 @@ mod tests {
             InboundResource::from_advertisement(&ResourceAdv::parse(&advbuf[..n]).unwrap())
                 .unwrap();
         assert!(inb.receive_part(out.part(0).unwrap()));
-        let wrong = LinkKeys::derive(&[0x99; 32], &[0x55; 32], &[0xCD; 16]);
+        let wrong = LinkKeys::derive(&[0x99; 32], &[0x55; 32], &[0xCD; 16]).unwrap();
         assert_eq!(
             inb.assemble(&wrong),
             Err(ResourceError::Crypto(CryptoError::AuthenticationFailed))

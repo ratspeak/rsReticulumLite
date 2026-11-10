@@ -82,7 +82,7 @@ fn vector_keys() -> LinkKeys {
     let init_x: [u8; 32] = arr(hex_field(VECTORS, "init_x25519_priv"));
     let resp_pub: [u8; 32] = arr(hex_field(VECTORS, "resp_x25519_pub"));
     let link_id: [u8; 16] = arr(hex_field(VECTORS, "link_id"));
-    let keys = LinkKeys::derive(&init_x, &resp_pub, &link_id);
+    let keys = LinkKeys::derive(&init_x, &resp_pub, &link_id).unwrap();
     assert_eq!(
         keys.combined().as_slice(),
         hex_field(VECTORS, "session_key").as_slice(),
