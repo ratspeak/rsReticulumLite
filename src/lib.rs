@@ -32,6 +32,7 @@ pub mod packet_buffer;
 pub mod proof;
 pub mod ratchet;
 pub mod resource;
+pub mod stamps;
 pub mod tables;
 pub mod transport;
 pub mod tunnel;
