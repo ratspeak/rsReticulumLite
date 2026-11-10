@@ -30,6 +30,7 @@ use zeroize::Zeroize;
 use crate::constants::{DESTINATION_LENGTH, MDU, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
 use crate::crypto::{CryptoError, token_decrypt, token_encrypt};
 use crate::identity::LocalIdentity;
+use crate::stamps::{self, StampPolicy};
 use crate::wire::truncated_hash;
 
 /// X25519 / Ed25519 public key size.
@@ -142,6 +143,10 @@ pub enum LinkError {
     InvalidMtu,
     /// The peer's X25519 key is a low-order point.
     LowOrderPoint,
+    /// No stamped link-request key has been found yet.
+    StampNotReady,
+    /// The link request's stamp is below the responder's required cost.
+    InsufficientStamp,
 }
 
 /// MTU + encryption-mode signalling, packed into 3 big-endian bytes:
@@ -272,6 +277,131 @@ pub fn build_link_request(
     Ok(LINK_REQUEST_LEN)
 }
 
+/// `destination.hash + sig_pub_bytes`, the material a link-request key stamps (Link.py:191, :365@1.6.0).
+pub fn link_stamp_material(
+    destination_hash: &[u8; DESTINATION_LENGTH],
+    ed25519_pub: &[u8; KEYSIZE],
+) -> [u8; DESTINATION_LENGTH + KEYSIZE] {
+    let mut material = [0u8; DESTINATION_LENGTH + KEYSIZE];
+    material[..DESTINATION_LENGTH].copy_from_slice(destination_hash);
+    material[DESTINATION_LENGTH..].copy_from_slice(ed25519_pub);
+    material
+}
+
+/// Fixed-point stamp value of a 64- or 67-byte link request (Python `link.stamp_cost`).
+pub fn link_request_stamp_value_fp(
+    destination_hash: &[u8; DESTINATION_LENGTH],
+    request: &[u8],
+) -> Option<u32> {
+    let view = LinkRequestView::parse_keys(request)?;
+    let material = link_stamp_material(destination_hash, &view.1);
+    Some(stamps::stamp_value_fp(&material, &view.0))
+}
+
+/// Whether a link request meets `cost_fp` (`Link.validate_request`, Link.py:187-195@1.6.0).
+/// A cost of 0 accepts every well-formed request; costs are capped at 25600.
+pub fn link_request_stamp_valid(
+    destination_hash: &[u8; DESTINATION_LENGTH],
+    request: &[u8],
+    cost_fp: u16,
+) -> bool {
+    let Some((peer_pub, sig_pub)) = LinkRequestView::parse_keys(request) else {
+        return false;
+    };
+    let material = link_stamp_material(destination_hash, &sig_pub);
+    stamps::stamp_valid_fp(&peer_pub, StampPolicy::clamp_cost_fp(cost_fp), &material)
+        .unwrap_or(false)
+}
+
+/// Resumable search for an X25519 key whose public half stamps a link request
+/// (`generate_stamped_key`, Stamps.py:317-345 and `_loop_key`, :230-250@1.6.0).
+/// The host fills each candidate private key from its cryptographic RNG and calls
+/// [`Self::step`] with a small budget from its main loop, cancelling it or
+/// dropping it when its `lr_stamp_timeout_ms` deadline passes; that is upstream's
+/// stamp failure, and no request is sent. The Ed25519 seed is fixed for the search.
+pub struct LinkRequestKeySearch {
+    search: stamps::KeyStampSearch,
+    ed25519_seed: [u8; KEYSIZE],
+    found: Option<[u8; KEYSIZE]>,
+}
+
+impl Drop for LinkRequestKeySearch {
+    fn drop(&mut self) {
+        self.ed25519_seed.zeroize();
+        if let Some(key) = self.found.as_mut() {
+            key.zeroize();
+        }
+    }
+}
+
+impl LinkRequestKeySearch {
+    /// Start a search for `destination_hash` at `cost_fp`, as returned by
+    /// [`StampPolicy::link_request_cost_fp`]. Costs above 25600 are rejected.
+    pub fn new(
+        destination_hash: &[u8; DESTINATION_LENGTH],
+        ed25519_seed: &[u8; KEYSIZE],
+        cost_fp: u16,
+    ) -> Result<Self, stamps::StampError> {
+        let ed_pub = ed25519_dalek::SigningKey::from_bytes(ed25519_seed).verifying_key();
+        let material = link_stamp_material(destination_hash, ed_pub.as_bytes());
+        Ok(Self {
+            search: stamps::KeyStampSearch::new(&material, cost_fp, u64::MAX)?,
+            ed25519_seed: *ed25519_seed,
+            found: None,
+        })
+    }
+
+    pub fn progress(&self) -> stamps::Progress<KEYSIZE> {
+        self.search.progress()
+    }
+
+    pub fn attempts(&self) -> u64 {
+        self.search.attempts()
+    }
+
+    pub fn cancel(&mut self) {
+        self.search.cancel();
+    }
+
+    /// Test at most `attempt_budget` candidate private keys filled by `fill`.
+    /// On `Complete`, `stamp` is the X25519 public key; take the keys with
+    /// [`Self::build_request`].
+    pub fn step(
+        &mut self,
+        attempt_budget: u32,
+        mut fill: impl FnMut(&mut [u8; KEYSIZE]),
+    ) -> stamps::Progress<KEYSIZE> {
+        let mut candidate = [0u8; KEYSIZE];
+        for _ in 0..attempt_budget {
+            if !matches!(self.search.progress(), stamps::Progress::Searching { .. }) {
+                break;
+            }
+            fill(&mut candidate);
+            let public = PublicKey::from(&StaticSecret::from(candidate));
+            if let stamps::Progress::Complete { .. } = self.search.offer(public.as_bytes()) {
+                self.found = Some(candidate);
+            }
+        }
+        candidate.zeroize();
+        self.search.progress()
+    }
+
+    /// The found X25519 private key, once the search completed.
+    pub fn x25519_private_key(&self) -> Option<&[u8; KEYSIZE]> {
+        self.found.as_ref()
+    }
+
+    /// Build the LINKREQUEST from the found keys, as [`build_link_request`].
+    pub fn build_request(
+        &self,
+        signalling: SignallingData,
+        out: &mut [u8],
+    ) -> Result<usize, LinkError> {
+        let key = self.found.as_ref().ok_or(LinkError::StampNotReady)?;
+        build_link_request(key, &self.ed25519_seed, signalling, out)
+    }
+}
+
 /// A parsed LINKREQUEST payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LinkRequestView {
@@ -281,6 +411,17 @@ pub struct LinkRequestView {
 }
 
 impl LinkRequestView {
+    /// The X25519 and Ed25519 keys of a 64- or 67-byte request, without signalling checks.
+    fn parse_keys(data: &[u8]) -> Option<([u8; KEYSIZE], [u8; KEYSIZE])> {
+        if data.len() != LINK_REQUEST_LEGACY_LEN && data.len() != LINK_REQUEST_LEN {
+            return None;
+        }
+        Some((
+            data[..KEYSIZE].try_into().ok()?,
+            data[KEYSIZE..ECPUBSIZE].try_into().ok()?,
+        ))
+    }
+
     /// Parse exactly 64 bytes (legacy) or 67 bytes (with signalling).
     /// Legacy input uses AES-256/MTU-500 defaults. Checks the MTU wire domain but
     /// does not restrict the mode, authenticate the keys or enforce endpoint MTU.

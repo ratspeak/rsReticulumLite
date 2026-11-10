@@ -138,6 +138,9 @@ impl ResponderSession {
     /// is the associated signing identity; this function does not check that binding.
     /// Supply fresh cryptographic `ephemeral_x25519`, the received hop count, and
     /// monotonic `now_ms`. It does not transmit the proof or authorize the initiator.
+    /// `required_cost_fp` is [`crate::stamps::StampPolicy::responder_link_cost_fp`]; a
+    /// request below it is refused without a proof (Link.py:193-195@1.6.0).
+    #[allow(clippy::too_many_arguments)]
     pub fn accept(
         identity: &LocalIdentity,
         destination_hash: &[u8; DESTINATION_LENGTH],
@@ -145,9 +148,15 @@ impl ResponderSession {
         hops: u8,
         ephemeral_x25519: &[u8; 32],
         now_ms: u64,
+        required_cost_fp: Option<u16>,
         proof: &mut [u8],
     ) -> Result<(Self, usize), SessionError> {
         let view = LinkRequestView::parse(request)?;
+        if let Some(cost_fp) = required_cost_fp {
+            if !crate::link::link_request_stamp_valid(destination_hash, request, cost_fp) {
+                return Err(LinkError::InsufficientStamp.into());
+            }
+        }
         if view.signalling.mode != MODE_AES256_CBC {
             return Err(LinkError::UnsupportedMode.into());
         }
@@ -427,6 +436,7 @@ mod tests {
             1,
             &[0x55; 32],
             now_ms,
+            None,
             &mut proof,
         )
         .unwrap();
@@ -470,6 +480,7 @@ mod tests {
             1,
             &[0x55; 32],
             0,
+            None,
             &mut proof,
         )
         .unwrap();
@@ -484,6 +495,7 @@ mod tests {
                 1,
                 &[1; 32],
                 0,
+                None,
                 &mut proof
             )
             .err(),

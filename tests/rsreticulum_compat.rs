@@ -1143,6 +1143,7 @@ fn link_session_serves_a_trusted_initiator_end_to_end() {
             hops,
             &[0x55; 32],
             0,
+            None,
             &mut proof,
         )
         .unwrap();

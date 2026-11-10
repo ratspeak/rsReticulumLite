@@ -238,6 +238,95 @@ pub fn parse_announce_ext(app_data: &[u8]) -> AnnounceExtParse<'_> {
     })
 }
 
+/// The stamp extension a destination appends to its own announce app_data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnnounceStampExt {
+    pub stamp: [u8; stamps::NETWORK_STAMP_SIZE],
+    /// Link-request cost to announce, fixed point; encoded capped at 25600 as `cost_to_bytes` does.
+    pub lr_cost_fp: u16,
+}
+
+impl AnnounceStampExt {
+    /// `0xC1 | flags | stamp | cost_bytes[1] | cost_bytes[0]` (Destination.py:353-354@1.6.0).
+    pub fn encode(&self) -> [u8; ANNOUNCE_EXT_LENGTH] {
+        let cost = stamps::fp_to_bytes(stamps::StampPolicy::clamp_cost_fp(self.lr_cost_fp));
+        let mut ext = [0u8; ANNOUNCE_EXT_LENGTH];
+        ext[0] = ANNOUNCE_EXT_MARKER;
+        ext[1] = ANNOUNCE_EXT_FLAGS;
+        ext[ANNOUNCE_EXT_HEADER_LENGTH..ANNOUNCE_EXT_HEADER_LENGTH + stamps::NETWORK_STAMP_SIZE]
+            .copy_from_slice(&self.stamp);
+        ext[ANNOUNCE_EXT_LENGTH - 2] = cost[1];
+        ext[ANNOUNCE_EXT_LENGTH - 1] = cost[0];
+        ext
+    }
+}
+
+/// `Destination.get_ext_flags()` at 1.6.0.
+pub const ANNOUNCE_EXT_FLAGS: u8 = 0x00;
+
+/// A destination stamp the host holds, generated or loaded, with its fixed-point value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DestinationStamp {
+    pub stamp: [u8; stamps::NETWORK_STAMP_SIZE],
+    pub value_fp: u32,
+}
+
+impl DestinationStamp {
+    /// A stored or provisioned stamp, kept only when it meets `required_fp`
+    /// over the destination's stamp material (`load_destination_stamp`, Stamps.py:914-926@1.6.0).
+    pub fn verify(
+        material: &[u8; stamps::DESTINATION_STAMP_MATERIAL_LENGTH],
+        stamp: &[u8; stamps::NETWORK_STAMP_SIZE],
+        required_fp: u16,
+    ) -> Option<Self> {
+        let hash = stamps::stamp_hash(&stamps::workblock_prefix(material), stamp);
+        stamps::target_from_fp(stamps::StampPolicy::clamp_cost_fp(required_fp))
+            .ok()
+            .filter(|target| target.accepts(&hash))
+            .map(|_| Self {
+                stamp: *stamp,
+                value_fp: stamps::stamp_value_fp_from_hash(&hash),
+            })
+    }
+}
+
+/// What an own announce needs under the stamp policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnnounceStamping {
+    /// `stamp_destinations` is off: announce without an extension.
+    Unstamped,
+    /// Announce with this extension.
+    Stamped(AnnounceStampExt),
+    /// No held stamp meets `target_fp`. Load or generate one over
+    /// [`stamps::destination_stamp_material`] with a [`stamps::NetworkStampSearch`]
+    /// at `target_fp`, then decide again; upstream sends nothing until then.
+    NeedsStamp { target_fp: u16 },
+}
+
+/// `Destination.announce` stamp handling (Destination.py:297-354@1.6.0).
+/// `requested_value_fp` is the host's `set_value`, `link_cost_fp` its
+/// `set_link_cost` (store it through [`stamps::StampPolicy::clamp_link_cost_fp`]).
+pub fn announce_stamping(
+    policy: &stamps::StampPolicy,
+    held: Option<&DestinationStamp>,
+    requested_value_fp: Option<u16>,
+    link_cost_fp: Option<u16>,
+) -> AnnounceStamping {
+    if !policy.stamp_destinations {
+        return AnnounceStamping::Unstamped;
+    }
+    let target_fp = policy.destination_target_value_fp(requested_value_fp);
+    match held {
+        Some(held) if held.value_fp >= u32::from(target_fp) => {
+            AnnounceStamping::Stamped(AnnounceStampExt {
+                stamp: held.stamp,
+                lr_cost_fp: policy.announced_link_cost_fp(link_cost_fp),
+            })
+        }
+        _ => AnnounceStamping::NeedsStamp { target_fp },
+    }
+}
+
 /// Outcome of the announce stamp check, as upstream records it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AnnounceStampCheck {
@@ -481,7 +570,24 @@ impl LocalIdentity {
         app_data: &[u8],
         out: &mut [u8],
     ) -> Result<usize, AnnounceError> {
-        if app_data.len() > MAX_ANNOUNCE_APP_DATA {
+        self.create_announce_stamped(name_hash, random_hash, ratchet, app_data, None, out)
+    }
+
+    /// As [`Self::create_announce_with_name_hash`], appending `ext` to the app_data
+    /// before signing (Destination.py:347-361@1.6.0); pass the extension from
+    /// [`announce_stamping`]. The extension counts against [`MAX_ANNOUNCE_APP_DATA`].
+    pub fn create_announce_stamped(
+        &self,
+        name_hash: &[u8; NAME_HASH_LENGTH],
+        random_hash: &[u8; RANDOM_HASH_LENGTH],
+        ratchet: Option<&[u8; RATCHET_SIZE]>,
+        app_data: &[u8],
+        ext: Option<&AnnounceStampExt>,
+        out: &mut [u8],
+    ) -> Result<usize, AnnounceError> {
+        let ext = ext.map(AnnounceStampExt::encode);
+        let ext: &[u8] = ext.as_ref().map_or(&[], |ext| ext);
+        if app_data.len() + ext.len() > MAX_ANNOUNCE_APP_DATA {
             return Err(AnnounceError::AppDataTooLong);
         }
         let ratchet_len = ratchet.map_or(0, |_| RATCHET_SIZE);
@@ -490,7 +596,8 @@ impl LocalIdentity {
             + RANDOM_HASH_LENGTH
             + ratchet_len
             + SIGNATURE_LENGTH
-            + app_data.len();
+            + app_data.len()
+            + ext.len();
         if out.len() < announce_len {
             return Err(AnnounceError::OutputTooSmall);
         }
@@ -514,6 +621,8 @@ impl LocalIdentity {
         }
         signed[s..s + app_data.len()].copy_from_slice(app_data);
         s += app_data.len();
+        signed[s..s + ext.len()].copy_from_slice(ext);
+        s += ext.len();
         let signature = self.sign(&signed[..s]);
 
         // announce_data = pub || name_hash || random_hash || [ratchet] || signature || app_data
@@ -532,6 +641,8 @@ impl LocalIdentity {
         w += SIGNATURE_LENGTH;
         out[w..w + app_data.len()].copy_from_slice(app_data);
         w += app_data.len();
+        out[w..w + ext.len()].copy_from_slice(ext);
+        w += ext.len();
         debug_assert_eq!(w, announce_len);
         Ok(w)
     }

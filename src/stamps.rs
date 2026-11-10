@@ -526,6 +526,23 @@ impl KeyStampSearch {
     }
 }
 
+/// Length of `Destination.stamp_material()`: hash, public key, name hash.
+pub const DESTINATION_STAMP_MATERIAL_LENGTH: usize = 16 + 64 + 10;
+
+/// `Destination.stamp_material()`: public values only, so a host tool can
+/// generate the stamp for a device (Destination.py:381-382@1.6.0).
+pub fn destination_stamp_material(
+    destination_hash: &[u8; 16],
+    public_key: &[u8; 64],
+    name_hash: &[u8; 10],
+) -> [u8; DESTINATION_STAMP_MATERIAL_LENGTH] {
+    let mut material = [0u8; DESTINATION_STAMP_MATERIAL_LENGTH];
+    material[..16].copy_from_slice(destination_hash);
+    material[16..80].copy_from_slice(public_key);
+    material[80..].copy_from_slice(name_hash);
+    material
+}
+
 /// Link-request stamp cost cap (`Transport.LINK_COST_CAP`), in fixed point.
 pub const LINK_COST_CAP_FP: u16 = 40 * 256;
 /// Lower bound for both stamp generation timeouts (`max(0.020, v)`), in milliseconds.
@@ -546,8 +563,6 @@ pub const STAMP_TIMEOUT_MS: u32 = 15_000;
 /// Network stamp switches and costs, as Python keeps them on `Transport`.
 /// Costs are fixed point (1.0 = 256). Every switch defaults to upstream, so
 /// nothing is enforced and nothing is generated until the host opts in.
-/// The link-request and announce-emission fields are carried for parity and
-/// are not consumed yet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StampPolicy {
     /// `STAMPS_ENABLED`: check announce and path-request stamps.
@@ -652,6 +667,53 @@ impl StampPolicy {
             Some(fp) => fp,
             None => self.pr_cost_fp,
         })
+    }
+
+    /// Python `Destination.target_value`: the requested value, at least
+    /// `destination_value_fp`, capped (Destination.py:389-397@1.6.0).
+    pub const fn destination_target_value_fp(&self, requested_fp: Option<u16>) -> u16 {
+        let requested = match requested_fp {
+            Some(fp) if fp > self.destination_value_fp => fp,
+            _ => self.destination_value_fp,
+        };
+        Self::clamp_cost_fp(requested)
+    }
+
+    /// Python `Destination.get_link_cost`: the destination's cost, else `lr_cost_fp`,
+    /// capped (Destination.py:407-417@1.6.0).
+    pub const fn announced_link_cost_fp(&self, destination_link_cost_fp: Option<u16>) -> u16 {
+        Self::clamp_cost_fp(match destination_link_cost_fp {
+            Some(fp) => fp,
+            None => self.lr_cost_fp,
+        })
+    }
+
+    /// The cost an outgoing link request is stamped at, given the cost the
+    /// destination announced; `None` means unstamped keys (Link.py:310-313@1.6.0).
+    pub const fn link_request_cost_fp(&self, announced_fp: Option<u16>) -> Option<u16> {
+        let cost = match announced_fp {
+            Some(fp) => fp,
+            None if self.always_stamp_lrs => self.lr_cost_fp,
+            None => return None,
+        };
+        if cost != 0 && self.stamp_lrs {
+            Some(cost)
+        } else {
+            None
+        }
+    }
+
+    /// The cost a responder requires of an incoming link request, `None` when
+    /// `lr_stamps_enforced` is off. `destination_link_cost_fp` is the value set
+    /// with `set_link_cost`, if any (Link.py:193-195, Destination.py:415-417@1.6.0).
+    pub const fn responder_link_cost_fp(
+        &self,
+        destination_link_cost_fp: Option<u16>,
+    ) -> Option<u16> {
+        if !self.lr_stamps_enforced {
+            return None;
+        }
+        Some(self.announced_link_cost_fp(destination_link_cost_fp))
     }
 }
 
