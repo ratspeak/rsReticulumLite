@@ -15,8 +15,8 @@ use crate::discovery::{
     BeginDiscovery, Discoveries, REQUEST_GATE_MS, REQUESTERS, discovery_timeout, link_deadline,
 };
 use crate::identity::{
-    AnnounceError, AnnounceStampCheck, AnnounceView, LXMF_DELIVERY_NAME, SIGNED_DATA_MAX,
-    destination_hash_from_name, name_hash,
+    ANNOUNCE_EXT_MARKER, AnnounceError, AnnounceStampCheck, AnnounceView, LXMF_DELIVERY_NAME,
+    SIGNED_DATA_MAX, destination_hash_from_name, name_hash,
 };
 use crate::ifac::{IfacError, has_ifac_flag, ifac_sign_into, ifac_verify_into};
 use crate::known_destinations::{
@@ -25,6 +25,11 @@ use crate::known_destinations::{
 use crate::lora::LoraModemConfig;
 use crate::model::{Endpoint, Model, Router, RouterStats};
 use crate::packet_buffer::{BufferError, PacketBuffer, WireBuffer};
+use crate::pr_stamper::{
+    PR_STAMP_CACHE_MAX, PathRequestStampJob, PathRequestStamper, PathRequestTarget,
+    STAMPER_PR_QUEUE_SLOTS, StamperStep,
+};
+use crate::stamps::{NETWORK_STAMP_SIZE, StampPolicy};
 use crate::tables::{
     AnnounceCache, AnnounceSchedule, CachedAnnounce, Hash16, InterfaceId, LinkEntry, LinkTable,
     PacketHashTable, PathEntry, PathTable, Queue, RequestTagTable, ReverseEntry, ReverseTable,
@@ -41,7 +46,9 @@ pub type Esp32PsramNode = LiteNode<1024, 2048, 128, 128, 64, 256, 128, KNOWN_DES
 /// Smallest preset, paired with [`LiteConfig::ESP32_LORA_TRANSPORT_MICRO`].
 /// Tests assert a 32 KiB node budget on their build target. Check the actual target layout,
 /// construction temporaries and available device memory before allocating it.
-pub type MicroNode = LiteNode<48, 64, 8, 8, 4, 8, 8, KNOWN_DESTINATIONS_MICRO>;
+/// It has no room for path-request stamp generation: with `stamp_prs` on, its requests are
+/// refused with [`TransportError::StampQueueFull`]. Hosts that stamp name a larger stamper.
+pub type MicroNode = LiteNode<48, 64, 8, 8, 4, 8, 8, KNOWN_DESTINATIONS_MICRO, 8, Endpoint, 0, 0>;
 
 /// Endpoint local slots, shared by own destinations and local Links without a Link cap.
 pub const ENDPOINT_LOCAL_SLOTS: usize = 4;
@@ -267,6 +274,15 @@ pub enum IngestAction {
     Dropped,
 }
 
+/// What [`LiteNode::request_path`] did with the request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PathRequestOutcome {
+    /// The request is in the outbound queue.
+    Queued,
+    /// The request waits for its stamp; see [`LiteNode::step_path_request_stamp`].
+    AwaitingStamp,
+}
+
 /// Saturating counters for individual processing paths, not an exhaustive packet accounting.
 /// `accepted` increments after parsing and initial Link checks, before later policy/dedup
 /// decisions. `queued_outbound` counts queue admissions, including replacement of an older
@@ -286,6 +302,8 @@ pub struct TransportStats {
     pub outbound_expired: u64,
     /// Announces rejected by the pre-verify admission limiter.
     pub announces_rate_dropped: u64,
+    /// Announces and path requests dropped for a missing or insufficient stamp under enforcement.
+    pub stamp_dropped: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -305,6 +323,8 @@ pub enum TransportError {
     InvalidLinkSignalling,
     UnsupportedTransitModeTransform,
     CapacityTooSmall,
+    /// The path-request stamp queue is full; the request was dropped.
+    StampQueueFull,
     Wire(WireError),
     Buffer(BufferError),
     Announce(AnnounceError),
@@ -388,6 +408,8 @@ pub struct LiteNode<
     const KNOWN_DESTINATIONS: usize = KNOWN_DESTINATIONS_SMALL,
     const SCHEDULED: usize = ANNOUNCES,
     M: Model = Endpoint,
+    const PR_QUEUE: usize = STAMPER_PR_QUEUE_SLOTS,
+    const PR_CACHE: usize = PR_STAMP_CACHE_MAX,
 > {
     #[doc(hidden)]
     pub config: LiteConfig,
@@ -427,6 +449,8 @@ pub struct LiteNode<
     pub interfaces: M,
     #[doc(hidden)]
     pub stats: TransportStats,
+    #[doc(hidden)]
+    pub pr_stamper: PathRequestStamper<PR_QUEUE, PR_CACHE>,
 }
 
 impl<
@@ -440,6 +464,8 @@ impl<
     const KNOWN_DESTINATIONS: usize,
     const SCHEDULED: usize,
     M: Model,
+    const PR_QUEUE: usize,
+    const PR_CACHE: usize,
 >
     LiteNode<
         PATHS,
@@ -452,6 +478,8 @@ impl<
         KNOWN_DESTINATIONS,
         SCHEDULED,
         M,
+        PR_QUEUE,
+        PR_CACHE,
     >
 {
     /// Validate configuration and return an empty node by value.
@@ -517,7 +545,9 @@ impl<
                 outbound_dropped: 0,
                 outbound_expired: 0,
                 announces_rate_dropped: 0,
+                stamp_dropped: 0,
             },
+            pr_stamper: PathRequestStamper::new(),
         }
     }
 
@@ -669,6 +699,7 @@ impl<
         self.request_tags.clear();
         self.outbound.clear();
         self.discoveries.clear();
+        self.pr_stamper.clear();
         self.stats = TransportStats::default();
         Ok(())
     }
@@ -713,15 +744,112 @@ impl<
         self.known_destinations.link_cost_fp(destination_hash)
     }
 
-    /// Check an announce's stamp extension against this node's `destination_cost_fp`.
+    /// Check an announce's stamp extension as received on `interface_id`, against that
+    /// interface's `destination_cost_fp` or the policy's; nothing is checked while
+    /// `stamps_enabled` is off (Identity.py:793-795, :838@1.6.0).
     /// Use [`AnnounceStampCheck::app_data`] on `announce.signed_app_data` for the app_data
     /// upstream hands to announce handlers; relayed bytes are never changed.
     pub fn announce_stamp_check(
         &self,
         destination_hash: &Hash16,
         announce: &AnnounceView<'_>,
+        interface_id: InterfaceId,
     ) -> AnnounceStampCheck {
-        announce.check_stamp(destination_hash, self.config.destination_cost_fp)
+        if !self.config.stamp_policy.stamps_enabled {
+            return AnnounceStampCheck::default();
+        }
+        announce.check_stamp(
+            destination_hash,
+            self.interface_destination_cost_fp(interface_id),
+        )
+    }
+
+    /// Python `Interface.destination_cost`: the registered interface's value, else the policy's.
+    pub fn interface_destination_cost_fp(&self, interface_id: InterfaceId) -> u16 {
+        self.config.stamp_policy.interface_destination_cost_fp(
+            self.interfaces
+                .router()
+                .and_then(|router| router.interface(interface_id))
+                .and_then(|interface| interface.destination_cost_fp),
+        )
+    }
+
+    /// Python `Interface.pr_cost`: the registered interface's value, else the policy's.
+    pub fn interface_pr_cost_fp(&self, interface_id: InterfaceId) -> u16 {
+        self.config.stamp_policy.interface_pr_cost_fp(
+            self.interfaces
+                .router()
+                .and_then(|router| router.interface(interface_id))
+                .and_then(|interface| interface.pr_cost_fp),
+        )
+    }
+
+    pub const fn stamp_policy(&self) -> StampPolicy {
+        self.config.stamp_policy
+    }
+
+    /// Replace the stamp policy; queued generation and cached stamps are kept.
+    pub fn set_stamp_policy(&mut self, policy: StampPolicy) {
+        self.config.stamp_policy = policy;
+    }
+
+    /// A path-request stamp is queued or being searched; drive it with
+    /// [`Self::step_path_request_stamp`].
+    pub fn path_request_stamp_pending(&self) -> bool {
+        self.pr_stamper.pending()
+    }
+
+    /// Generated path-request stamp for `destination_hash` and `tag`, if cached.
+    pub fn cached_path_request_stamp(
+        &self,
+        destination_hash: &Hash16,
+        tag: &[u8; 16],
+    ) -> Option<[u8; NETWORK_STAMP_SIZE]> {
+        self.pr_stamper.cached(destination_hash, tag)
+    }
+
+    /// Advance path-request stamp generation by at most `attempt_budget` candidates, each
+    /// filled by `fill` from the host's cryptographic RNG. A finished stamp is cached and its
+    /// request queued at once; a timed-out job sends nothing (Transport.py:4027-4051@1.6.0).
+    /// Queue refusal of the finished request is returned as the error the caller would get
+    /// from [`Self::request_path`]; the stamp stays cached.
+    pub fn step_path_request_stamp(
+        &mut self,
+        now_ms: u64,
+        attempt_budget: u32,
+        fill: impl FnMut(&mut [u8; NETWORK_STAMP_SIZE]),
+    ) -> Result<StamperStep, TransportError> {
+        self.clock_ms = now_ms;
+        self.expire_outbound(now_ms);
+        let step = self.pr_stamper.step(now_ms, attempt_budget, fill);
+        if let StamperStep::Ready { job, stamp } = step {
+            let ext = stamped_path_request_ext(&stamp);
+            match job.target {
+                PathRequestTarget::Interface(interface_id) => {
+                    self.send_path_request(
+                        &job.destination_hash,
+                        &job.tag,
+                        interface_id,
+                        Some(&ext),
+                        now_ms,
+                    )?;
+                }
+                PathRequestTarget::AllExcept(source) => {
+                    let request =
+                        self.build_path_request(job.destination_hash, &job.tag, Some(&ext))?;
+                    if self.enqueue_packet_broadcast(
+                        source,
+                        request,
+                        OutboundReason::PathRequestForward,
+                        false,
+                    ) == 0
+                    {
+                        return Err(TransportError::Backpressure);
+                    }
+                }
+            }
+        }
+        Ok(step)
     }
 
     pub const fn known_destination_count(&self) -> usize {
@@ -778,16 +906,62 @@ impl<
     /// transmission or a discovered path.
     /// `interface_id` is retained as frame metadata; the retained handheld adapter fans locally
     /// originated requests out to its eligible targets.
+    /// Under the policy's `stamp_prs` a cached stamp is appended; otherwise generation is
+    /// queued, nothing is sent yet and [`PathRequestOutcome::AwaitingStamp`] is returned
+    /// (Transport.py:3706-3720@1.6.0). A full stamp queue drops the request.
     pub fn request_path(
         &mut self,
         destination_hash: &Hash16,
         tag: &[u8; 16],
         interface_id: InterfaceId,
         now_ms: u64,
-    ) -> Result<(), TransportError> {
+    ) -> Result<PathRequestOutcome, TransportError> {
         self.clock_ms = now_ms;
         self.expire_outbound(now_ms);
-        let request = self.build_path_request(*destination_hash, tag, None)?;
+        if !self.config.stamp_policy.stamp_prs {
+            self.send_path_request(destination_hash, tag, interface_id, None, now_ms)?;
+            return Ok(PathRequestOutcome::Queued);
+        }
+        if let Some(stamp) = self.pr_stamper.cached(destination_hash, tag) {
+            let ext = stamped_path_request_ext(&stamp);
+            self.send_path_request(destination_hash, tag, interface_id, Some(&ext), now_ms)?;
+            return Ok(PathRequestOutcome::Queued);
+        }
+        self.queue_path_request_stamp(
+            *destination_hash,
+            *tag,
+            PathRequestTarget::Interface(interface_id),
+        )?;
+        Ok(PathRequestOutcome::AwaitingStamp)
+    }
+
+    fn queue_path_request_stamp(
+        &mut self,
+        destination_hash: Hash16,
+        tag: [u8; 16],
+        target: PathRequestTarget,
+    ) -> Result<(), TransportError> {
+        let policy = self.config.stamp_policy;
+        self.pr_stamper
+            .enqueue(PathRequestStampJob {
+                destination_hash,
+                tag,
+                target,
+                value_fp: policy.pr_value_fp,
+                timeout_ms: policy.pr_stamp_timeout_ms,
+            })
+            .map_err(|_| TransportError::StampQueueFull)
+    }
+
+    fn send_path_request(
+        &mut self,
+        destination_hash: &Hash16,
+        tag: &[u8; 16],
+        interface_id: InterfaceId,
+        ext: Option<&[u8; PR_EXT_PAYLOAD_LENGTH]>,
+        now_ms: u64,
+    ) -> Result<(), TransportError> {
+        let request = self.build_path_request(*destination_hash, tag, ext)?;
         // Send before recording: a request that never queued must not burn the
         // duplicate gate or register its tag (trusted send-before-record ordering).
         if !self.enqueue(interface_id, request, OutboundReason::PathRequest) {
@@ -1463,6 +1637,16 @@ impl<
             view.header.flags.context_flag,
             self.config.max_announce_app_data,
         )?;
+        // Identity.validate_announce (Identity.py:838-889@1.6.0): the stamp before the
+        // signature; enforcement drops silently (Transport.py:2047-2049@1.6.0).
+        let stamp =
+            self.announce_stamp_check(&header.destination_hash, &announce, meta.interface_id);
+        let policy = self.config.stamp_policy;
+        if policy.stamps_enabled && policy.stamps_enforced && !stamp.validated {
+            self.stats.stamp_dropped = self.stats.stamp_dropped.saturating_add(1);
+            self.stats.dropped = self.stats.dropped.saturating_add(1);
+            return Ok(IngestAction::Dropped);
+        }
         let known_public_key = self
             .known_destinations
             .peek(&header.destination_hash)
@@ -1473,7 +1657,6 @@ impl<
         // Python remembers every validated announce, replays and path responses included,
         // before it decides the path (Transport.py:2172, Identity.py:589), as trusted inbound.rs.
         if KNOWN_DESTINATIONS != 0 && announce.name_hash == name_hash(LXMF_DELIVERY_NAME) {
-            let stamp = self.announce_stamp_check(&header.destination_hash, &announce);
             self.known_destinations.learn_announce(
                 header.destination_hash,
                 announce.public_key,
@@ -1663,6 +1846,21 @@ impl<
             self.stats.duplicates = self.stats.duplicates.saturating_add(1);
             return Ok(IngestAction::Duplicate);
         }
+        // Transport.py:2099-2129@1.6.0: the flags byte is not read, so the lenient
+        // 0xC1 0xFF marker fails like any invalid stamp.
+        let policy = self.config.stamp_policy;
+        if policy.stamps_enabled {
+            let required_fp = self.interface_pr_cost_fp(interface_id);
+            let stamp_ok = ext.is_some_and(|ext| {
+                ext[0] == ANNOUNCE_EXT_MARKER
+                    && path_request_stamp_valid(&requested, &tag_key[16..], &ext[2..], required_fp)
+            });
+            if !stamp_ok && policy.stamps_enforced {
+                self.stats.stamp_dropped = self.stats.stamp_dropped.saturating_add(1);
+                self.stats.dropped = self.stats.dropped.saturating_add(1);
+                return Ok(IngestAction::Dropped);
+            }
+        }
 
         // Trusted outbound.rs / Python 1.3.8 Transport.py:2969: a path request for one of
         // our OWN destinations is answered by the HOST (fresh signed announce), never
@@ -1703,6 +1901,34 @@ impl<
         }
 
         if M::ROUTER && self.is_local_client_interface(interface_id) {
+            // Transport.py:3873-3879, :3706-3717@1.6.0: a stamping node stamps a local
+            // client's unstamped request before forwarding it.
+            let stamped;
+            let ext = match ext {
+                None if policy.stamp_prs => {
+                    let mut tag16 = [0u8; 16];
+                    tag16.copy_from_slice(tag);
+                    match self.pr_stamper.cached(&requested, &tag16) {
+                        Some(stamp) => {
+                            stamped = stamped_path_request_ext(&stamp);
+                            Some(&stamped)
+                        }
+                        None => {
+                            return Ok(
+                                match self.queue_path_request_stamp(
+                                    requested,
+                                    tag16,
+                                    PathRequestTarget::AllExcept(interface_id),
+                                ) {
+                                    Ok(()) => IngestAction::Accepted,
+                                    Err(_) => IngestAction::Dropped,
+                                },
+                            );
+                        }
+                    }
+                }
+                ext => ext,
+            };
             let request = self.build_path_request(requested, tag, ext)?;
             return Ok(
                 if self.enqueue_packet_broadcast(
@@ -1718,6 +1944,12 @@ impl<
                 },
             );
         }
+        // Transport.py:3930-3936, :3955-3956@1.6.0: a stamping node relays someone else's
+        // unstamped request with the lenient marker instead of a stamp.
+        let relay_ext = match ext {
+            None if policy.stamp_prs => Some(&LENIENT_PATH_REQUEST_EXT),
+            ext => ext,
+        };
         if self.config.transport_enabled && mode_discovers_unknown_paths(mode) {
             let Some(slot) = self
                 .interface_slot(interface_id)
@@ -1725,6 +1957,10 @@ impl<
             else {
                 return Ok(IngestAction::Dropped);
             };
+            // Transport.py:3895-3897@1.6.0: unreachable while enforcement drops above.
+            if ext.is_none() && policy.stamps_enforced {
+                return Ok(IngestAction::Dropped);
+            }
             let timeout = discovery_timeout(self.slowest_outbound_bitrate(interface_id));
             match self.discoveries.begin(requested, slot, now_ms, timeout) {
                 BeginDiscovery::Joined => return Ok(IngestAction::Accepted),
@@ -1733,7 +1969,7 @@ impl<
                     return Ok(IngestAction::Dropped);
                 }
                 BeginDiscovery::New(identity) => {
-                    let request = self.build_path_request(requested, tag, ext)?;
+                    let request = self.build_path_request(requested, tag, relay_ext)?;
                     let lifetime = OutboundLifetime {
                         enqueued_ms: now_ms,
                         expires_ms: now_ms
@@ -1758,7 +1994,7 @@ impl<
         }
 
         if M::ROUTER {
-            let request = self.build_path_request(requested, tag, ext)?;
+            let request = self.build_path_request(requested, tag, relay_ext)?;
             if self.enqueue_packet_broadcast(
                 interface_id,
                 request,
@@ -2377,6 +2613,8 @@ impl<
     const OUTBOUND: usize,
     const KNOWN_DESTINATIONS: usize,
     const SCHEDULED: usize,
+    const PR_QUEUE: usize,
+    const PR_CACHE: usize,
 >
     LiteNode<
         PATHS,
@@ -2389,6 +2627,8 @@ impl<
         KNOWN_DESTINATIONS,
         SCHEDULED,
         Endpoint,
+        PR_QUEUE,
+        PR_CACHE,
     >
 {
     /// Private owner metadata. Call before ingest/tick. A generation change or loss of
@@ -2628,6 +2868,39 @@ pub const PR_LENGTH: usize = 48;
 pub const PR_STAMPED_LENGTH: usize = 64;
 pub const PR_EXT_PAYLOAD_LENGTH: usize = PR_STAMPED_LENGTH - PR_LENGTH;
 
+/// `0xC1 0x00` followed by the stamp (Transport.py:3720, :4049@1.6.0).
+pub fn stamped_path_request_ext(stamp: &[u8; NETWORK_STAMP_SIZE]) -> [u8; PR_EXT_PAYLOAD_LENGTH] {
+    let mut ext = [0u8; PR_EXT_PAYLOAD_LENGTH];
+    ext[0] = ANNOUNCE_EXT_MARKER;
+    ext[2..].copy_from_slice(stamp);
+    ext
+}
+
+/// Marks a relayed unstamped request from a stamping node (Transport.py:3936@1.6.0).
+pub const LENIENT_PATH_REQUEST_EXT: [u8; PR_EXT_PAYLOAD_LENGTH] = {
+    let mut ext = [0u8; PR_EXT_PAYLOAD_LENGTH];
+    ext[0] = ANNOUNCE_EXT_MARKER;
+    ext[1] = 0xFF;
+    ext
+};
+
+/// Python `Transport.validate_pr_stamp`: material `destination || tag`, unexpanded.
+pub fn path_request_stamp_valid(
+    destination_hash: &Hash16,
+    tag: &[u8],
+    stamp: &[u8],
+    required_fp: u16,
+) -> bool {
+    if stamp.len() != NETWORK_STAMP_SIZE || tag.len() != 16 {
+        return false;
+    }
+    let mut material = [0u8; 32];
+    material[..16].copy_from_slice(destination_hash);
+    material[16..].copy_from_slice(tag);
+    crate::stamps::stamp_valid_fp(stamp, StampPolicy::clamp_cost_fp(required_fp), &material)
+        .unwrap_or(false)
+}
+
 pub fn path_request_destination() -> Hash16 {
     destination_hash_from_name("rnstransport.path.request", None)
 }
@@ -2692,7 +2965,9 @@ mod tests {
         const O: usize,
         const K: usize,
         const S: usize,
-    > TestQueueDrain for LiteNode<P, H, A, R, L, T, O, K, S>
+        const PQ: usize,
+        const PC: usize,
+    > TestQueueDrain for LiteNode<P, H, A, R, L, T, O, K, S, Endpoint, PQ, PC>
     {
         fn take_queued(&mut self) -> Option<OutboundFrame> {
             self.expire_outbound(self.clock_ms);
@@ -4574,8 +4849,8 @@ mod tests {
         // Cardputer budget (no PSRAM, ~55 KB free heap): the MICRO node must stay <= 32 KB so
         // cap drift can't silently blow the internal-heap allocation.
         let micro = core::mem::size_of::<MicroNode>();
-        // 32,664 since the bulk flag gave cached announces a niche for their `Option` tag.
-        assert_eq!(micro, 32_664, "MicroNode layout changed unexpectedly");
+        // 32,736 since the stamp policy joined the config; MicroNode carries no stamper.
+        assert_eq!(micro, 32_736, "MicroNode layout changed unexpectedly");
         assert!(micro <= 32 * 1024, "MicroNode grew to {micro} B (> 32 KB)");
         std::println!(
             "MicroNode={micro} SmallNode={} Esp32PsramNode={} OutboundFrame={} OutboundLifetime={} token={}",
@@ -5662,17 +5937,17 @@ mod tests {
 
     #[test]
     fn endpoint_layout_and_transit_key_storage_remain_bounded() {
-        assert_eq!(core::mem::size_of::<MicroNode>(), 32664);
-        assert_eq!(core::mem::size_of::<SmallNode>(), 202040);
+        assert_eq!(core::mem::size_of::<MicroNode>(), 32736);
+        assert_eq!(core::mem::size_of::<SmallNode>(), 216256);
         assert_eq!(core::mem::size_of::<LinkEntry>(), 72);
         type ConstrainedRouter = LiteNode<16, 64, 16, 8, 4, 16, 8, 0, 4, Router>;
         type PsramRouter = LiteNode<128, 512, 32, 32, 16, 64, 16, 0, 16, Router>;
         if cfg!(target_pointer_width = "64") {
-            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 24984);
-            assert_eq!(core::mem::size_of::<PsramRouter>(), 90584);
+            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 39264);
+            assert_eq!(core::mem::size_of::<PsramRouter>(), 104864);
         } else if cfg!(target_pointer_width = "32") {
-            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 24632);
-            assert_eq!(core::mem::size_of::<PsramRouter>(), 89944);
+            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 38896);
+            assert_eq!(core::mem::size_of::<PsramRouter>(), 104208);
         }
     }
 

@@ -1,8 +1,9 @@
 use crate::announce_admission::AnnounceAdmissionConfig;
 use crate::announce_cap::ANNOUNCE_CAP_PERMILLE;
 use crate::constants::{LORA_SPLIT_FRAME_PAYLOAD_MAX, MDU, MTU};
-use crate::identity::{DESTINATION_COST_FP, MAX_ANNOUNCE_APP_DATA};
+use crate::identity::MAX_ANNOUNCE_APP_DATA;
 use crate::ifac::{IFAC_KEY_LENGTH, IFAC_LORA_DEFAULT_SIZE};
+use crate::stamps::StampPolicy;
 use crate::tables::InterfaceId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,6 +206,10 @@ pub struct InterfaceConfig {
     /// Paths learned from unsolicited announces here are bulk: an uplink to a busy hub must not
     /// churn the paths LoRa and local peers depend on.
     pub bulk_paths: bool,
+    /// Python interface `destination_cost`; `None` follows the policy's `destination_cost_fp`.
+    pub destination_cost_fp: Option<u16>,
+    /// Python interface `pr_cost`; `None` follows the policy's `pr_cost_fp`.
+    pub pr_cost_fp: Option<u16>,
 }
 
 impl InterfaceConfig {
@@ -221,6 +226,8 @@ impl InterfaceConfig {
             tx_queue_depth,
             announce_cap_permille: ANNOUNCE_CAP_PERMILLE,
             bulk_paths: false,
+            destination_cost_fp: None,
+            pr_cost_fp: None,
         }
     }
 
@@ -246,6 +253,8 @@ impl InterfaceConfig {
             tx_queue_depth,
             announce_cap_permille: ANNOUNCE_CAP_PERMILLE,
             bulk_paths: true,
+            destination_cost_fp: None,
+            pr_cost_fp: None,
         }
     }
 
@@ -262,6 +271,8 @@ impl InterfaceConfig {
             tx_queue_depth,
             announce_cap_permille: ANNOUNCE_CAP_PERMILLE,
             bulk_paths: false,
+            destination_cost_fp: None,
+            pr_cost_fp: None,
         }
     }
 
@@ -281,6 +292,8 @@ impl InterfaceConfig {
             tx_queue_depth,
             announce_cap_permille: ANNOUNCE_CAP_PERMILLE,
             bulk_paths: false,
+            destination_cost_fp: None,
+            pr_cost_fp: None,
         }
     }
 
@@ -486,9 +499,9 @@ pub struct LiteConfig {
     pub probe_destination_enabled: bool,
     pub ifac: Option<IfacConfig>,
     pub announce_admission: AnnounceAdmissionConfig,
-    /// Required announce stamp value in fixed point (1.0 = 256), clamped to 25600.
-    /// Python's interface `destination_cost`, defaulting to 23.5 (Transport.py:200@1.6.0).
-    pub destination_cost_fp: u16,
+    /// Network stamp switches and costs (Transport.py:191-206@1.6.0). Everything is off by
+    /// default; interface overrides live on [`InterfaceConfig`].
+    pub stamp_policy: StampPolicy,
 }
 
 impl LiteConfig {
@@ -504,7 +517,7 @@ impl LiteConfig {
         probe_destination_enabled: true,
         ifac: None,
         announce_admission: AnnounceAdmissionConfig::DISABLED,
-        destination_cost_fp: DESTINATION_COST_FP,
+        stamp_policy: StampPolicy::DEFAULT,
     };
 
     pub const ESP32_LORA_TRANSPORT_SMALL: Self = Self {
@@ -517,7 +530,7 @@ impl LiteConfig {
         probe_destination_enabled: true,
         ifac: None,
         announce_admission: AnnounceAdmissionConfig::DISABLED,
-        destination_cost_fp: DESTINATION_COST_FP,
+        stamp_policy: StampPolicy::DEFAULT,
     };
 
     pub const ESP32_LORA_TRANSPORT_MICRO: Self = Self {
@@ -530,7 +543,7 @@ impl LiteConfig {
         probe_destination_enabled: true,
         ifac: None,
         announce_admission: AnnounceAdmissionConfig::DISABLED,
-        destination_cost_fp: DESTINATION_COST_FP,
+        stamp_policy: StampPolicy::DEFAULT,
     };
 
     pub const fn validate(self) -> Result<(), ConfigError> {

@@ -194,7 +194,7 @@ pub const ANNOUNCE_EXT_HEADER_LENGTH: usize = 2;
 pub const ANNOUNCE_EXT_MARKER: u8 = 0xC1;
 /// Required announce stamp value when nothing else is configured, 23.5 in fixed point
 /// (`Transport.DESTINATION_COST`, Transport.py:200@1.6.0).
-pub const DESTINATION_COST_FP: u16 = 23 * 256 + 128;
+pub use crate::stamps::DESTINATION_COST_FP;
 
 /// A known-format stamp extension, borrowed from the announce app_data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

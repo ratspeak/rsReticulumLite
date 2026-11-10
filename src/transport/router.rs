@@ -23,7 +23,9 @@ impl<
     const O: usize,
     const K: usize,
     const S: usize,
-> LiteNode<P, H, A, R, L, T, O, K, S, Router>
+    const PQ: usize,
+    const PC: usize,
+> LiteNode<P, H, A, R, L, T, O, K, S, Router, PQ, PC>
 {
     pub fn new_router(
         config: LiteConfig,
@@ -268,7 +270,9 @@ impl<
     const K: usize,
     const S: usize,
     M: Model,
-> LiteNode<P, H, A, R, L, T, O, K, S, M>
+    const PQ: usize,
+    const PC: usize,
+> LiteNode<P, H, A, R, L, T, O, K, S, M, PQ, PC>
 {
     pub(super) fn router_ingress(
         &mut self,

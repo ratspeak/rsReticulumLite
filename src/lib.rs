@@ -29,6 +29,7 @@ pub mod link_session;
 pub mod lora;
 pub mod model;
 pub mod packet_buffer;
+pub mod pr_stamper;
 pub mod proof;
 pub mod ratchet;
 pub mod resource;

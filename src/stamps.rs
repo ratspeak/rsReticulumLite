@@ -526,6 +526,141 @@ impl KeyStampSearch {
     }
 }
 
+/// Link-request stamp cost cap (`Transport.LINK_COST_CAP`), in fixed point.
+pub const LINK_COST_CAP_FP: u16 = 40 * 256;
+/// Lower bound for both stamp generation timeouts (`max(0.020, v)`), in milliseconds.
+pub const STAMP_TIMEOUT_FLOOR_MS: u32 = 20;
+/// `Transport.DESTINATION_COST`, 23.5.
+pub const DESTINATION_COST_FP: u16 = 6016;
+/// `Transport.DESTINATION_VALUE`, 25.0.
+pub const DESTINATION_VALUE_FP: u16 = 6400;
+/// `Transport.PR_COST`, 15.8 as `cost_to_fp` rounds it.
+pub const PR_COST_FP: u16 = 4045;
+/// `Transport.PR_VALUE`, 15.8 as `cost_to_fp` rounds it.
+pub const PR_VALUE_FP: u16 = 4045;
+/// `Transport.LR_COST`, 12.5.
+pub const LR_COST_FP: u16 = 3200;
+/// `Transport.PR_STAMP_TIMEOUT` and `LINK_STAMP_TIMEOUT`, 15 s.
+pub const STAMP_TIMEOUT_MS: u32 = 15_000;
+
+/// Network stamp switches and costs, as Python keeps them on `Transport`.
+/// Costs are fixed point (1.0 = 256). Every switch defaults to upstream, so
+/// nothing is enforced and nothing is generated until the host opts in.
+/// The link-request and announce-emission fields are carried for parity and
+/// are not consumed yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StampPolicy {
+    /// `STAMPS_ENABLED`: check announce and path-request stamps.
+    pub stamps_enabled: bool,
+    /// `STAMPS_ENFORCED`: drop announces and path requests without a valid stamp.
+    pub stamps_enforced: bool,
+    /// `LR_STAMPS_ENFORCED`.
+    pub lr_stamps_enforced: bool,
+    /// `STAMP_DESTINATIONS`.
+    pub stamp_destinations: bool,
+    /// `STAMP_PRS`: stamp path requests this node originates.
+    pub stamp_prs: bool,
+    /// `STAMP_LRS`.
+    pub stamp_lrs: bool,
+    /// `ALWAYS_STAMP_LRS`.
+    pub always_stamp_lrs: bool,
+    /// `DESTINATION_COST`: required announce stamp value.
+    pub destination_cost_fp: u16,
+    /// `DESTINATION_VALUE`.
+    pub destination_value_fp: u16,
+    /// `PR_COST`: required path-request stamp value.
+    pub pr_cost_fp: u16,
+    /// `PR_VALUE`: value of path-request stamps this node generates.
+    pub pr_value_fp: u16,
+    /// `LR_COST`.
+    pub lr_cost_fp: u16,
+    /// `LINK_STAMP_TIMEOUT`, in milliseconds.
+    pub lr_stamp_timeout_ms: u32,
+    /// `PR_STAMP_TIMEOUT`, in milliseconds.
+    pub pr_stamp_timeout_ms: u32,
+}
+
+impl StampPolicy {
+    pub const DEFAULT: Self = Self {
+        stamps_enabled: true,
+        stamps_enforced: false,
+        lr_stamps_enforced: false,
+        stamp_destinations: false,
+        stamp_prs: false,
+        stamp_lrs: true,
+        always_stamp_lrs: false,
+        destination_cost_fp: DESTINATION_COST_FP,
+        destination_value_fp: DESTINATION_VALUE_FP,
+        pr_cost_fp: PR_COST_FP,
+        pr_value_fp: PR_VALUE_FP,
+        lr_cost_fp: LR_COST_FP,
+        lr_stamp_timeout_ms: STAMP_TIMEOUT_MS,
+        pr_stamp_timeout_ms: STAMP_TIMEOUT_MS,
+    };
+
+    /// Python `min(v, STAMP_COST_CAP)`.
+    pub const fn clamp_cost_fp(fp: u16) -> u16 {
+        if fp > STAMP_COST_CAP_FP {
+            STAMP_COST_CAP_FP
+        } else {
+            fp
+        }
+    }
+
+    /// Python `min(v, LINK_COST_CAP)`.
+    pub const fn clamp_link_cost_fp(fp: u16) -> u16 {
+        if fp > LINK_COST_CAP_FP {
+            LINK_COST_CAP_FP
+        } else {
+            fp
+        }
+    }
+
+    /// Python `max(0.020, v)`.
+    pub const fn clamp_timeout_ms(ms: u32) -> u32 {
+        if ms < STAMP_TIMEOUT_FLOOR_MS {
+            STAMP_TIMEOUT_FLOOR_MS
+        } else {
+            ms
+        }
+    }
+
+    /// The `enable_stamping` switch.
+    pub fn enable_stamping(&mut self) {
+        self.stamp_destinations = true;
+        self.stamp_prs = true;
+        self.stamp_lrs = true;
+    }
+
+    /// The `enforce_stamps` switch.
+    pub fn enforce(&mut self) {
+        self.stamps_enforced = true;
+        self.lr_stamps_enforced = true;
+    }
+
+    /// Python `Interface.destination_cost`: the interface value, else the global, capped.
+    pub const fn interface_destination_cost_fp(&self, interface_cost_fp: Option<u16>) -> u16 {
+        Self::clamp_cost_fp(match interface_cost_fp {
+            Some(fp) => fp,
+            None => self.destination_cost_fp,
+        })
+    }
+
+    /// Python `Interface.pr_cost`: the interface value, else the global, capped.
+    pub const fn interface_pr_cost_fp(&self, interface_cost_fp: Option<u16>) -> u16 {
+        Self::clamp_cost_fp(match interface_cost_fp {
+            Some(fp) => fp,
+            None => self.pr_cost_fp,
+        })
+    }
+}
+
+impl Default for StampPolicy {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,5 +849,21 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn policy_switches_and_clamps_follow_upstream() {
+        let mut p = StampPolicy::default();
+        p.enable_stamping();
+        assert!(p.stamp_destinations && p.stamp_prs && p.stamp_lrs && !p.stamps_enforced);
+        let mut p = StampPolicy::default();
+        p.enforce();
+        assert!(p.stamps_enforced && p.lr_stamps_enforced && !p.stamp_prs);
+        assert_eq!(StampPolicy::clamp_cost_fp(30_000), 25_600);
+        assert_eq!(StampPolicy::clamp_link_cost_fp(41 * 256), 40 * 256);
+        assert_eq!(StampPolicy::clamp_timeout_ms(1), 20);
+        assert_eq!(p.interface_pr_cost_fp(Some(1280)), 1280);
+        assert_eq!(p.interface_pr_cost_fp(None), 4045);
+        assert_eq!(p.interface_destination_cost_fp(Some(u16::MAX)), 25_600);
     }
 }
