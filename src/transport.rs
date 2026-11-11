@@ -2171,7 +2171,11 @@ impl<
             None if policy.stamp_prs => Some(&LENIENT_PATH_REQUEST_EXT),
             ext => ext,
         };
-        if self.config.transport_enabled && mode_discovers_unknown_paths(mode) {
+        // An Endpoint's host fans a forwarded request out itself and cannot apply
+        // `BOUNDARY_SEARCH_MODES`, so only a Router searches for a Boundary arrival.
+        let searches = mode_discovers_unknown_paths(mode)
+            && (M::ROUTER || mode != crate::config::InterfaceMode::Boundary);
+        if self.config.transport_enabled && searches {
             let Some(slot) = self
                 .interface_slot(interface_id)
                 .filter(|&slot| self.interfaces.facts(slot).outbound())
@@ -4750,6 +4754,23 @@ mod tests {
         assert_eq!(view.header.destination_hash, path_request_destination());
         assert_eq!(&view.payload[..16], &requested);
         assert_eq!(&view.payload[16..32], &TRANSPORT_ID);
+    }
+
+    #[test]
+    fn endpoint_does_not_search_for_a_boundary_arrival() {
+        // Upstream limits a Boundary search to BOUNDARY_SEARCH_MODES targets
+        // (Transport.py:3781-3783@1.6.0); an Endpoint's host cannot apply that.
+        let mut node = node();
+        let request = path_request([0x77; 16], [0x66; 16]);
+        let action = node
+            .ingest(
+                request.as_slice(),
+                RxMeta::with_mode(IFACE, InterfaceMode::Boundary),
+                1000,
+            )
+            .unwrap();
+        assert_eq!(action, IngestAction::Dropped);
+        assert!(node.take_queued().is_none());
     }
 
     #[test]
