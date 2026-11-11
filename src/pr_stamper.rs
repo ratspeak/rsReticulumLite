@@ -63,20 +63,23 @@ pub fn pr_stamp_material(destination_hash: &Hash16, tag: &[u8; 16]) -> [u8; 32] 
     material
 }
 
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CachedStamp {
+pub struct CachedStamp {
     material: [u8; 32],
     stamp: PathRequestStamp,
 }
 
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Started {
+pub struct Started {
     deadline_ms: u64,
     attempts: u64,
 }
 
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Slot {
+pub struct Slot {
     job: PathRequestStampJob,
     started: Option<Started>,
 }
@@ -106,8 +109,10 @@ pub enum StamperStep {
 /// `Q` queue slots, the running job included, and a cache of at most `C` stamps.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PathRequestStamper<const Q: usize, const C: usize> {
-    queue: Queue<Slot, Q>,
-    cache: Queue<CachedStamp, C>,
+    #[doc(hidden)]
+    pub queue: Queue<Slot, Q>,
+    #[doc(hidden)]
+    pub cache: Queue<CachedStamp, C>,
 }
 
 impl<const Q: usize, const C: usize> PathRequestStamper<Q, C> {
