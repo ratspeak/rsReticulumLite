@@ -25,8 +25,8 @@
       "str": "TCPInterface[Golden Uplink/[::1]:4242]"
     }
   },
-  "note": "Tunnel synthesis vectors from the REAL RNS 1.5.5 Transport.synthesize_tunnel (fixed identity and random hash). Regenerate only via gen_tunnel_vectors.py.",
-  "rns_version": "1.5.5",
+  "note": "Tunnel synthesis vectors from the REAL RNS 1.6.0 Transport.synthesize_tunnel (fixed identity and random hash). Regenerate only via gen_tunnel_vectors.py.",
+  "rns_version": "1.6.0",
   "syntheses": {
     "first_connect": {
       "identity": "first",

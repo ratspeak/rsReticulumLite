@@ -11,7 +11,7 @@ permissions:
 
 env:
   RSLITE_RSRETICULUM_COMMIT: 14241a383910e6ee7665303eff1e7c8d98957cc0
-  RSLITE_PYTHON_RNS_VERSION: "1.5.5"
+  RSLITE_PYTHON_RNS_VERSION: "1.6.0"
 
 jobs:
   quality:
@@ -82,7 +82,7 @@ jobs:
         working-directory: rsReticulumLite
 
   python-vectors:
-    name: Python RNS 1.5.5 bidirectional vectors
+    name: Python RNS 1.6.0 bidirectional vectors
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
