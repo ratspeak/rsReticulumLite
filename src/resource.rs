@@ -602,9 +602,11 @@ impl<'a> PartRequestView<'a> {
     }
 }
 
-/// Receiver window controlled by the host: grow after a batch, shrink after a timeout.
-/// Fields are public; preserve sensible bounds when changing them. Receiver methods add
-/// `window` to the completed-part index, and counters increment without saturation.
+/// Receiver window controlled by the host (Resource.py:633-638, 866-875, 916-940@1.6.0).
+/// The host calls [`Self::on_first_part`] for the first part after each request,
+/// [`Self::grow`] and then [`Self::on_window_drained`] when a request's parts have all
+/// arrived, and [`Self::shrink`] on a part timeout. Rates are given as bytes over
+/// elapsed milliseconds and compared exactly, without floating point.
 #[derive(Clone, Copy, Debug)]
 pub struct WindowState {
     pub window: usize,
@@ -625,55 +627,86 @@ impl WindowState {
         }
     }
 
-    /// Grow after a completed batch; `rate` is bytes/sec, or zero for no estimate.
-    /// Zero leaves rate counters unchanged. Four fast observations promote the ceiling to 75;
-    /// two very-slow observations reduce it to four and clamp the current window. Intermediate
-    /// rates clear both counters but do not restore the initial ceiling. Zero observations
-    /// between qualifying observations do not break their run.
-    pub fn grow(&mut self, rate: usize) {
+    /// Start from the window the previous incoming resource on the Link ended with;
+    /// zero or `None` keeps the initial window (Resource.py:218-221).
+    pub fn with_previous_window(previous_window: Option<usize>) -> Self {
+        let mut state = Self::new();
+        if let Some(window) = previous_window.filter(|window| *window > 0) {
+            state.window = window;
+        }
+        state
+    }
+
+    /// Grow after a drained request round; the minimum follows a growing window.
+    pub fn grow(&mut self) {
         if self.window < self.window_max {
             self.window += 1;
-            // saturating: a very-slow demotion can clamp `window` below `window_min` (Python's
-            // signed comparison is false there; a plain sub underflows).
+            // saturating: a carried-over window can sit below `window_min`.
             if self.window.saturating_sub(self.window_min) > (WINDOW_FLEXIBILITY - 1) {
                 self.window_min += 1;
             }
         }
-        if rate == 0 {
-            // Unknown rate: tier counters untouched.
-        } else if rate > RATE_FAST {
-            self.fast_rate_rounds += 1;
-            self.very_slow_rate_rounds = 0;
-            if self.fast_rate_rounds >= FAST_RATE_THRESHOLD {
-                self.window_max = WINDOW_MAX_FAST;
-            }
-        } else if rate < RATE_VERY_SLOW {
-            self.very_slow_rate_rounds += 1;
-            self.fast_rate_rounds = 0;
-            if self.very_slow_rate_rounds >= VERY_SLOW_RATE_THRESHOLD {
-                self.window_max = WINDOW_MAX_VERY_SLOW;
-                if self.window > self.window_max {
-                    self.window = self.window_max;
-                }
-            }
-        } else {
-            self.fast_rate_rounds = 0;
-            self.very_slow_rate_rounds = 0;
+    }
+
+    /// Count a fast round from the first part after a request: `bytes` is that part's raw
+    /// packet length plus the request's raw packet length, `elapsed_ms` the time since the
+    /// request was sent. Zero elapsed time counts nothing. Fast rounds are never reset.
+    pub fn on_first_part(&mut self, bytes: usize, elapsed_ms: u64) {
+        if elapsed_ms > 0 {
+            self.count_fast(bytes, elapsed_ms);
         }
     }
 
-    /// Shrink after a timeout, keeping the flexibility band.
+    /// Count rounds from a drained request: `bytes` of part data received for it over
+    /// `elapsed_ms` since it was sent. Very-slow rounds count only before any fast round,
+    /// and demotion leaves the current window unclamped.
+    pub fn on_window_drained(&mut self, bytes: usize, elapsed_ms: u64) {
+        if elapsed_ms == 0 {
+            return;
+        }
+        self.count_fast(bytes, elapsed_ms);
+        if self.fast_rate_rounds == 0
+            && rate_below(bytes, elapsed_ms, RATE_VERY_SLOW)
+            && self.very_slow_rate_rounds < VERY_SLOW_RATE_THRESHOLD
+        {
+            self.very_slow_rate_rounds += 1;
+            if self.very_slow_rate_rounds == VERY_SLOW_RATE_THRESHOLD {
+                self.window_max = WINDOW_MAX_VERY_SLOW;
+            }
+        }
+    }
+
+    fn count_fast(&mut self, bytes: usize, elapsed_ms: u64) {
+        if rate_above(bytes, elapsed_ms, RATE_FAST) && self.fast_rate_rounds < FAST_RATE_THRESHOLD {
+            self.fast_rate_rounds += 1;
+            if self.fast_rate_rounds == FAST_RATE_THRESHOLD {
+                self.window_max = WINDOW_MAX_FAST;
+            }
+        }
+    }
+
+    /// Shrink after a part timeout. Nothing changes at the window minimum; otherwise the
+    /// ceiling follows, closing a gap wider than the flexibility by one more step.
     pub fn shrink(&mut self) {
         if self.window > self.window_min {
             self.window -= 1;
-        }
-        if self.window_max > self.window_min {
-            self.window_max -= 1;
-        }
-        if self.window_max.saturating_sub(self.window) > WINDOW_FLEXIBILITY - 1 {
-            self.window_max -= 1;
+            if self.window_max > self.window_min {
+                self.window_max -= 1;
+                if self.window_max.saturating_sub(self.window) > WINDOW_FLEXIBILITY - 1 {
+                    self.window_max -= 1;
+                }
+            }
         }
     }
+}
+
+// `bytes / (elapsed_ms / 1000)` against `rate`, exactly; the products saturate.
+fn rate_above(bytes: usize, elapsed_ms: u64, rate: usize) -> bool {
+    (bytes as u64).saturating_mul(1000) > (rate as u64).saturating_mul(elapsed_ms)
+}
+
+fn rate_below(bytes: usize, elapsed_ms: u64, rate: usize) -> bool {
+    (bytes as u64).saturating_mul(1000) < (rate as u64).saturating_mul(elapsed_ms)
 }
 
 impl Default for WindowState {
@@ -1255,7 +1288,9 @@ pub enum AdvWatchdogAction {
     Wait,
     /// Re-send the stored advertisement; the deadline restarts from this poll's `now_ms`.
     Resend,
-    /// Retries exhausted — fail the transfer (terminal; later polls return `Wait`).
+    /// Retries exhausted — fail the transfer and, while the Link is active, send the
+    /// resource hash with RESOURCE_ICL context (Resource.py:1124-1132@1.6.0). Terminal;
+    /// later polls return `Wait`.
     Failed,
 }
 
@@ -1880,65 +1915,50 @@ mod tests {
         assert!(has_map_hash_collision(&dup));
     }
 
-    // Regression: a very-slow demotion can clamp `window` below an already-raised `window_min`;
-    // the next promoted grow must not underflow `window - window_min` (Python's signed comparison
-    // is simply false there).
     #[test]
-    fn window_grow_survives_demote_then_promote() {
-        let mut w = WindowState::new();
-        for _ in 0..6 {
-            w.grow(1000);
-        }
-        assert_eq!((w.window, w.window_min, w.window_max), (10, 7, 10));
-        for _ in 0..VERY_SLOW_RATE_THRESHOLD {
-            w.grow(RATE_VERY_SLOW - 1);
-        }
-        assert_eq!(
-            (w.window, w.window_min, w.window_max),
-            (WINDOW_MAX_VERY_SLOW, 7, WINDOW_MAX_VERY_SLOW)
-        );
-        for _ in 0..FAST_RATE_THRESHOLD + 1 {
-            w.grow(RATE_FAST + 1);
-        }
-        assert_eq!(w.window_max, WINDOW_MAX_FAST);
-        assert_eq!(w.window, 5);
-        assert_eq!(w.window_min, 7); // unchanged: window has not outgrown the band
-    }
-
-    // Rate 0 (host has no estimate — the common clockless-MCU case) must not count as a
-    // very-slow round and demote the ceiling.
-    #[test]
-    fn window_grow_rate_zero_is_neutral() {
-        let mut w = WindowState::new();
-        for _ in 0..8 {
-            w.grow(0);
-        }
-        assert_eq!(w.window_max, WINDOW_MAX_SLOW);
-        assert_eq!(w.very_slow_rate_rounds, 0);
-        assert_eq!(w.window, WINDOW_MAX_SLOW.min(WINDOW_INITIAL + 8));
-    }
-
-    #[test]
-    fn window_state_grows_and_shrinks_like_reference() {
+    fn window_rounds_follow_the_reference_rules() {
         let mut w = WindowState::new();
         assert_eq!((w.window, w.window_min, w.window_max), (4, 2, 10));
-        // Sustained fast rounds promote the ceiling.
-        for _ in 0..FAST_RATE_THRESHOLD {
-            w.grow(RATE_FAST + 1);
+        for _ in 0..6 {
+            w.grow();
+        }
+        assert_eq!((w.window, w.window_min, w.window_max), (10, 7, 10));
+        // Exactly RATE_VERY_SLOW is not very slow; one byte less is.
+        w.on_window_drained(RATE_VERY_SLOW, 1000);
+        assert_eq!(w.very_slow_rate_rounds, 0);
+        for _ in 0..VERY_SLOW_RATE_THRESHOLD + 1 {
+            w.on_window_drained(RATE_VERY_SLOW - 1, 1000);
+        }
+        // Demotion lowers the ceiling but leaves the window, and the counter stops.
+        assert_eq!((w.window, w.window_max), (10, WINDOW_MAX_VERY_SLOW));
+        assert_eq!(w.very_slow_rate_rounds, VERY_SLOW_RATE_THRESHOLD);
+        // Zero elapsed time is no sample.
+        w.on_first_part(1_000_000, 0);
+        assert_eq!(w.fast_rate_rounds, 0);
+        w.on_first_part(RATE_FAST, 1000);
+        assert_eq!(w.fast_rate_rounds, 0);
+        for _ in 0..FAST_RATE_THRESHOLD + 1 {
+            w.on_first_part(RATE_FAST + 1, 1000);
         }
         assert_eq!(w.window_max, WINDOW_MAX_FAST);
-        // Sustained very-slow rounds demote and clamp.
+        assert_eq!(w.fast_rate_rounds, FAST_RATE_THRESHOLD);
+    }
+
+    #[test]
+    fn window_shrink_is_nested_under_the_window_minimum() {
         let mut w = WindowState::new();
-        for _ in 0..VERY_SLOW_RATE_THRESHOLD + 3 {
-            w.grow(RATE_VERY_SLOW - 1);
-        }
-        assert_eq!(w.window_max, WINDOW_MAX_VERY_SLOW);
-        assert!(w.window <= w.window_max);
-        // Shrink floors at window_min.
-        for _ in 0..20 {
-            w.shrink();
-        }
-        assert_eq!(w.window, w.window_min);
+        w.window = w.window_min;
+        w.shrink();
+        assert_eq!((w.window, w.window_max), (WINDOW_MIN, WINDOW_MAX_SLOW));
+        let mut w = WindowState::new();
+        w.shrink();
+        // 4 -> 3, ceiling 10 -> 9 -> 8 because the gap stays wider than the flexibility.
+        assert_eq!((w.window, w.window_max), (3, 8));
+        assert_eq!(
+            WindowState::with_previous_window(Some(0)).window,
+            WINDOW_INITIAL
+        );
+        assert_eq!(WindowState::with_previous_window(Some(9)).window, 9);
     }
 
     #[test]

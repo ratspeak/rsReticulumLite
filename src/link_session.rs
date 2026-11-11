@@ -216,11 +216,12 @@ impl ResponderSession {
     /// before a context-specific check fails, so consume only the returned event.
     /// Authentication failures leave session state unchanged.
     ///
-    /// Application data requires `Active` or `Stale`; identification can arrive
-    /// during `Handshake`. The first valid identity is retained, but later valid
-    /// identifications still refresh liveness. An authenticated RTT that is not a
-    /// msgpack number returns [`SessionError::MalformedRtt`]. Keepalive requests are
-    /// unencrypted and can revive a stale session. The caller applies authorization
+    /// Application data and identification are accepted from `Handshake` on, so a
+    /// request that overtakes the RTT packet is answered. The first valid identity is
+    /// retained, but later valid identifications still refresh liveness. An
+    /// authenticated RTT that is not a msgpack number returns
+    /// [`SessionError::MalformedRtt`]. Keepalive requests are unencrypted and can
+    /// revive a stale session. The caller applies authorization
     /// and replay policy before acting on application data.
     pub fn receive(
         &mut self,
@@ -282,10 +283,8 @@ impl ResponderSession {
                 self.state = SessionState::Closed;
                 Ok(Received::Closed)
             }
+            // Data may overtake the LRRTT; upstream decrypts it on any open link (Link.py:1024-1032).
             PacketContext::None => {
-                if self.state == SessionState::Handshake {
-                    return Err(SessionError::State);
-                }
                 let len = link_decrypt(&self.keys, payload, plaintext)?;
                 self.record_inbound(now_ms);
                 Ok(Received::Data(len))
@@ -294,7 +293,7 @@ impl ResponderSession {
         }
     }
 
-    /// Encrypt application data in `Active` or `Stale` state and record
+    /// Encrypt application data in any state but `Closed` and record
     /// `now_ms` as outbound activity on success. Supply fresh, unpredictable IV
     /// bytes and keep plaintext within [`crate::link::LINK_MDU`]; the Token helper
     /// allows a larger buffer ceiling. Success constructs a payload, not proof of
@@ -306,7 +305,7 @@ impl ResponderSession {
         out: &mut [u8],
         now_ms: u64,
     ) -> Result<usize, SessionError> {
-        if !matches!(self.state, SessionState::Active | SessionState::Stale) {
+        if self.state == SessionState::Closed {
             return Err(SessionError::State);
         }
         let len = link_encrypt(&self.keys, plaintext, iv, out)?;
@@ -533,8 +532,11 @@ mod tests {
         let (data, len) = sealed(&keys, b"early");
         assert_eq!(
             session.receive(PacketContext::None, &data[..len], 1_100, &mut buf),
-            Err(SessionError::State)
+            Ok(Received::Data(5))
         );
+        let mut out = [0u8; 128];
+        assert!(session.seal(b"reply", &[1; 16], &mut out, 1_150).is_ok());
+        assert_eq!(session.state(), SessionState::Handshake);
         activate(&mut session, &keys, 1_400, 0.25);
         assert_eq!(session.rtt_ms(), Some(400));
         // 400 ms × 360 / 1.75 = 82.3 s; stale at twice that.

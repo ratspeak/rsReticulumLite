@@ -169,7 +169,7 @@ impl SignallingData {
         }
     }
 
-    /// Check the wire domain: mode 0..=7 and MTU zero or 500..=0x1F_FFFF.
+    /// Check the wire domain: mode 0..=7 and MTU 0..=0x1F_FFFF.
     /// Zero becomes 500. This accepts modes and MTUs the fixed endpoint does not
     /// support; it does not mask out-of-range input.
     pub fn try_new(mode: u8, mtu: u32) -> Result<Self, LinkError> {
@@ -183,12 +183,13 @@ impl SignallingData {
         })
     }
 
-    /// Return 500 for MTU zero, otherwise require 500..=0x1F_FFFF.
+    /// Return 500 for MTU zero, otherwise any 21-bit value, as `Link.mtu_from_lr_packet`
+    /// adopts it (Link.py:155-158, 202-203@1.6.0).
     /// Does not check mode or mutate the stored trailer used for signatures.
     pub fn effective_mtu(self) -> Result<u32, LinkError> {
         match self.mtu {
             0 => Ok(crate::constants::MTU as u32),
-            500..=MTU_BYTEMASK => Ok(self.mtu),
+            1..=MTU_BYTEMASK => Ok(self.mtu),
             _ => Err(LinkError::InvalidMtu),
         }
     }
@@ -827,16 +828,18 @@ mod tests {
     }
     #[test]
     fn checked_signalling_domain_and_builders_do_not_mask() {
-        for mtu in 1..500 {
-            assert_eq!(SignallingData::try_new(1, mtu), Err(LinkError::InvalidMtu));
+        for mtu in [1, 499] {
             let mut request = [0u8; LINK_REQUEST_LEN];
             request[64..].copy_from_slice(&SignallingData::new(1, mtu).pack());
-            assert_eq!(LinkRequestView::parse(&request), Err(LinkError::InvalidMtu));
+            assert_eq!(
+                LinkRequestView::parse(&request).unwrap().signalling.mtu,
+                mtu
+            );
             let mut proof = [0u8; LINK_PROOF_LEN];
             proof[96..].copy_from_slice(&request[64..]);
-            assert_eq!(LinkProofView::parse(&proof), Err(LinkError::InvalidMtu));
+            assert_eq!(LinkProofView::parse(&proof).unwrap().signalling.mtu, mtu);
         }
-        for mtu in [0, 500, 501, MTU_BYTEMASK] {
+        for mtu in [0, 1, 499, 500, 501, MTU_BYTEMASK] {
             assert!(SignallingData::try_new(1, mtu).is_ok());
         }
         for mtu in [MTU_BYTEMASK + 1, u32::MAX] {

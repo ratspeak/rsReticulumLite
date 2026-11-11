@@ -688,7 +688,11 @@ fn lite_adv_watchdog_matches_trusted_check_timeout() {
 
     trusted.started_at = Instant::now() - Duration::from_secs(60);
     now_ms += 60_000;
-    assert!(matches!(trusted.check_timeout(), TransferAction::Failed(_)));
+    // The trusted sender cancels with ICL first; Lite leaves that send to the host.
+    assert!(matches!(
+        trusted.check_timeout(),
+        TransferAction::SendCancel(rns_protocol::resource::CancelType::Icl, _)
+    ));
     assert_eq!(lite.poll(now_ms, rtt_ms), AdvWatchdogAction::Failed);
     assert_eq!(trusted.resource.state, ResourceState::Failed);
 
@@ -1389,6 +1393,108 @@ fn tunnel_synthesis_matches_rsreticulum() {
             assert_eq!(&parsed.public_key, lite.public_key());
             assert_eq!(parsed.interface_hash, hash);
             assert!(parsed.is_signed(), "the trusted hub verifies it");
+        }
+    }
+}
+
+#[test]
+fn lite_resource_window_matches_trusted_window_rules() {
+    use rns_lite_core::resource::WindowState as Lite;
+    use rns_protocol::resource::WindowState as Trusted;
+
+    #[derive(Clone, Copy)]
+    enum Step {
+        Grow,
+        Shrink,
+        FirstPart(usize, u64),
+        Drained(usize, u64),
+    }
+    use Step::*;
+    let slow = Drained(100, 1000);
+    let fast_first = FirstPart(20_000, 1000);
+    let scripts: &[&[Step]] = &[
+        &[
+            Grow, Grow, Grow, Grow, Grow, Grow, slow, slow, slow, Grow, Shrink, Shrink,
+        ],
+        &[
+            fast_first,
+            fast_first,
+            Drained(7000, 1000),
+            fast_first,
+            Grow,
+            Grow,
+            slow,
+            Grow,
+        ],
+        &[
+            Shrink,
+            Shrink,
+            Shrink,
+            Shrink,
+            Grow,
+            Drained(250, 1000),
+            Drained(6250, 1000),
+        ],
+        &[
+            Grow, Grow, Grow, Grow, Grow, Grow, Grow, Grow, Shrink, Shrink, Shrink, Shrink,
+        ],
+        &[
+            slow,
+            fast_first,
+            slow,
+            slow,
+            Grow,
+            Shrink,
+            FirstPart(1, 0),
+            Drained(0, 0),
+        ],
+    ];
+    let snapshot = |w: &Trusted| {
+        (
+            w.window,
+            w.window_min,
+            w.window_max,
+            w.fast_rate_rounds,
+            w.very_slow_rate_rounds,
+        )
+    };
+    for (index, script) in scripts.iter().enumerate() {
+        let mut lite = Lite::new();
+        let mut trusted = Trusted::new();
+        for &step in script.iter() {
+            match step {
+                Grow => {
+                    lite.grow();
+                    trusted.grow();
+                }
+                Shrink => {
+                    lite.shrink();
+                    trusted.shrink();
+                }
+                FirstPart(bytes, ms) => {
+                    lite.on_first_part(bytes, ms);
+                    if ms > 0 {
+                        trusted.on_first_part(bytes as f64 * 1000.0 / ms as f64);
+                    }
+                }
+                Drained(bytes, ms) => {
+                    lite.on_window_drained(bytes, ms);
+                    if ms > 0 {
+                        trusted.on_window_drained(bytes as f64 * 1000.0 / ms as f64);
+                    }
+                }
+            }
+            assert_eq!(
+                (
+                    lite.window,
+                    lite.window_min,
+                    lite.window_max,
+                    lite.fast_rate_rounds,
+                    lite.very_slow_rate_rounds
+                ),
+                snapshot(&trusted),
+                "script {index}"
+            );
         }
     }
 }

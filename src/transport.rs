@@ -1719,13 +1719,6 @@ impl<
         meta: RxMeta,
         now_ms: u64,
     ) -> Result<IngestAction, TransportError> {
-        // Our own announce echoed back by another relay (trusted inbound.rs "dropping own
-        // announce"): learning it would create a phantom self-path and rebroadcast our
-        // announce as if transported.
-        if self.is_own_destination(&header.destination_hash) {
-            self.stats.dropped = self.stats.dropped.saturating_add(1);
-            return Ok(IngestAction::Dropped);
-        }
         if !self.announce_admission.admit(
             self.config.announce_admission,
             header.context == PacketContext::PathResponse,
@@ -1794,6 +1787,11 @@ impl<
                 now_ms,
                 stamp.lr_cost_fp,
             )?;
+        }
+        // Own announces are validated and remembered but route nothing (Transport.py:2453-2454).
+        if self.is_own_destination(&header.destination_hash) {
+            self.stats.dropped = self.stats.dropped.saturating_add(1);
+            return Ok(IngestAction::Dropped);
         }
         // Trusted inbound.rs announce gate on POST-INCREMENT hops, a deliberate tightening beyond
         // Python's `< M+1`: a path stored at PATHFINDER_M hops is provably dead under the parse
@@ -2336,7 +2334,8 @@ impl<
             if raw.len() - original_header.size() == crate::link::LINK_REQUEST_LEN {
                 forwarded.set_len(forwarded.len() - crate::link::LINK_MTU_SIZE)?;
             }
-        } else if request.signalling.mtu != 500 {
+        } else if request.signalling.mtu > 500 {
+            // Only an offer above the base needs a rewrite, which non-default modes cannot take.
             return Err(TransportError::UnsupportedTransitModeTransform);
         }
 
@@ -3557,13 +3556,21 @@ mod tests {
     }
 
     #[test]
-    fn own_destination_announce_echo_is_dropped_not_learned() {
+    fn own_destination_announce_echo_is_validated_but_never_routed() {
         let mut node =
             SmallNode::new(LiteConfig::ESP32_LORA_TRANSPORT_SMALL, TRANSPORT_ID).unwrap();
         let ann = signed_announce([0x21u8; 32], "lxmf.delivery", b"self");
         assert!(node.register_own_destination(ann.destination_hash));
-        // Our announce echoed back by a neighbouring relay (hops bumped): dropped — no
-        // phantom self-path, nothing scheduled for rebroadcast.
+        let mut forged = ann.raw;
+        let last = forged.len() - 1;
+        forged.as_mut_slice()[last] ^= 0x01;
+        forged.as_mut_slice()[1] = 1;
+        assert!(matches!(
+            node.ingest(forged.as_slice(), RxMeta::new(IFACE), 1000),
+            Err(TransportError::Announce(_))
+        ));
+        assert_eq!(node.stats().validation_failures, 1);
+        // A valid echo is remembered but learns no path and schedules no rebroadcast.
         let mut echoed = ann.raw;
         echoed.as_mut_slice()[1] = 1;
         let action = node
@@ -3571,6 +3578,10 @@ mod tests {
             .unwrap();
         assert_eq!(action, IngestAction::Dropped);
         assert!(!node.has_path(&ann.destination_hash, 1000));
+        assert!(
+            node.known_destination_recall(&ann.destination_hash)
+                .is_some()
+        );
         node.tick(5000);
         assert!(node.take_queued().is_none());
         // Other destinations still learn normally.
@@ -5742,7 +5753,7 @@ mod tests {
                 let id = link_id_from_raw(request.as_slice(), HeaderType::Header2);
                 let before = n.packet_hashes;
                 let result = n.ingest(request.as_slice(), RxMeta::new(9), 1100);
-                if mtu == 499 || (mode != 1 && mtu != 500) {
+                if mode != 1 && mtu > 500 {
                     assert!(result.is_err());
                     assert!(n.links.get(&id, 1100).is_none());
                     assert_eq!(n.outbound_len(), 0);
@@ -5790,7 +5801,7 @@ mod tests {
         n.ingest(request.as_slice(), RxMeta::new(9), 1100).unwrap();
         while n.take_queued().is_some() {}
         let pending = *n.links.get(&id, 1100).unwrap();
-        for (mode, mtu) in [(0, 500), (7, 500), (1, 499), (1, 501)] {
+        for (mode, mtu) in [(0, 500), (7, 500), (1, 501)] {
             let mut proof = lrproof(id, 0, seed);
             let offset = PacketView::parse(proof.as_slice()).unwrap().header.size();
             let trailer = crate::link::SignallingData::new(mode, mtu).pack();
