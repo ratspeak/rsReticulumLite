@@ -1196,6 +1196,18 @@ fn link_session_serves_a_trusted_initiator_end_to_end() {
     );
 }
 
+/// Frames go through the actor's class queues, not the query mailbox, so wait for them to empty.
+async fn drain_inbound_queues(queues: &rns_transport::inbound_queues::InboundQueues) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while queues.snapshot().heights.iter().any(|&height| height != 0) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "trusted actor stalled"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
 // RNS 1.5.5 packet_filter as trusted rns-transport runs it (actor/inbound.rs): after the
 // repeating contexts, PLAIN and GROUP packets are dropped when announced or beyond one wire hop.
 // The trusted actor records packet metrics only for packets past that filter, so a metrics
@@ -1252,6 +1264,7 @@ fn plain_and_group_filter_matches_trusted_transport() {
         .unwrap();
     runtime.block_on(async {
         let (actor, actor_tx) = TransportActor::new();
+        let queues = actor.inbound_queues();
         tokio::spawn(actor.run());
         let (frames, _frames) = tokio::sync::mpsc::channel(256);
         let entry = InterfaceEntry::new(
@@ -1298,6 +1311,7 @@ fn plain_and_group_filter_matches_trusted_transport() {
                             }))
                             .await
                             .unwrap();
+                        drain_inbound_queues(&queues).await;
                         let (response_tx, response) = tokio::sync::oneshot::channel();
                         actor_tx
                             .send(TransportMessage::Rpc {
