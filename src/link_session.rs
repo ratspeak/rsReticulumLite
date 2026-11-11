@@ -28,6 +28,8 @@ const STALE_TIME_DEFAULT_MS: u64 = 720_000;
 const STALE_FACTOR: u64 = 2;
 const STALE_GRACE_MS: u64 = 5_000;
 const KEEPALIVE_TIMEOUT_FACTOR: u64 = 4;
+/// Link.py `WATCHDOG_MAX_SLEEP`: every watchdog sleep, the stale grace included, is clamped to it.
+const WATCHDOG_MAX_SLEEP_MS: u64 = 5_000;
 
 /// Keepalive payloads, sent unencrypted.
 pub const KEEPALIVE_REQUEST: u8 = 0xFF;
@@ -47,6 +49,9 @@ pub enum SessionError {
     Crypto(CryptoError),
     /// The packet is not valid in the session's state.
     State,
+    /// The RTT packet decrypted to something other than a msgpack number. The session
+    /// stays in `Handshake`; tear it down, as Link.py does (Link.py:622-624).
+    MalformedRtt,
 }
 
 impl From<LinkError> for SessionError {
@@ -213,8 +218,8 @@ impl ResponderSession {
     ///
     /// Application data requires `Active` or `Stale`; identification can arrive
     /// during `Handshake`. The first valid identity is retained, but later valid
-    /// identifications still refresh liveness. An authenticated RTT with invalid
-    /// RTT encoding activates using the local measurement. Keepalive requests are
+    /// identifications still refresh liveness. An authenticated RTT that is not a
+    /// msgpack number returns [`SessionError::MalformedRtt`]. Keepalive requests are
     /// unencrypted and can revive a stale session. The caller applies authorization
     /// and replay policy before acting on application data.
     pub fn receive(
@@ -243,9 +248,9 @@ impl ResponderSession {
                     return Err(SessionError::State);
                 }
                 let len = link_decrypt(&self.keys, payload, plaintext)?;
+                let peer = peer_rtt_ms(&plaintext[..len]).ok_or(SessionError::MalformedRtt)?;
                 let local_rtt = now_ms.saturating_sub(self.request_ms);
-                let rtt =
-                    peer_rtt_ms(&plaintext[..len]).map_or(local_rtt, |peer| peer.max(local_rtt));
+                let rtt = peer.map_or(local_rtt, |peer| peer.max(local_rtt));
                 self.rtt_ms = Some(rtt);
                 // Trusted `KEEPALIVE_MAX / KEEPALIVE_MAX_RTT` = 360 / 1.75 = 1440 / 7.
                 self.keepalive_ms =
@@ -359,7 +364,8 @@ impl ResponderSession {
                     .rtt_ms
                     .unwrap_or(1_000)
                     .saturating_mul(KEEPALIVE_TIMEOUT_FACTOR)
-                    .saturating_add(STALE_GRACE_MS);
+                    .saturating_add(STALE_GRACE_MS)
+                    .min(WATCHDOG_MAX_SLEEP_MS);
                 if self
                     .stale_since_ms
                     .is_some_and(|since| now_ms.saturating_sub(since) >= grace)
@@ -381,25 +387,42 @@ impl ResponderSession {
     }
 }
 
-/// The initiator's measured RTT, a msgpack float. NaN and negative values never count; larger ones
-/// saturate at the default stale time.
-fn peer_rtt_ms(plaintext: &[u8]) -> Option<u64> {
-    let seconds = match plaintext {
-        [0xcb, rest @ ..] if rest.len() == 8 => f64::from_be_bytes(rest.try_into().ok()?),
-        [0xca, rest @ ..] if rest.len() == 4 => {
-            f64::from(f32::from_be_bytes(rest.try_into().ok()?))
-        }
+/// The initiator's measured RTT: any msgpack number or boolean, trailing bytes ignored, as
+/// `umsgpack.unpackb` reads it. `None` is not a number; `Some(None)` is a number that never
+/// beats the local measurement (NaN or negative). Larger values saturate at the default stale time.
+#[allow(clippy::option_option)]
+fn peer_rtt_ms(plaintext: &[u8]) -> Option<Option<u64>> {
+    let (&code, rest) = plaintext.split_first()?;
+    let be = |n: usize| -> Option<u64> {
+        let bytes = rest.get(..n)?;
+        Some(bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b)))
+    };
+    let seconds = match code {
+        0x00..=0x7f => f64::from(code),
+        0xe0..=0xff => -1.0,
+        0xc2 => 0.0,
+        0xc3 => 1.0,
+        0xcc => be(1)? as f64,
+        0xcd => be(2)? as f64,
+        0xce => be(4)? as f64,
+        0xcf => be(8)? as f64,
+        0xd0 => f64::from(*rest.first()? as i8),
+        0xd1 => f64::from(be(2)? as u16 as i16),
+        0xd2 => f64::from(be(4)? as u32 as i32),
+        0xd3 => be(8)? as i64 as f64,
+        0xca => f64::from(f32::from_bits(be(4)? as u32)),
+        0xcb => f64::from_bits(be(8)?),
         _ => return None,
     };
     if seconds.is_nan() || seconds < 0.0 {
-        return None;
+        return Some(None);
     }
     let millis = seconds * 1_000.0;
-    Some(if millis >= STALE_TIME_DEFAULT_MS as f64 {
+    Some(Some(if millis >= STALE_TIME_DEFAULT_MS as f64 {
         STALE_TIME_DEFAULT_MS
     } else {
         millis as u64
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -518,10 +541,10 @@ mod tests {
         assert_eq!(session.keepalive_ms(), 82_285);
         assert_eq!(session.tick(1_400 + 2 * 82_285 - 1), TickAction::None);
         assert_eq!(session.tick(1_400 + 2 * 82_285), TickAction::Stale);
-        // Grace is four RTTs plus five seconds.
+        // Four RTTs plus five seconds, clamped to the watchdog's longest sleep.
         let stale_at = 1_400 + 2 * 82_285;
-        assert_eq!(session.tick(stale_at + 6_599), TickAction::None);
-        assert_eq!(session.tick(stale_at + 6_600), TickAction::Teardown);
+        assert_eq!(session.tick(stale_at + 4_999), TickAction::None);
+        assert_eq!(session.tick(stale_at + 5_000), TickAction::Teardown);
         let mut close = [0u8; 80];
         let len = session.teardown(&[7; 16], &mut close).unwrap();
         assert_eq!(len, 80);
@@ -534,14 +557,13 @@ mod tests {
 
     #[test]
     fn peer_rtt_is_bounded_and_falls_back_to_the_measured_one() {
-        assert_eq!(peer_rtt_ms(&rtt(1.5)), Some(1_500));
-        assert_eq!(peer_rtt_ms(&rtt(f64::NAN)), None);
-        assert_eq!(peer_rtt_ms(&rtt(-1.0)), None);
-        assert_eq!(peer_rtt_ms(&rtt(1e9)), Some(STALE_TIME_DEFAULT_MS));
+        assert_eq!(peer_rtt_ms(&rtt(1.5)), Some(Some(1_500)));
+        assert_eq!(peer_rtt_ms(&rtt(f64::NAN)), Some(None));
+        assert_eq!(peer_rtt_ms(&rtt(-1.0)), Some(None));
+        assert_eq!(peer_rtt_ms(&rtt(1e9)), Some(Some(STALE_TIME_DEFAULT_MS)));
         let mut float32 = [0xca; 5];
         float32[1..].copy_from_slice(&0.5f32.to_be_bytes());
-        assert_eq!(peer_rtt_ms(&float32), Some(500));
-        assert_eq!(peer_rtt_ms(&[0x01]), None);
+        assert_eq!(peer_rtt_ms(&float32), Some(Some(500)));
         let (mut session, keys) = accepted(0);
         activate(&mut session, &keys, 3_000, f64::NAN);
         assert_eq!(session.rtt_ms(), Some(3_000));
@@ -549,6 +571,30 @@ mod tests {
             session.keepalive_ms(),
             KEEPALIVE_DEFAULT_MS.min(3_000 * 1_440 / 7)
         );
+    }
+
+    #[test]
+    fn rtt_that_is_not_a_number_is_refused_and_any_msgpack_number_activates() {
+        let mut buf = [0u8; 64];
+        for bad in [&[0xc0][..], &[0xa1, b'x'], &[0x90]] {
+            let (mut session, keys) = accepted(0);
+            let (packet, len) = sealed(&keys, bad);
+            assert_eq!(
+                session.receive(PacketContext::Lrrtt, &packet[..len], 100, &mut buf),
+                Err(SessionError::MalformedRtt)
+            );
+            assert_eq!(session.state(), SessionState::Handshake);
+        }
+        // umsgpack.unpackb reads 5, True and -1 as numbers; max(measured, rtt) keeps 3 s, 1 s, 0.1 s.
+        for (good, rtt) in [(&[0x05][..], 5_000), (&[0xc3], 1_000), (&[0xd0, 0xff], 100)] {
+            let (mut session, keys) = accepted(0);
+            let (packet, len) = sealed(&keys, good);
+            assert_eq!(
+                session.receive(PacketContext::Lrrtt, &packet[..len], 100, &mut buf),
+                Ok(Received::Activated)
+            );
+            assert_eq!(session.rtt_ms(), Some(rtt));
+        }
     }
 
     #[test]

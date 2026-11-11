@@ -302,6 +302,13 @@ impl<
         }
     }
 
+    fn interface_mode(&self, interface: InterfaceId) -> Option<InterfaceMode> {
+        self.interfaces
+            .router()
+            .and_then(|r| r.interface(interface))
+            .map(|i| i.mode)
+    }
+
     pub(super) fn is_local_client_interface(&self, interface: InterfaceId) -> bool {
         self.interfaces
             .slot(interface)
@@ -362,7 +369,15 @@ impl<
                 .and_then(|r| r.registry.at_slot(slot))
                 .copied();
             if let Some(target) = target {
-                if !local_only || target.role == InterfaceRole::LocalClient {
+                // Transport.py:3938-3940@1.6.0: a Boundary search reaches only BOUNDARY_SEARCH_MODES.
+                let filtered = reason == OutboundReason::PathRequestForward
+                    && !local_only
+                    && self.interface_mode(source) == Some(InterfaceMode::Boundary)
+                    && !matches!(
+                        target.mode,
+                        InterfaceMode::Boundary | InterfaceMode::Gateway
+                    );
+                if !filtered && (!local_only || target.role == InterfaceRole::LocalClient) {
                     queued += usize::from(self.enqueue_forwarded_with_lifetime(
                         source, target.id, packet, reason, lifetime,
                     ));
@@ -519,12 +534,7 @@ impl<
     pub(super) fn announce_current(&self, announce: &ScheduledAnnounce, now_ms: u64) -> bool {
         self.paths
             .get_live(&announce.destination_hash, now_ms)
-            .is_some_and(|path| {
-                PacketView::parse(announce.packet.as_slice()).is_ok_and(|view| {
-                    packet_hash(announce.packet.as_slice(), view.header.flags.header_type)
-                        == path.packet_hash
-                })
-            })
+            .is_some_and(|path| same_emission_packet(&announce.packet, &path.packet_hash))
     }
 
     pub(super) fn bridge_plain_broadcast(

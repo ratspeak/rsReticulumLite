@@ -212,6 +212,8 @@ pub struct PathEntry {
     /// For a new destination, eviction prefers bulk entries; a bulk newcomer
     /// cannot evict a non-bulk path. Existing-destination updates are separate.
     pub bulk: bool,
+    /// A failed link attempt marked this route unresponsive (Transport.py:3624-3629@1.6.0).
+    pub unresponsive: bool,
 }
 
 impl PathEntry {
@@ -293,18 +295,49 @@ impl<const N: usize> PathTable<N> {
             .and_then(|entry| entry.is_live(now_ms).then_some(entry))
     }
 
-    /// Refresh a successfully used route without changing its incarnation or lifetime span.
-    /// Adapted from trusted `PathEntry::touch`; queue wait alone never refreshes a route.
-    pub fn touch(&mut self, destination_hash: &Hash16, now_ms: u64) {
-        if let Some(entry) = self
+    /// Renew a route on proof of destination liveness, like Python `mark_path_responsive`
+    /// (Transport.py:3632-3648@1.6.0): the lifetime restarts at `now_ms` with the span it
+    /// was learned with, and the route is responsive again.
+    pub fn mark_responsive(&mut self, destination_hash: &Hash16, now_ms: u64) -> bool {
+        let Some(entry) = self
             .entries
             .iter_mut()
             .flatten()
             .find(|entry| &entry.destination_hash == destination_hash && entry.is_live(now_ms))
+        else {
+            return false;
+        };
+        let lifetime = entry.expires_ms.saturating_sub(entry.last_seen_ms);
+        entry.last_seen_ms = now_ms;
+        entry.expires_ms = now_ms.saturating_add(lifetime);
+        entry.unresponsive = false;
+        true
+    }
+
+    /// Python `mark_path_unresponsive` (Transport.py:3624-3629@1.6.0).
+    pub fn mark_unresponsive(&mut self, destination_hash: &Hash16) -> bool {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| &entry.destination_hash == destination_hash)
+        else {
+            return false;
+        };
+        entry.unresponsive = true;
+        true
+    }
+
+    /// Set a route's hop count in place, as a transit LRPROOF rebalance does
+    /// (Transport.py:2905-2906@1.6.0).
+    pub fn set_hops(&mut self, destination_hash: &Hash16, hops: u8) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| &entry.destination_hash == destination_hash)
         {
-            let lifetime = entry.expires_ms.saturating_sub(entry.last_seen_ms);
-            entry.last_seen_ms = now_ms;
-            entry.expires_ms = now_ms.saturating_add(lifetime);
+            entry.hops = hops;
         }
     }
 
@@ -375,8 +408,8 @@ impl<const N: usize> PathTable<N> {
                 // Farther hop: accept only if the path expired or the announce is newer.
                 !random_seen
             } else {
-                // Same emission (lite has no unresponsive-path tracking) or older: ignore.
-                false
+                // Transport.py:2571-2577@1.6.0: the same emission replaces only an unresponsive route.
+                new_emitted == old_emitted && old.unresponsive
             };
             return should_replace && self.replace_entry(idx, entry);
         }
@@ -527,6 +560,9 @@ pub struct ScheduledAnnounce {
     /// Registry interface slots still owed this rebroadcast, each waiting on its announce gate
     /// (trusted per-interface announce queue). Zero for hosts without a registry.
     pub pending_targets: u8,
+    /// Set aside while a path response for the destination waits (Python `held_announces`,
+    /// Transport.py:3858-3866@1.6.0): never due and invisible to destination lookups.
+    pub held: bool,
 }
 
 impl ScheduledAnnounce {
@@ -560,11 +596,9 @@ impl<const N: usize> AnnounceSchedule<N> {
     /// use physical slot order. Insertion itself does not check an airtime gate.
     pub fn insert(&mut self, entry: ScheduledAnnounce, now_ms: u64) {
         self.expire(now_ms);
-        if let Some(slot) = self
-            .entries
-            .iter_mut()
-            .find(|slot| slot.is_some_and(|old| old.destination_hash == entry.destination_hash))
-        {
+        if let Some(slot) = self.entries.iter_mut().find(|slot| {
+            slot.is_some_and(|old| !old.held && old.destination_hash == entry.destination_hash)
+        }) {
             *slot = Some(entry);
             return;
         }
@@ -643,7 +677,7 @@ impl<const N: usize> AnnounceSchedule<N> {
         let idx = self
             .entries
             .iter()
-            .position(|entry| entry.is_some_and(|entry| now_ms >= entry.due_ms))?;
+            .position(|entry| entry.is_some_and(|entry| !entry.held && now_ms >= entry.due_ms))?;
         self.entries[idx].take()
     }
 
@@ -651,15 +685,54 @@ impl<const N: usize> AnnounceSchedule<N> {
         self.entries
             .iter_mut()
             .flatten()
-            .find(|entry| entry.destination_hash == *destination_hash)
+            .find(|entry| !entry.held && entry.destination_hash == *destination_hash)
     }
 
     pub fn remove(&mut self, destination_hash: &Hash16) {
         for slot in &mut self.entries {
-            if slot.is_some_and(|entry| entry.destination_hash == *destination_hash) {
+            if slot.is_some_and(|entry| !entry.held && entry.destination_hash == *destination_hash)
+            {
                 *slot = None;
             }
         }
+    }
+
+    /// Hold the destination's queued entry, replacing any entry held before.
+    pub fn hold(&mut self, destination_hash: &Hash16) {
+        if self.get_mut(destination_hash).is_none() {
+            return;
+        }
+        for slot in &mut self.entries {
+            if let Some(entry) = slot
+                .as_mut()
+                .filter(|e| e.destination_hash == *destination_hash)
+            {
+                if entry.held {
+                    *slot = None;
+                } else {
+                    entry.held = true;
+                }
+            }
+        }
+    }
+
+    /// Reinsert the destination's held entry (Transport.py:962-965@1.6.0).
+    pub fn release_held(&mut self, destination_hash: &Hash16) -> bool {
+        if !self
+            .entries
+            .iter()
+            .flatten()
+            .any(|entry| entry.held && entry.destination_hash == *destination_hash)
+        {
+            return false;
+        }
+        self.remove(destination_hash);
+        for entry in self.entries.iter_mut().flatten() {
+            if entry.destination_hash == *destination_hash {
+                entry.held = false;
+            }
+        }
+        true
     }
 
     pub fn remove_interface(&mut self, interface: InterfaceId) {
@@ -838,6 +911,8 @@ impl<const N: usize> Default for ReverseTable<N> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LinkEntry {
     pub link_id: Hash16,
+    /// Destination the link request was forwarded to.
+    pub destination_hash: Hash16,
     /// Identity authenticated by the destination's announce when the request was admitted.
     /// Retained independently of the route table so path churn cannot break LRPROOF validation.
     pub destination_ed25519: Option<[u8; 32]>,
@@ -969,10 +1044,22 @@ impl<const N: usize> LinkTable<N> {
             .entries
             .iter_mut()
             .flatten()
-            .find(|entry| &entry.link_id == link_id)
+            .find(|entry| &entry.link_id == link_id && now_ms < entry.expires_ms)
         {
             entry.validated = true;
             entry.expires_ms = expires_ms;
+        }
+    }
+
+    /// Set a live Link's remaining hops after a validated rebalancing proof.
+    pub fn set_remaining_hops(&mut self, link_id: &Hash16, hops: u8, now_ms: u64) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| &entry.link_id == link_id && now_ms < entry.expires_ms)
+        {
+            entry.remaining_hops = hops;
         }
     }
 
@@ -982,18 +1069,29 @@ impl<const N: usize> LinkTable<N> {
             .entries
             .iter_mut()
             .flatten()
-            .find(|entry| &entry.link_id == link_id)
+            .find(|entry| &entry.link_id == link_id && now_ms < entry.expires_ms)
         {
             entry.expires_ms = expires_ms;
         }
     }
 
+    /// Clear expired validated Links. Expired unvalidated Links stay, invisible to
+    /// lookups, until [`Self::pop_unproven`] takes them.
     pub fn expire(&mut self, now_ms: u64) {
         for slot in &mut self.entries {
-            if slot.is_some_and(|entry| now_ms >= entry.expires_ms) {
+            if slot.is_some_and(|entry| entry.validated && now_ms >= entry.expires_ms) {
                 *slot = None;
             }
         }
+    }
+
+    /// Remove and return one expired unvalidated Link, for the link-table cull
+    /// of Transport.py:1041-1043@1.6.0.
+    pub fn pop_unproven(&mut self, now_ms: u64) -> Option<LinkEntry> {
+        let slot = self.entries.iter_mut().find(|slot| {
+            slot.is_some_and(|entry| !entry.validated && now_ms >= entry.expires_ms)
+        })?;
+        slot.take()
     }
 }
 
@@ -1050,6 +1148,121 @@ impl<const N: usize> RequestTagTable<N> {
                 *slot = None;
             }
         }
+    }
+}
+
+/// Announce validation results by packet hash, oldest replaced first (Python
+/// `announce_valid_cache` / `announce_invalid_cache`, Identity.py:676-790@1.6.0, at a size an
+/// MCU can hold). The packet hash covers the destination hash and every signed field, so a
+/// cached verdict holds for every copy; checks against local state are not cached.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnnounceValidations<const N: usize> {
+    #[doc(hidden)]
+    pub entries: [Option<(Hash32, Option<crate::identity::AnnounceError>)>; N],
+    #[doc(hidden)]
+    pub next: usize,
+}
+
+impl<const N: usize> AnnounceValidations<N> {
+    pub fn clear(&mut self) {
+        self.entries.fill(None);
+        self.next = 0;
+    }
+
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; N],
+            next: 0,
+        }
+    }
+
+    /// `Some(None)` for a valid announce, `Some(Some(error))` for an invalid one.
+    pub fn get(&self, packet_hash: &Hash32) -> Option<Option<crate::identity::AnnounceError>> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|(hash, _)| hash == packet_hash)
+            .map(|(_, verdict)| *verdict)
+    }
+
+    pub fn insert(&mut self, packet_hash: Hash32, verdict: Option<crate::identity::AnnounceError>) {
+        if N == 0 {
+            return;
+        }
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|(hash, _)| *hash == packet_hash)
+        {
+            entry.1 = verdict;
+            return;
+        }
+        self.entries[self.next % N] = Some((packet_hash, verdict));
+        self.next = (self.next + 1) % N;
+    }
+}
+
+impl<const N: usize> Default for AnnounceValidations<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// When this node last requested a path to each destination (Python `path_requests`,
+/// Transport.py:3714, :3744@1.6.0). When full, the oldest request is forgotten.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PathRequestTimes<const N: usize> {
+    #[doc(hidden)]
+    pub entries: [Option<(Hash16, u64)>; N],
+}
+
+impl<const N: usize> PathRequestTimes<N> {
+    pub fn clear(&mut self) {
+        self.entries.fill(None);
+    }
+
+    pub const fn new() -> Self {
+        Self { entries: [None; N] }
+    }
+
+    pub fn record(&mut self, destination_hash: Hash16, now_ms: u64) {
+        let idx = self
+            .entries
+            .iter()
+            .position(|slot| slot.is_some_and(|(dest, _)| dest == destination_hash))
+            .or_else(|| self.entries.iter().position(Option::is_none))
+            .or_else(|| oldest_index(&self.entries, |(_, at)| at));
+        if let Some(idx) = idx {
+            self.entries[idx] = Some((destination_hash, now_ms));
+        }
+    }
+
+    /// Forget the destination, returning whether it was recorded.
+    pub fn take(&mut self, destination_hash: &Hash16) -> bool {
+        let Some(slot) = self
+            .entries
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|(dest, _)| dest == *destination_hash))
+        else {
+            return false;
+        };
+        *slot = None;
+        true
+    }
+
+    pub fn last(&self, destination_hash: &Hash16) -> Option<u64> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|(dest, _)| dest == destination_hash)
+            .map(|(_, at)| *at)
+    }
+}
+
+impl<const N: usize> Default for PathRequestTimes<N> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1124,6 +1337,7 @@ mod tests {
             random_hash: [destination; RANDOM_HASH_LENGTH],
             public_key: [destination; PUBLIC_KEY_LENGTH],
             bulk: false,
+            unresponsive: false,
         }
     }
 
@@ -1149,6 +1363,7 @@ mod tests {
             retries: 0,
             local_rebroadcasts: 0,
             pending_targets: 0,
+            held: false,
         }
     }
 
@@ -1156,6 +1371,7 @@ mod tests {
         ScheduledAnnounce {
             hops,
             pending_targets: targets,
+            held: false,
             ..scheduled_announce(destination, ScheduledAnnounce::PENDING_ONLY, learned_ms)
         }
     }
@@ -1164,6 +1380,7 @@ mod tests {
     fn bulk_paths_only_displace_bulk_paths() {
         let bulk = |destination, expires_ms| PathEntry {
             bulk: true,
+            unresponsive: false,
             ..path(destination, expires_ms)
         };
         let present =
@@ -1229,6 +1446,7 @@ mod tests {
         let mut schedule: AnnounceSchedule<1> = AnnounceSchedule::new();
         let entry = ScheduledAnnounce {
             pending_targets: 0b1,
+            held: false,
             ..scheduled_announce(1, 500, 1_000)
         };
         schedule.insert(entry, 0);
@@ -1261,6 +1479,7 @@ mod tests {
         schedule.insert(
             ScheduledAnnounce {
                 pending_targets: 0b01,
+                held: false,
                 ..scheduled_announce(3, 10, 100)
             },
             0,
@@ -1443,6 +1662,7 @@ mod tests {
         table.insert(
             LinkEntry {
                 link_id: [1; 16],
+                destination_hash: [1; 16],
                 destination_ed25519: Some([0xAA; 32]),
                 receiving_interface: 1,
                 outbound_interface: 2,
@@ -1458,6 +1678,7 @@ mod tests {
         table.insert(
             LinkEntry {
                 link_id: [2; 16],
+                destination_hash: [2; 16],
                 destination_ed25519: Some([0xBB; 32]),
                 receiving_interface: 1,
                 outbound_interface: 2,
@@ -1473,6 +1694,7 @@ mod tests {
         table.insert(
             LinkEntry {
                 link_id: [3; 16],
+                destination_hash: [3; 16],
                 destination_ed25519: Some([0xCC; 32]),
                 receiving_interface: 1,
                 outbound_interface: 2,
@@ -1533,6 +1755,7 @@ mod tests {
     fn link(key: u8, expires_ms: u64) -> LinkEntry {
         LinkEntry {
             link_id: [key; 16],
+            destination_hash: [key; 16],
             destination_ed25519: Some([3; 32]),
             receiving_interface: 1,
             outbound_interface: 2,
@@ -1613,6 +1836,10 @@ mod tests {
         assert_eq!(table.generation(&[2; 16], 0), Some(held));
         assert!(table.get_generation(held, 199).unwrap().validated);
         table.expire(10); // earlier hole must not hide a later matching key
+        assert_eq!(
+            table.pop_unproven(10).map(|link| link.link_id),
+            Some([1; 16])
+        );
         table.insert(link(2, 200), 10);
         assert_eq!(table.entries.iter().flatten().count(), 1);
         assert!(table.get_generation(held, 10).is_none());

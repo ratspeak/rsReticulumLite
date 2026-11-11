@@ -31,9 +31,9 @@ use crate::pr_stamper::{
 };
 use crate::stamps::{NETWORK_STAMP_SIZE, StampPolicy};
 use crate::tables::{
-    AnnounceCache, AnnounceSchedule, CachedAnnounce, Hash16, InterfaceId, LinkEntry, LinkTable,
-    PacketHashTable, PathEntry, PathTable, Queue, RequestTagTable, ReverseEntry, ReverseTable,
-    ScheduledAnnounce,
+    AnnounceCache, AnnounceSchedule, AnnounceValidations, CachedAnnounce, Hash16, InterfaceId,
+    LinkEntry, LinkTable, PacketHashTable, PathEntry, PathRequestTimes, PathTable, Queue,
+    RequestTagTable, ReverseEntry, ReverseTable, ScheduledAnnounce,
 };
 use crate::wire::{
     DestinationType, HeaderType, PacketContext, PacketFlags, PacketHeader, PacketType, PacketView,
@@ -44,7 +44,7 @@ use crate::wire::{
 pub type SmallNode = LiteNode<256, 512, 64, 64, 32, 64, 64, KNOWN_DESTINATIONS_SMALL>;
 pub type Esp32PsramNode = LiteNode<1024, 2048, 128, 128, 64, 256, 128, KNOWN_DESTINATIONS_SMALL>;
 /// Smallest preset, paired with [`LiteConfig::ESP32_LORA_TRANSPORT_MICRO`].
-/// Tests assert a 32 KiB node budget on their build target. Check the actual target layout,
+/// Tests assert a 33 KiB node budget on their build target. Check the actual target layout,
 /// construction temporaries and available device memory before allocating it.
 /// It has no room for path-request stamp generation: with `stamp_prs` on, its requests are
 /// refused with [`TransportError::StampQueueFull`]. Hosts that stamp name a larger stamper.
@@ -69,6 +69,14 @@ pub enum LocalSlot {
 }
 
 const HASHLIST_LIFETIME_MS: u64 = 120_000;
+/// Announce validation verdicts kept; Python keeps 128 of each kind (Identity.py:682, :702@1.6.0).
+const ANNOUNCE_VALIDATION_CACHE: usize = 8;
+/// Transport.py:179-181@1.6.0 `PATH_REQUEST_GRACE`, `PATH_REQUEST_RG`, `PATH_REQUEST_MI`.
+const PATH_REQUEST_GRACE_MS: u64 = 400;
+const PATH_REQUEST_RG_MS: u64 = 1_500;
+const PATH_REQUEST_MI_MS: u64 = 20_000;
+/// Transport.py:178@1.6.0 `PATH_REQUEST_GATE_TIMEOUT`.
+const PATH_REQUEST_GATE_TIMEOUT_MS: u64 = 45_000;
 // Upstream PATHFINDER_RW = 0.5s: announce rebroadcast jitter window is [0,500)ms.
 // (No RNG on MCUs: the offset mixes the packet hash with the node's transport ID.)
 const DEFAULT_ANNOUNCE_JITTER_MS: u64 = 500;
@@ -439,6 +447,11 @@ pub struct LiteNode<
     pub links: LinkTable<LINKS>,
     #[doc(hidden)]
     pub request_tags: RequestTagTable<TAGS>,
+    pub path_request_times: PathRequestTimes<LINKS>,
+    /// Path requests waiting on a local client's answer (Python `pending_local_path_requests`).
+    pub pending_local_path_requests: PathRequestTimes<LINKS>,
+    /// Destinations with a path request being handled (Python `inflight_path_requests`).
+    pub inflight_path_requests: PathRequestTimes<LINKS>,
     #[doc(hidden)]
     pub outbound: Queue<QueuedOutbound<M::Delivery>, OUTBOUND>,
     #[doc(hidden)]
@@ -451,6 +464,7 @@ pub struct LiteNode<
     pub interfaces: M,
     #[doc(hidden)]
     pub stats: TransportStats,
+    pub announce_validations: AnnounceValidations<ANNOUNCE_VALIDATION_CACHE>,
     #[doc(hidden)]
     pub pr_stamper: PathRequestStamper<PR_QUEUE, PR_CACHE>,
 }
@@ -532,11 +546,15 @@ impl<
             reverse: ReverseTable::new(),
             links: LinkTable::new(),
             request_tags: RequestTagTable::new(),
+            path_request_times: PathRequestTimes::new(),
+            pending_local_path_requests: PathRequestTimes::new(),
+            inflight_path_requests: PathRequestTimes::new(),
             outbound: Queue::new(),
             last_delivery_identity: 0,
             retained_owner_mode: false,
             discoveries: Discoveries::new(),
             interfaces: M::EMPTY,
+            announce_validations: AnnounceValidations::new(),
             stats: TransportStats {
                 accepted: 0,
                 duplicates: 0,
@@ -700,9 +718,13 @@ impl<
         self.reverse.clear();
         self.links.clear();
         self.request_tags.clear();
+        self.path_request_times.clear();
+        self.pending_local_path_requests.clear();
+        self.inflight_path_requests.clear();
         self.outbound.clear();
         self.discoveries.clear();
         self.pr_stamper.clear();
+        self.announce_validations.clear();
         self.stats = TransportStats::default();
         Ok(())
     }
@@ -970,6 +992,7 @@ impl<
         if !self.enqueue(interface_id, request, OutboundReason::PathRequest) {
             return Err(self.egress_error(interface_id, request.len()));
         }
+        self.path_request_times.record(*destination_hash, now_ms);
         let mut tag_key = [0u8; 32];
         tag_key[..16].copy_from_slice(destination_hash);
         tag_key[16..].copy_from_slice(tag);
@@ -1264,6 +1287,75 @@ impl<
         Ok(())
     }
 
+    fn cull_unproven_links(&mut self, now_ms: u64) {
+        self.links.expire(now_ms);
+        while let Some(link) = self.links.pop_unproven(now_ms) {
+            self.rediscover_after_unproven_link(link, now_ms);
+        }
+    }
+
+    /// Transport.py:1041-1115@1.6.0: a transit link that never saw its proof may mean the
+    /// path is gone or the destination moved; ask again, and distrust a one-hop route.
+    fn rediscover_after_unproven_link(&mut self, link: LinkEntry, now_ms: u64) {
+        let destination = link.destination_hash;
+        let throttled = self
+            .path_request_times
+            .last(&destination)
+            .is_some_and(|at| now_ms.saturating_sub(at) < PATH_REQUEST_MI_MS);
+        let path_hops = self
+            .paths
+            .get_live(&destination, now_ms)
+            .map(|path| path.hops);
+        let blocked = if path_hops.is_none() || (!throttled && link.taken_hops == 0) {
+            None
+        } else if !throttled && (path_hops == Some(1) || link.taken_hops == 1) {
+            let boundary = self
+                .interface_slot(link.receiving_interface)
+                .is_some_and(|slot| self.interfaces.facts(slot).mode == InterfaceMode::Boundary);
+            if self.config.transport_enabled && !boundary {
+                self.paths.mark_unresponsive(&destination);
+            }
+            Some(link.receiving_interface)
+        } else {
+            return;
+        };
+        let _ = self.send_rediscovery_request(destination, blocked, now_ms);
+        if !self.config.transport_enabled {
+            self.paths.drop_path(&destination);
+        }
+    }
+
+    /// Transport.py:4061-4080@1.6.0: one request on every interface but `blocked`.
+    fn send_rediscovery_request(
+        &mut self,
+        destination: Hash16,
+        blocked: Option<InterfaceId>,
+        now_ms: u64,
+    ) -> Result<(), TransportError> {
+        self.path_request_times.record(destination, now_ms);
+        // No RNG here: the tag only has to be fresh, so derive it from this node and the time.
+        let mut material = [0u8; 40];
+        material[..16].copy_from_slice(&self.transport_id);
+        material[16..32].copy_from_slice(&destination);
+        material[32..].copy_from_slice(&now_ms.to_be_bytes());
+        let tag = crate::wire::truncated_hash(&material);
+        if self.config.stamp_policy.stamp_prs {
+            return self.queue_path_request_stamp(
+                destination,
+                tag,
+                PathRequestTarget::AllExcept(blocked.unwrap_or(InterfaceId::MAX)),
+            );
+        }
+        let request = self.build_path_request(destination, &tag, None)?;
+        for slot in 0..REQUESTERS {
+            let target = self.interfaces.facts(slot);
+            if target.outbound() && Some(target.id) != blocked {
+                self.enqueue(target.id, request, OutboundReason::PathRequest);
+            }
+        }
+        Ok(())
+    }
+
     fn outbound_interface_online(&self, interface_id: InterfaceId) -> bool {
         self.interfaces.online(interface_id)
     }
@@ -1288,7 +1380,7 @@ impl<
         self.announce_cache.retain_paths(&self.paths, now_ms);
         self.announce_schedule.expire(now_ms);
         self.reverse.expire(now_ms);
-        self.links.expire(now_ms);
+        self.cull_unproven_links(now_ms);
         self.request_tags.expire(now_ms);
         self.expire_outbound(now_ms);
 
@@ -1297,12 +1389,7 @@ impl<
                 continue;
             };
             let path_hash = path.packet_hash;
-            if !announce.block_rebroadcast
-                && PacketView::parse(announce.packet.as_slice()).map_or(true, |view| {
-                    packet_hash(announce.packet.as_slice(), view.header.flags.header_type)
-                        != path_hash
-                })
-            {
+            if !announce.block_rebroadcast && !same_emission_packet(&announce.packet, &path_hash) {
                 continue;
             }
             if !announce.block_rebroadcast && M::ROUTER {
@@ -1322,6 +1409,13 @@ impl<
                         OutboundReason::AnnounceRebroadcast
                     },
                 );
+            }
+            // Transport.py:962-965@1.6.0: a held announce takes the slot back after this send.
+            if self
+                .announce_schedule
+                .release_held(&announce.destination_hash)
+            {
+                continue;
             }
             // Trusted maintenance.rs: count the send, retry once PATHFINDER_G later.
             announce.retries = announce.retries.saturating_add(1);
@@ -1660,9 +1754,37 @@ impl<
             .known_destinations
             .peek(&header.destination_hash)
             .or_else(|| self.paths.known_public_key(&header.destination_hash));
-        let mut scratch = [0u8; ANNOUNCE_SCRATCH_MAX];
-        let identity_hash =
-            announce.validate(&header.destination_hash, known_public_key, &mut scratch)?;
+        let validation_hash = packet_hash(raw, view.header.flags.header_type);
+        let identity_hash = match self.announce_validations.get(&validation_hash) {
+            Some(Some(error)) => return Err(error.into()),
+            Some(None) => {
+                if known_public_key.is_some_and(|known| known != &announce.public_key) {
+                    return Err(AnnounceError::PublicKeyChanged.into());
+                }
+                announce.identity_hash()
+            }
+            None => {
+                let mut scratch = [0u8; ANNOUNCE_SCRATCH_MAX];
+                match announce.validate(&header.destination_hash, known_public_key, &mut scratch) {
+                    Ok(identity_hash) => {
+                        self.announce_validations.insert(validation_hash, None);
+                        identity_hash
+                    }
+                    Err(error) => {
+                        if matches!(
+                            error,
+                            AnnounceError::SignatureInvalid
+                                | AnnounceError::DestinationHashMismatch
+                                | AnnounceError::InvalidPublicKey
+                        ) {
+                            self.announce_validations
+                                .insert(validation_hash, Some(error));
+                        }
+                        return Err(error.into());
+                    }
+                }
+            }
+        };
         // Python remembers every validated announce, replays and path responses included,
         // before it decides the path (Transport.py:2172, Identity.py:589), as trusted inbound.rs.
         if KNOWN_DESTINATIONS != 0 && announce.name_hash == name_hash(LXMF_DELIVERY_NAME) {
@@ -1685,17 +1807,22 @@ impl<
         // Trusted inbound.rs: a neighbour carrying our queued rebroadcast cancels its retry. A
         // same-hop copy counts toward LOCAL_REBROADCASTS_MAX; a hops+1 copy before the retry is
         // due was passed on. Runs before the path update, which may replace the entry.
-        if self.config.transport_enabled {
+        // Transport.py:2454-2477@1.6.0: only relayed copies count, every same-hop copy is
+        // counted, and only an entry already sent completes.
+        if self.config.transport_enabled && view.header.transport_id.is_some() {
             let wire_hops = view.header.hops;
             let mut cancel = false;
             if let Some(entry) = self.announce_schedule.get_mut(&header.destination_hash) {
-                if entry.retries > 0 {
-                    if wire_hops == entry.hops {
-                        entry.local_rebroadcasts = entry.local_rebroadcasts.saturating_add(1);
-                        cancel = entry.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX;
-                    } else if wire_hops == entry.hops.saturating_add(1) && now_ms < entry.due_ms {
-                        cancel = true;
-                    }
+                if wire_hops == entry.hops {
+                    entry.local_rebroadcasts = entry.local_rebroadcasts.saturating_add(1);
+                    cancel =
+                        entry.retries > 0 && entry.local_rebroadcasts >= LOCAL_REBROADCASTS_MAX;
+                }
+                if wire_hops == entry.hops.saturating_add(1)
+                    && entry.retries > 0
+                    && now_ms < entry.due_ms
+                {
+                    cancel = true;
                 }
             }
             if cancel {
@@ -1733,6 +1860,7 @@ impl<
             random_hash: announce.random_hash,
             public_key: announce.public_key,
             bulk,
+            unresponsive: false,
         };
 
         let learned = self.paths.insert_or_update(path_entry, now_ms);
@@ -1749,6 +1877,8 @@ impl<
 
         if learned {
             let _ = identity_hash;
+            // Transport.py:2751-2754@1.6.0: a learned path resolves the in-flight request.
+            self.inflight_path_requests.take(&header.destination_hash);
             self.stats.learned_announces = self.stats.learned_announces.saturating_add(1);
 
             // Cache the announce only when the path was actually learned/replaced. Upstream caches
@@ -1779,7 +1909,17 @@ impl<
             // path/contact is kept) but is NOT rebroadcast — skip gracefully instead of erroring
             // after the path was already inserted. (Conformant senders keep announces <= MDU, so
             // this only fires for an over-large directly-received announce.)
-            if self.config.transport_enabled && header.context != PacketContext::PathResponse {
+            // Transport.py:2627-2645@1.6.0: a local client's answer to a waiting request goes
+            // out once, at once.
+            let pending_local_answer = header.context == PacketContext::PathResponse
+                && M::ROUTER
+                && self.is_local_client_interface(meta.interface_id)
+                && self
+                    .pending_local_path_requests
+                    .take(&header.destination_hash);
+            if (self.config.transport_enabled && header.context != PacketContext::PathResponse)
+                || pending_local_answer
+            {
                 if let Ok(packet) = self.transport_announce_from_raw(
                     raw,
                     header.destination_hash,
@@ -1792,14 +1932,23 @@ impl<
                             destination_hash: header.destination_hash,
                             packet,
                             interface_id: meta.interface_id,
-                            due_ms: now_ms.saturating_add(jitter),
+                            due_ms: if pending_local_answer {
+                                now_ms
+                            } else {
+                                now_ms.saturating_add(jitter)
+                            },
                             expires_ms: now_ms
                                 .saturating_add((QUEUED_ANNOUNCE_LIFE_SECS as u64) * 1000),
                             block_rebroadcast: false,
                             hops: header.hops,
-                            retries: 0,
+                            retries: if pending_local_answer {
+                                PATHFINDER_R
+                            } else {
+                                0
+                            },
                             local_rebroadcasts: 0,
                             pending_targets: 0,
+                            held: false,
                         },
                         now_ms,
                     );
@@ -1875,31 +2024,96 @@ impl<
         // our OWN destinations is answered by the HOST (fresh signed announce), never
         // forwarded. Returning Dropped lets the FFI's own-path-request post-check fire in
         // both transport postures.
+        // Transport.py:2135-2157@1.6.0: a request for a destination already in flight joins
+        // its waiting requesters instead of being processed again.
+        if self
+            .inflight_path_requests
+            .last(&requested)
+            .is_some_and(|at| now_ms.saturating_sub(at) <= PATH_REQUEST_GATE_TIMEOUT_MS)
+        {
+            let from_local_client = M::ROUTER && self.is_local_client_interface(interface_id);
+            if self.config.transport_enabled || from_local_client {
+                if let Some(slot) = self.interface_slot(interface_id) {
+                    let timeout = discovery_timeout(self.slowest_outbound_bitrate(interface_id));
+                    let _ = self.discoveries.begin(requested, slot, now_ms, timeout);
+                }
+            }
+            return Ok(IngestAction::Accepted);
+        }
+        self.inflight_path_requests.record(requested, now_ms);
         if self.is_own_destination(&requested) {
+            self.inflight_path_requests.take(&requested);
             return Ok(IngestAction::LocalEndpoint);
+        }
+        // Transport.py:3790-3798@1.6.0: the local client's answer is passed on when it comes.
+        if M::ROUTER
+            && self
+                .paths
+                .get_live(&requested, now_ms)
+                .is_some_and(|path| self.is_local_client_interface(path.interface_id))
+        {
+            self.pending_local_path_requests.record(requested, now_ms);
         }
 
         if let Some(path) = self.paths.get_live(&requested, now_ms) {
+            // Transport.py:3809@1.6.0: a transport node, or any node asked by a local client,
+            // answers from its cache.
+            let from_local_client = M::ROUTER && self.is_local_client_interface(interface_id);
+            let answers = self.config.transport_enabled || from_local_client;
             if requestor_transport_id.is_some_and(|requestor| path.next_hop == Some(requestor)) {
+                // Transport.py:3813, :3965-3969@1.6.0: declined still counts as answered.
+                if answers {
+                    self.inflight_path_requests.take(&requested);
+                }
                 return Ok(IngestAction::Dropped);
             }
             // Roaming self-loop suppression: don't answer for a path learned from the same
             // interface the request arrived on (upstream Transport.py:2941-2942).
             if mode == crate::config::InterfaceMode::Roaming && path.interface_id == interface_id {
+                if answers {
+                    self.inflight_path_requests.take(&requested);
+                }
                 return Ok(IngestAction::Dropped);
             }
-            // Only answer cached path requests when acting as a transport node (upstream gates the
-            // cached answer on transport_enabled || is_from_local_client; lite has no local clients).
-            if self.config.transport_enabled {
+            if answers {
                 if let Some(cached) = self.announce_cache.get(&requested, now_ms) {
                     let response = self.path_response_from_cached_announce(
                         cached.raw.as_slice(),
                         requested,
                         cached.hops,
                     )?;
-                    if !self.enqueue(interface_id, response, OutboundReason::PathResponse) {
-                        return Ok(IngestAction::Dropped);
-                    }
+                    // Transport.py:3842-3856@1.6.0: wait PATH_REQUEST_GRACE (plus PATH_REQUEST_RG
+                    // on a roaming interface) so better-placed peers can answer first.
+                    let delay_ms = if from_local_client
+                        || (M::ROUTER && self.is_local_client_interface(path.interface_id))
+                    {
+                        0
+                    } else if mode == crate::config::InterfaceMode::Roaming {
+                        PATH_REQUEST_GRACE_MS + PATH_REQUEST_RG_MS
+                    } else {
+                        PATH_REQUEST_GRACE_MS
+                    };
+                    let hops = cached.hops;
+                    // Transport.py:3858-3866@1.6.0: a queued announce waits for the answer.
+                    self.announce_schedule.hold(&requested);
+                    self.announce_schedule.insert(
+                        ScheduledAnnounce {
+                            destination_hash: requested,
+                            packet: response,
+                            interface_id,
+                            due_ms: now_ms.saturating_add(delay_ms),
+                            expires_ms: now_ms
+                                .saturating_add(u64::from(QUEUED_ANNOUNCE_LIFE_SECS) * 1000),
+                            block_rebroadcast: true,
+                            hops,
+                            retries: PATHFINDER_R,
+                            local_rebroadcasts: 0,
+                            pending_targets: 0,
+                            held: false,
+                        },
+                        now_ms,
+                    );
+                    self.inflight_path_requests.take(&requested);
                     return Ok(IngestAction::AnsweredPathRequest);
                 }
             }
@@ -2057,7 +2271,6 @@ impl<
         ) {
             return Ok(IngestAction::Dropped);
         }
-        self.paths.touch(&header.destination_hash, now_ms);
         self.reverse.insert(
             ReverseEntry {
                 proof_hash,
@@ -2095,6 +2308,8 @@ impl<
         if self.links.contains_live(&link_id, now_ms) {
             return Ok(IngestAction::Dropped);
         }
+        // An unproven Link's slot is freed only after its rediscovery has run.
+        self.cull_unproven_links(now_ms);
         // Trusted inbound.rs: a full transit table refuses the request instead
         // of evicting a Link that may still carry traffic.
         if !self.links.has_free_slot(now_ms) {
@@ -2132,6 +2347,7 @@ impl<
                 let link_id = link_id_from_raw(raw, original_header.flags.header_type);
                 LinkEntry {
                     link_id,
+                    destination_hash: header.destination_hash,
                     destination_ed25519: path.public_key[32..].try_into().ok(),
                     receiving_interface: meta.interface_id,
                     outbound_interface: target_interface,
@@ -2167,7 +2383,6 @@ impl<
         ) {
             return Ok(IngestAction::Dropped);
         }
-        self.paths.touch(&header.destination_hash, now_ms);
         self.links.insert(entry, now_ms);
         Ok(IngestAction::ForwardedTransport)
     }
@@ -2181,7 +2396,20 @@ impl<
         now_ms: u64,
     ) -> Result<IngestAction, TransportError> {
         if header.context == PacketContext::Lrproof {
-            if let Some(link) = self.links.get(&header.destination_hash, now_ms).copied() {
+            if let Some(mut link) = self.links.get(&header.destination_hash, now_ms).copied() {
+                // Transport.py:2886-2907@1.6.0: a validly signed proof that took a different
+                // number of hops re-balances the link and the path before the hop check.
+                if link.outbound_interface == meta.interface_id
+                    && link.remaining_hops != header.hops
+                    && !link.validated
+                    && self.validate_transit_lrproof(raw, header, link)
+                {
+                    link.remaining_hops = header.hops;
+                    self.links
+                        .set_remaining_hops(&header.destination_hash, header.hops, now_ms);
+                    self.paths.set_hops(&link.destination_hash, header.hops);
+                    self.paths.mark_responsive(&link.destination_hash, now_ms);
+                }
                 if link.outbound_interface == meta.interface_id
                     && link.remaining_hops == header.hops
                 {
@@ -2214,6 +2442,8 @@ impl<
                         now_ms.saturating_add((LINK_TIMEOUT_SECS as u64) * 1000),
                         now_ms,
                     );
+                    // Transport.py:2938@1.6.0: a forwarded link proof shows the destination is alive.
+                    self.paths.mark_responsive(&link.destination_hash, now_ms);
                     return Ok(IngestAction::ForwardedProof);
                 }
             }
@@ -2924,6 +3154,30 @@ fn announce_jitter_ms(packet_hash: &[u8; 32], transport_id: &Hash16, round: u8) 
     raw % DEFAULT_ANNOUNCE_JITTER_MS
 }
 
+/// Whether a queued rebroadcast still carries the announce its path was learned from. A local
+/// client's path response is rebroadcast with context NONE (Transport.py:2592-2645@1.6.0), so
+/// either context matches.
+fn same_emission_packet(packet: &PacketBuffer, path_hash: &[u8; 32]) -> bool {
+    let Ok(view) = PacketView::parse(packet.as_slice()) else {
+        return false;
+    };
+    let header_type = view.header.flags.header_type;
+    if packet_hash(packet.as_slice(), header_type) == *path_hash {
+        return true;
+    }
+    let mut bytes = [0u8; crate::constants::MTU];
+    let raw = packet.as_slice();
+    let Some(copy) = bytes.get_mut(..raw.len()) else {
+        return false;
+    };
+    copy.copy_from_slice(raw);
+    let context_at = view.header.size() - 1;
+    copy[context_at] = PacketContext::PathResponse.to_byte();
+    packet_hash(copy, header_type) == *path_hash
+}
+
+/// Transport.py:3778-3784@1.6.0: `DISCOVER_PATHS_FOR`, plus Boundary, which searches only
+/// `BOUNDARY_SEARCH_MODES` (Interface.py).
 fn mode_discovers_unknown_paths(mode: crate::config::InterfaceMode) -> bool {
     matches!(
         mode,
@@ -2931,6 +3185,7 @@ fn mode_discovers_unknown_paths(mode: crate::config::InterfaceMode) -> bool {
             | crate::config::InterfaceMode::Gateway
             | crate::config::InterfaceMode::Roaming
             | crate::config::InterfaceMode::Internal
+            | crate::config::InterfaceMode::Boundary
     )
 }
 
@@ -3024,7 +3279,7 @@ mod tests {
     #[test]
     fn recursive_micro_budget_capacity_and_disabled_retirement() {
         let mut n = MicroNode::new(LiteConfig::ESP32_LORA_TRANSPORT_MICRO, TRANSPORT_ID).unwrap();
-        assert!(core::mem::size_of_val(&n) <= 32768);
+        assert!(core::mem::size_of_val(&n) <= 33 * 1024);
         for index in 0..4u8 {
             let request = path_request([index; 16], [index; 16]);
             assert_eq!(
@@ -3898,23 +4153,23 @@ mod tests {
         node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
 
-        // Trusted counts neighbour copies only after our own first send.
+        // Transport.py:2464-2471@1.6.0: a copy heard before our first send counts but
+        // cannot complete the entry.
         assert_eq!(
             node.ingest(neighbour.as_slice(), RxMeta::new(IFACE), 1100)
                 .unwrap(),
             IngestAction::AnnounceIgnored
         );
+        assert_eq!(
+            node.announce_schedule
+                .get_mut(&announce.destination_hash)
+                .map(|entry| entry.local_rebroadcasts),
+            Some(1)
+        );
         node.tick(1500);
         assert!(node.take_queued().is_some());
 
         node.ingest(neighbour.as_slice(), RxMeta::new(IFACE), 2000)
-            .unwrap();
-        assert_eq!(
-            node.announce_schedule.entries.iter().flatten().count(),
-            1,
-            "one local copy stays below LOCAL_REBROADCASTS_MAX"
-        );
-        node.ingest(neighbour.as_slice(), RxMeta::new(IFACE), 2100)
             .unwrap();
         node.tick(10_000);
         assert!(
@@ -4025,6 +4280,7 @@ mod tests {
             node.ingest(req.as_slice(), RxMeta::new(9), 1200).unwrap(),
             IngestAction::AnsweredPathRequest
         );
+        node.tick(1200 + PATH_REQUEST_GRACE_MS);
         let out = node.take_queued().unwrap();
         let view = PacketView::parse(out.packet.as_slice()).unwrap();
         let app_data = &view.payload[view.payload.len() - 5..];
@@ -4423,6 +4679,27 @@ mod tests {
     }
 
     #[test]
+    fn repeated_announce_copies_reuse_the_cached_validation() {
+        let announce = signed_announce([0x16; 32], "lxmf.delivery", b"cache");
+        let mut node = node();
+        node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
+            .unwrap();
+        let hash = packet_hash(announce.raw.as_slice(), HeaderType::Header1);
+        assert_eq!(node.announce_validations.get(&hash), Some(None));
+        let mut forged = announce.raw.as_slice().to_vec();
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        let forged_hash = packet_hash(&forged, HeaderType::Header1);
+        for now in [1100, 1200] {
+            assert!(node.ingest(&forged, RxMeta::new(IFACE), now).is_err());
+        }
+        assert_eq!(
+            node.announce_validations.get(&forged_hash),
+            Some(Some(AnnounceError::SignatureInvalid))
+        );
+    }
+
+    #[test]
     fn path_request_is_answered_from_cached_announce() {
         let announce = signed_announce([0x13; 32], "lxmf.delivery", b"node");
         let mut node = node();
@@ -4435,6 +4712,7 @@ mod tests {
             .unwrap();
         assert_eq!(action, IngestAction::AnsweredPathRequest);
 
+        node.tick(1200 + PATH_REQUEST_GRACE_MS);
         let out = node.take_queued().unwrap();
         assert_eq!(out.reason, OutboundReason::PathResponse);
         let view = PacketView::parse(out.packet.as_slice()).unwrap();
@@ -4858,9 +5136,10 @@ mod tests {
         // Cardputer budget (no PSRAM, ~55 KB free heap): the MICRO node must stay <= 32 KB so
         // cap drift can't silently blow the internal-heap allocation.
         let micro = core::mem::size_of::<MicroNode>();
-        // 32,744 since the protocol-violation counter joined the stats; MicroNode carries no stamper.
-        assert_eq!(micro, 32_744, "MicroNode layout changed unexpectedly");
-        assert!(micro <= 32 * 1024, "MicroNode grew to {micro} B (> 32 KB)");
+        // 33,464 since transit links keep their destination, path requests their time,
+        // origin and in-flight state, and announce validations their verdict.
+        assert_eq!(micro, 33_464, "MicroNode layout changed unexpectedly");
+        assert!(micro <= 33 * 1024, "MicroNode grew to {micro} B (> 33 KB)");
         std::println!(
             "MicroNode={micro} SmallNode={} Esp32PsramNode={} OutboundFrame={} OutboundLifetime={} token={}",
             core::mem::size_of::<SmallNode>(),
@@ -5132,6 +5411,7 @@ mod tests {
                     .unwrap(),
                 IngestAction::AnsweredPathRequest
             );
+            node.tick(3000 + PATH_REQUEST_GRACE_MS);
             assert_eq!(
                 node.take_queued().unwrap().reason,
                 OutboundReason::PathResponse
@@ -5681,7 +5961,7 @@ mod tests {
     }
 
     #[test]
-    fn only_successful_forwarding_touches_the_path() {
+    fn forwarding_never_renews_the_path() {
         let mut n = router(&[
             InterfaceConfig::lora_repeater(1, 1000, 4),
             InterfaceConfig::backbone(2, 100000, 4),
@@ -5714,9 +5994,8 @@ mod tests {
             ),
             Ok(IngestAction::ForwardedTransport)
         );
-        let touched = n.path(&ann.destination_hash, 1100).unwrap();
-        assert_eq!(touched.last_seen_ms, 1100);
-        assert_eq!(touched.expires_ms, original.expires_ms + 100);
+        // Transport.py:2387@1.6.0: forwarding marks use only; it never renews the path.
+        assert_eq!(*n.path(&ann.destination_hash, 1100).unwrap(), original);
     }
 
     #[test]
@@ -5946,17 +6225,17 @@ mod tests {
 
     #[test]
     fn endpoint_layout_and_transit_key_storage_remain_bounded() {
-        assert_eq!(core::mem::size_of::<MicroNode>(), 32744);
-        assert_eq!(core::mem::size_of::<SmallNode>(), 216264);
-        assert_eq!(core::mem::size_of::<LinkEntry>(), 72);
+        assert_eq!(core::mem::size_of::<MicroNode>(), 33464);
+        assert_eq!(core::mem::size_of::<SmallNode>(), 220120);
+        assert_eq!(core::mem::size_of::<LinkEntry>(), 88);
         type ConstrainedRouter = LiteNode<16, 64, 16, 8, 4, 16, 8, 0, 4, Router>;
         type PsramRouter = LiteNode<128, 512, 32, 32, 16, 64, 16, 0, 16, Router>;
         if cfg!(target_pointer_width = "64") {
-            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 39272);
-            assert_eq!(core::mem::size_of::<PsramRouter>(), 104872);
+            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 39992);
+            assert_eq!(core::mem::size_of::<PsramRouter>(), 106936);
         } else if cfg!(target_pointer_width = "32") {
-            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 38904);
-            assert_eq!(core::mem::size_of::<PsramRouter>(), 104216);
+            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 39616);
+            assert_eq!(core::mem::size_of::<PsramRouter>(), 106272);
         }
     }
 

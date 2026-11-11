@@ -715,7 +715,7 @@ fn lora_and_tcp_access_point_exchange_path_discovery_without_local_privileges() 
 }
 
 #[test]
-fn boundary_unknown_path_request_falls_back_to_local_clients_only() {
+fn boundary_unknown_path_request_searches_boundary_search_modes_only() {
     let lora = InterfaceConfig::lora(1, 1_074, 2);
     let boundary = InterfaceConfig::backbone(2, 10_000_000, 2);
     let local = InterfaceConfig::local_client(3, 10_000_000, 2);
@@ -727,8 +727,9 @@ fn boundary_unknown_path_request_falls_back_to_local_clients_only() {
             .unwrap(),
         IngestAction::ForwardedPathRequest
     );
-    assert_eq!(node.poll_tx_for_interface(3).unwrap().interface_id, 3);
-    assert!(node.poll_tx_for_interface(1).is_none());
+    // Transport.py:3782-3784, :3938-3940@1.6.0: BOUNDARY_SEARCH_MODES is Boundary and Gateway.
+    assert_eq!(node.poll_tx_for_interface(1).unwrap().interface_id, 1);
+    assert!(node.poll_tx_for_interface(3).is_none());
 }
 
 #[test]
@@ -862,6 +863,7 @@ fn offline_backbone_keeps_descriptor_but_invalidates_cached_reachability_and_hel
             .unwrap(),
         IngestAction::AnsweredPathRequest
     );
+    node.tick(1500);
     let held = node.poll_tx_for_interface(1).unwrap();
     node.set_interface_online(2, false).unwrap();
     assert_eq!(node.interface(2).unwrap().role, InterfaceRole::Backbone);
@@ -1130,9 +1132,15 @@ fn a_neighbour_relay_cancels_a_waiting_rebroadcast() {
         rebroadcast_destination(node.poll_tx_for_interface(LORA).unwrap()),
         first.destination_hash
     );
-    // A neighbour already carried `second` one hop further on LoRa.
+    // A neighbouring transport already carried `second` one hop further on LoRa.
     let relayed = announce_with_hops(2, 2);
-    node.ingest(relayed.raw.as_slice(), RxMeta::new(LORA), 2_500)
+    let view = PacketView::parse(relayed.raw.as_slice()).unwrap();
+    let mut header = view.header;
+    header.flags.header_type = HeaderType::Header2;
+    header.flags.transport_type = TransportType::Transport;
+    header.transport_id = Some([0x99; 16]);
+    let relayed = build_packet(header, view.payload).unwrap();
+    node.ingest(relayed.as_slice(), RxMeta::new(LORA), 2_500)
         .unwrap();
     node.tick(200_000);
     while let Some(frame) = node.poll_tx_for_interface(LORA) {
