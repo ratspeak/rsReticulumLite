@@ -184,7 +184,7 @@ impl SignallingData {
     }
 
     /// Return 500 for MTU zero, otherwise any 21-bit value, as `Link.mtu_from_lr_packet`
-    /// adopts it (Link.py:155-158, 202-203@1.6.0).
+    /// adopts it (Link.py).
     /// Does not check mode or mutate the stored trailer used for signatures.
     pub fn effective_mtu(self) -> Result<u32, LinkError> {
         match self.mtu {
@@ -278,7 +278,7 @@ pub fn build_link_request(
     Ok(LINK_REQUEST_LEN)
 }
 
-/// `destination.hash + sig_pub_bytes`, the material a link-request key stamps (Link.py:191, :365@1.6.0).
+/// `destination.hash + sig_pub_bytes`, the material a link-request key stamps (Link.py).
 pub fn link_stamp_material(
     destination_hash: &[u8; DESTINATION_LENGTH],
     ed25519_pub: &[u8; KEYSIZE],
@@ -299,7 +299,7 @@ pub fn link_request_stamp_value_fp(
     Some(stamps::stamp_value_fp(&material, &view.0))
 }
 
-/// Whether a link request meets `cost_fp` (`Link.validate_request`, Link.py:187-195@1.6.0).
+/// Whether a link request meets `cost_fp` (`Link.validate_request`, Link.py).
 /// A cost of 0 accepts every well-formed request; costs are capped at 25600.
 pub fn link_request_stamp_valid(
     destination_hash: &[u8; DESTINATION_LENGTH],
@@ -315,7 +315,7 @@ pub fn link_request_stamp_valid(
 }
 
 /// Resumable search for an X25519 key whose public half stamps a link request
-/// (`generate_stamped_key`, Stamps.py:317-345 and `_loop_key`, :230-250@1.6.0).
+/// (`generate_stamped_key`, Stamps.py and `_loop_key`, :230-250).
 /// The host fills each candidate private key from its cryptographic RNG and calls
 /// [`Self::step`] with a small budget from its main loop, cancelling it or
 /// dropping it when its `lr_stamp_timeout_ms` deadline passes; that is upstream's

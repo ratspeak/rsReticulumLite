@@ -369,7 +369,7 @@ impl<
                 .and_then(|r| r.registry.at_slot(slot))
                 .copied();
             if let Some(target) = target {
-                // Transport.py:3938-3940@1.6.0: a Boundary search reaches only BOUNDARY_SEARCH_MODES.
+                // Transport.py: a Boundary search reaches only BOUNDARY_SEARCH_MODES.
                 let filtered = reason == OutboundReason::PathRequestForward
                     && !local_only
                     && self.interface_mode(source) == Some(InterfaceMode::Boundary)

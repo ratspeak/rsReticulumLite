@@ -23,7 +23,7 @@ pub struct KnownDestination {
     /// Eviction recency, at most [`RECENCY_MAX`].
     pub last_seen: u64,
     /// Fixed-point link-request cost from the last announce, set only when its
-    /// stamp validated (Identity.py:866-870, 109-124@1.6.0).
+    /// stamp validated (Identity.py).
     pub lr_cost_fp: Option<u16>,
 }
 
@@ -152,7 +152,7 @@ impl<const N: usize> KnownDestinations<N> {
     }
 
     /// Fixed-point link-request cost last announced by `destination_hash`
-    /// (`Identity.recall_link_cost`, Identity.py:201-212@1.6.0).
+    /// (`Identity.recall_link_cost`, Identity.py).
     pub fn link_cost_fp(&self, destination_hash: &[u8; DESTINATION_LENGTH]) -> Option<u16> {
         self.peek_entry(destination_hash)?.lr_cost_fp
     }
@@ -185,7 +185,7 @@ impl<const N: usize> KnownDestinations<N> {
 
     /// Learn from a validated announce, as [`Self::learn`], and record the
     /// link-request cost it carried. Every announce replaces the stored cost,
-    /// so `None` clears it (Identity.remember, Identity.py:109-124@1.6.0).
+    /// so `None` clears it (Identity.remember, Identity.py).
     /// Returns `true` when the table changed.
     pub fn learn_announce(
         &mut self,

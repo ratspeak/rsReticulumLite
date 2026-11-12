@@ -1,5 +1,5 @@
 //! Path-request stamp generation without threads or heap, ported from the
-//! trusted `rns-transport` stamper (Transport.py:1466-1493, :4018-4051 at
+//! trusted `rns-transport` stamper (Transport.py at
 //! 1.6.0): one search at a time, a bounded queue that coalesces by
 //! destination, and a bounded first-in-first-out cache of finished stamps.
 //! The host drives the search in bounded steps with its own RNG. The running

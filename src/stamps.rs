@@ -530,7 +530,7 @@ impl KeyStampSearch {
 pub const DESTINATION_STAMP_MATERIAL_LENGTH: usize = 16 + 64 + 10;
 
 /// `Destination.stamp_material()`: public values only, so a host tool can
-/// generate the stamp for a device (Destination.py:381-382@1.6.0).
+/// generate the stamp for a device (Destination.py).
 pub fn destination_stamp_material(
     destination_hash: &[u8; 16],
     public_key: &[u8; 64],
@@ -670,7 +670,7 @@ impl StampPolicy {
     }
 
     /// Python `Destination.target_value`: the requested value, at least
-    /// `destination_value_fp`, capped (Destination.py:389-397@1.6.0).
+    /// `destination_value_fp`, capped (Destination.py).
     pub const fn destination_target_value_fp(&self, requested_fp: Option<u16>) -> u16 {
         let requested = match requested_fp {
             Some(fp) if fp > self.destination_value_fp => fp,
@@ -680,7 +680,7 @@ impl StampPolicy {
     }
 
     /// Python `Destination.get_link_cost`: the destination's cost, else `lr_cost_fp`,
-    /// capped (Destination.py:407-417@1.6.0).
+    /// capped (Destination.py).
     pub const fn announced_link_cost_fp(&self, destination_link_cost_fp: Option<u16>) -> u16 {
         Self::clamp_cost_fp(match destination_link_cost_fp {
             Some(fp) => fp,
@@ -689,7 +689,7 @@ impl StampPolicy {
     }
 
     /// The cost an outgoing link request is stamped at, given the cost the
-    /// destination announced; `None` means unstamped keys (Link.py:310-313@1.6.0).
+    /// destination announced; `None` means unstamped keys (Link.py).
     pub const fn link_request_cost_fp(&self, announced_fp: Option<u16>) -> Option<u16> {
         let cost = match announced_fp {
             Some(fp) => fp,
@@ -705,7 +705,7 @@ impl StampPolicy {
 
     /// The cost a responder requires of an incoming link request, `None` when
     /// `lr_stamps_enforced` is off. `destination_link_cost_fp` is the value set
-    /// with `set_link_cost`, if any (Link.py:193-195, Destination.py:415-417@1.6.0).
+    /// with `set_link_cost`, if any (Link.py, Destination.py).
     pub const fn responder_link_cost_fp(
         &self,
         destination_link_cost_fp: Option<u16>,

@@ -212,7 +212,7 @@ pub struct PathEntry {
     /// For a new destination, eviction prefers bulk entries; a bulk newcomer
     /// cannot evict a non-bulk path. Existing-destination updates are separate.
     pub bulk: bool,
-    /// A failed link attempt marked this route unresponsive (Transport.py:3624-3629@1.6.0).
+    /// A failed link attempt marked this route unresponsive (Transport.py).
     pub unresponsive: bool,
 }
 
@@ -296,7 +296,7 @@ impl<const N: usize> PathTable<N> {
     }
 
     /// Renew a route on proof of destination liveness, like Python `mark_path_responsive`
-    /// (Transport.py:3632-3648@1.6.0): the lifetime restarts at `now_ms` with the span it
+    /// (Transport.py): the lifetime restarts at `now_ms` with the span it
     /// was learned with, and the route is responsive again.
     pub fn mark_responsive(&mut self, destination_hash: &Hash16, now_ms: u64) -> bool {
         let Some(entry) = self
@@ -314,7 +314,7 @@ impl<const N: usize> PathTable<N> {
         true
     }
 
-    /// Python `mark_path_unresponsive` (Transport.py:3624-3629@1.6.0).
+    /// Python `mark_path_unresponsive` (Transport.py).
     pub fn mark_unresponsive(&mut self, destination_hash: &Hash16) -> bool {
         let Some(entry) = self
             .entries
@@ -329,7 +329,7 @@ impl<const N: usize> PathTable<N> {
     }
 
     /// Set a route's hop count in place, as a transit LRPROOF rebalance does
-    /// (Transport.py:2905-2906@1.6.0).
+    /// (Transport.py).
     pub fn set_hops(&mut self, destination_hash: &Hash16, hops: u8) {
         if let Some(entry) = self
             .entries
@@ -392,7 +392,7 @@ impl<const N: usize> PathTable<N> {
             .position(|slot| slot.is_some_and(|old| old.destination_hash == entry.destination_hash))
         {
             let old = self.entries[idx].unwrap();
-            // Emission-timebase freshness / anti-replay gate (upstream Transport.py:1750-1811,
+            // Emission-timebase freshness / anti-replay gate (upstream Transport.py,
             // rns-transport actor/inbound.rs:365-382). `announce_emitted` is the big-endian timestamp in
             // random_hash[5:10]. NOTE: the lite keeps a 1-deep blob history per path (the bounded
             // random_blob ring is a deliberate MCU memory trade-off); the emission-timebase
@@ -408,7 +408,7 @@ impl<const N: usize> PathTable<N> {
                 // Farther hop: accept only if the path expired or the announce is newer.
                 !random_seen
             } else {
-                // Transport.py:2571-2577@1.6.0: the same emission replaces only an unresponsive route.
+                // Transport.py: the same emission replaces only an unresponsive route.
                 new_emitted == old_emitted && old.unresponsive
             };
             return should_replace && self.replace_entry(idx, entry);
@@ -561,7 +561,7 @@ pub struct ScheduledAnnounce {
     /// (trusted per-interface announce queue). Zero for hosts without a registry.
     pub pending_targets: u8,
     /// Set aside while a path response for the destination waits (Python `held_announces`,
-    /// Transport.py:3858-3866@1.6.0): never due and invisible to destination lookups.
+    /// Transport.py): never due and invisible to destination lookups.
     pub held: bool,
 }
 
@@ -716,7 +716,7 @@ impl<const N: usize> AnnounceSchedule<N> {
         }
     }
 
-    /// Reinsert the destination's held entry (Transport.py:962-965@1.6.0).
+    /// Reinsert the destination's held entry (Transport.py).
     pub fn release_held(&mut self, destination_hash: &Hash16) -> bool {
         if !self
             .entries
@@ -1086,7 +1086,7 @@ impl<const N: usize> LinkTable<N> {
     }
 
     /// Remove and return one expired unvalidated Link, for the link-table cull
-    /// of Transport.py:1041-1043@1.6.0.
+    /// of Transport.py
     pub fn pop_unproven(&mut self, now_ms: u64) -> Option<LinkEntry> {
         let slot = self.entries.iter_mut().find(|slot| {
             slot.is_some_and(|entry| !entry.validated && now_ms >= entry.expires_ms)
@@ -1152,7 +1152,7 @@ impl<const N: usize> RequestTagTable<N> {
 }
 
 /// Announce validation results by packet hash, oldest replaced first (Python
-/// `announce_valid_cache` / `announce_invalid_cache`, Identity.py:676-790@1.6.0, at a size an
+/// `announce_valid_cache` / `announce_invalid_cache`, Identity.py, at a size an
 /// MCU can hold). The packet hash covers the destination hash and every signed field, so a
 /// cached verdict holds for every copy; checks against local state are not cached.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1210,7 +1210,7 @@ impl<const N: usize> Default for AnnounceValidations<N> {
 }
 
 /// When this node last requested a path to each destination (Python `path_requests`,
-/// Transport.py:3714, :3744@1.6.0). When full, the oldest request is forgotten.
+/// Transport.py). When full, the oldest request is forgotten.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PathRequestTimes<const N: usize> {
     #[doc(hidden)]

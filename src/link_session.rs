@@ -50,7 +50,7 @@ pub enum SessionError {
     /// The packet is not valid in the session's state.
     State,
     /// The RTT packet decrypted to something other than a msgpack number. The session
-    /// stays in `Handshake`; tear it down, as Link.py does (Link.py:622-624).
+    /// stays in `Handshake`; tear it down, as Link.py does (Link.py).
     MalformedRtt,
 }
 
@@ -144,7 +144,7 @@ impl ResponderSession {
     /// Supply fresh cryptographic `ephemeral_x25519`, the received hop count, and
     /// monotonic `now_ms`. It does not transmit the proof or authorize the initiator.
     /// `required_cost_fp` is [`crate::stamps::StampPolicy::responder_link_cost_fp`]; a
-    /// request below it is refused without a proof (Link.py:193-195@1.6.0).
+    /// request below it is refused without a proof (Link.py).
     #[allow(clippy::too_many_arguments)]
     pub fn accept(
         identity: &LocalIdentity,
@@ -283,7 +283,7 @@ impl ResponderSession {
                 self.state = SessionState::Closed;
                 Ok(Received::Closed)
             }
-            // Data may overtake the LRRTT; upstream decrypts it on any open link (Link.py:1024-1032).
+            // Data may overtake the LRRTT; upstream decrypts it on any open link (Link.py).
             PacketContext::None => {
                 let len = link_decrypt(&self.keys, payload, plaintext)?;
                 self.record_inbound(now_ms);

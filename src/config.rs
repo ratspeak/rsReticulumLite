@@ -499,7 +499,7 @@ pub struct LiteConfig {
     pub probe_destination_enabled: bool,
     pub ifac: Option<IfacConfig>,
     pub announce_admission: AnnounceAdmissionConfig,
-    /// Network stamp switches and costs (Transport.py:191-206@1.6.0). Everything is off by
+    /// Network stamp switches and costs (Transport.py). Everything is off by
     /// default; interface overrides live on [`InterfaceConfig`].
     pub stamp_policy: StampPolicy,
 }

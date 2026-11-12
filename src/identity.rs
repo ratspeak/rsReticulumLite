@@ -159,7 +159,7 @@ impl<'a> AnnounceView<'a> {
     }
 
     /// Check the trailing stamp extension against `required_fp`, a fixed-point
-    /// cost clamped to 25600 (Identity.py:840-870@1.6.0). The workblock is
+    /// cost clamped to 25600 (Identity.py). The workblock is
     /// `destination_hash || public_key || name_hash`, unexpanded.
     pub fn check_stamp(
         &self,
@@ -188,12 +188,12 @@ impl<'a> AnnounceView<'a> {
     }
 }
 
-/// Trailing announce stamp extension: marker, flags, stamp, lr_cost (Identity.py:86-90@1.6.0).
+/// Trailing announce stamp extension: marker, flags, stamp, lr_cost (Identity.py).
 pub const ANNOUNCE_EXT_LENGTH: usize = 18;
 pub const ANNOUNCE_EXT_HEADER_LENGTH: usize = 2;
 pub const ANNOUNCE_EXT_MARKER: u8 = 0xC1;
 /// Required announce stamp value when nothing else is configured, 23.5 in fixed point
-/// (`Transport.DESTINATION_COST`, Transport.py:200@1.6.0).
+/// (`Transport.DESTINATION_COST`, Transport.py).
 pub use crate::stamps::DESTINATION_COST_FP;
 
 /// A known-format stamp extension, borrowed from the announce app_data.
@@ -214,7 +214,7 @@ pub enum AnnounceExtParse<'a> {
     Present(AnnounceExtView<'a>),
 }
 
-/// Parse the last 18 bytes of app_data as a stamp extension (Identity.py:840-856@1.6.0).
+/// Parse the last 18 bytes of app_data as a stamp extension (Identity.py).
 pub fn parse_announce_ext(app_data: &[u8]) -> AnnounceExtParse<'_> {
     if app_data.len() < ANNOUNCE_EXT_LENGTH {
         return AnnounceExtParse::Absent;
@@ -247,7 +247,7 @@ pub struct AnnounceStampExt {
 }
 
 impl AnnounceStampExt {
-    /// `0xC1 | flags | stamp | cost_bytes[1] | cost_bytes[0]` (Destination.py:353-354@1.6.0).
+    /// `0xC1 | flags | stamp | cost_bytes[1] | cost_bytes[0]` (Destination.py).
     pub fn encode(&self) -> [u8; ANNOUNCE_EXT_LENGTH] {
         let cost = stamps::fp_to_bytes(stamps::StampPolicy::clamp_cost_fp(self.lr_cost_fp));
         let mut ext = [0u8; ANNOUNCE_EXT_LENGTH];
@@ -273,7 +273,7 @@ pub struct DestinationStamp {
 
 impl DestinationStamp {
     /// A stored or provisioned stamp, kept only when it meets `required_fp`
-    /// over the destination's stamp material (`load_destination_stamp`, Stamps.py:914-926@1.6.0).
+    /// over the destination's stamp material (`load_destination_stamp`, Stamps.py).
     pub fn verify(
         material: &[u8; stamps::DESTINATION_STAMP_MATERIAL_LENGTH],
         stamp: &[u8; stamps::NETWORK_STAMP_SIZE],
@@ -303,7 +303,7 @@ pub enum AnnounceStamping {
     NeedsStamp { target_fp: u16 },
 }
 
-/// `Destination.announce` stamp handling (Destination.py:297-354@1.6.0).
+/// `Destination.announce` stamp handling (Destination.py).
 /// `requested_value_fp` is the host's `set_value`, `link_cost_fp` its
 /// `set_link_cost` (store it through [`stamps::StampPolicy::clamp_link_cost_fp`]).
 pub fn announce_stamping(
@@ -574,7 +574,7 @@ impl LocalIdentity {
     }
 
     /// As [`Self::create_announce_with_name_hash`], appending `ext` to the app_data
-    /// before signing (Destination.py:347-361@1.6.0); pass the extension from
+    /// before signing (Destination.py); pass the extension from
     /// [`announce_stamping`]. The extension counts against [`MAX_ANNOUNCE_APP_DATA`].
     pub fn create_announce_stamped(
         &self,

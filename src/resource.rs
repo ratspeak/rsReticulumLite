@@ -602,7 +602,7 @@ impl<'a> PartRequestView<'a> {
     }
 }
 
-/// Receiver window controlled by the host (Resource.py:633-638, 866-875, 916-940@1.6.0).
+/// Receiver window controlled by the host (Resource.py).
 /// The host calls [`Self::on_first_part`] for the first part after each request,
 /// [`Self::grow`] and then [`Self::on_window_drained`] when a request's parts have all
 /// arrived, and [`Self::shrink`] on a part timeout. Rates are given as bytes over
@@ -628,7 +628,7 @@ impl WindowState {
     }
 
     /// Start from the window the previous incoming resource on the Link ended with;
-    /// zero or `None` keeps the initial window (Resource.py:218-221).
+    /// zero or `None` keeps the initial window (Resource.py).
     pub fn with_previous_window(previous_window: Option<usize>) -> Self {
         let mut state = Self::new();
         if let Some(window) = previous_window.filter(|window| *window > 0) {
@@ -1289,7 +1289,7 @@ pub enum AdvWatchdogAction {
     /// Re-send the stored advertisement; the deadline restarts from this poll's `now_ms`.
     Resend,
     /// Retries exhausted — fail the transfer and, while the Link is active, send the
-    /// resource hash with RESOURCE_ICL context (Resource.py:1124-1132@1.6.0). Terminal;
+    /// resource hash with RESOURCE_ICL context (Resource.py). Terminal;
     /// later polls return `Wait`.
     Failed,
 }

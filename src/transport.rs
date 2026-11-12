@@ -69,13 +69,13 @@ pub enum LocalSlot {
 }
 
 const HASHLIST_LIFETIME_MS: u64 = 120_000;
-/// Announce validation verdicts kept; Python keeps 128 of each kind (Identity.py:682, :702@1.6.0).
+/// Announce validation verdicts kept; Python keeps 128 of each kind (Identity.py).
 const ANNOUNCE_VALIDATION_CACHE: usize = 8;
-/// Transport.py:179-181@1.6.0 `PATH_REQUEST_GRACE`, `PATH_REQUEST_RG`, `PATH_REQUEST_MI`.
+/// Transport.py `PATH_REQUEST_GRACE`, `PATH_REQUEST_RG`, `PATH_REQUEST_MI`.
 const PATH_REQUEST_GRACE_MS: u64 = 400;
 const PATH_REQUEST_RG_MS: u64 = 1_500;
 const PATH_REQUEST_MI_MS: u64 = 20_000;
-/// Transport.py:178@1.6.0 `PATH_REQUEST_GATE_TIMEOUT`.
+/// Transport.py `PATH_REQUEST_GATE_TIMEOUT`.
 const PATH_REQUEST_GATE_TIMEOUT_MS: u64 = 45_000;
 // Upstream PATHFINDER_RW = 0.5s: announce rebroadcast jitter window is [0,500)ms.
 // (No RNG on MCUs: the offset mixes the packet hash with the node's transport ID.)
@@ -771,7 +771,7 @@ impl<
 
     /// Check an announce's stamp extension as received on `interface_id`, against that
     /// interface's `destination_cost_fp` or the policy's; nothing is checked while
-    /// `stamps_enabled` is off (Identity.py:793-795, :838@1.6.0).
+    /// `stamps_enabled` is off (Identity.py).
     /// Use [`AnnounceStampCheck::app_data`] on `announce.signed_app_data` for the app_data
     /// upstream hands to announce handlers; relayed bytes are never changed.
     pub fn announce_stamp_check(
@@ -835,7 +835,7 @@ impl<
 
     /// Advance path-request stamp generation by at most `attempt_budget` candidates, each
     /// filled by `fill` from the host's cryptographic RNG. A finished stamp is cached and its
-    /// request queued at once; a timed-out job sends nothing (Transport.py:4027-4051@1.6.0).
+    /// request queued at once; a timed-out job sends nothing (Transport.py).
     /// Queue refusal of the finished request is returned as the error the caller would get
     /// from [`Self::request_path`]; the stamp stays cached.
     pub fn step_path_request_stamp(
@@ -933,7 +933,7 @@ impl<
     /// originated requests out to its eligible targets.
     /// Under the policy's `stamp_prs` a cached stamp is appended; otherwise generation is
     /// queued, nothing is sent yet and [`PathRequestOutcome::AwaitingStamp`] is returned
-    /// (Transport.py:3706-3720@1.6.0). A full stamp queue drops the request.
+    /// (Transport.py). A full stamp queue drops the request.
     pub fn request_path(
         &mut self,
         destination_hash: &Hash16,
@@ -1294,7 +1294,7 @@ impl<
         }
     }
 
-    /// Transport.py:1041-1115@1.6.0: a transit link that never saw its proof may mean the
+    /// Transport.py: a transit link that never saw its proof may mean the
     /// path is gone or the destination moved; ask again, and distrust a one-hop route.
     fn rediscover_after_unproven_link(&mut self, link: LinkEntry, now_ms: u64) {
         let destination = link.destination_hash;
@@ -1325,7 +1325,7 @@ impl<
         }
     }
 
-    /// Transport.py:4061-4080@1.6.0: one request on every interface but `blocked`.
+    /// Transport.py: one request on every interface but `blocked`.
     fn send_rediscovery_request(
         &mut self,
         destination: Hash16,
@@ -1410,7 +1410,7 @@ impl<
                     },
                 );
             }
-            // Transport.py:962-965@1.6.0: a held announce takes the slot back after this send.
+            // Transport.py: a held announce takes the slot back after this send.
             if self
                 .announce_schedule
                 .release_held(&announce.destination_hash)
@@ -1515,7 +1515,7 @@ impl<
                 }
             }
         } else {
-            // Python parity (Transport.py:1433): without IFAC configured, a flagged
+            // Python parity (Transport.py): without IFAC configured, a flagged
             // packet is another network's masked traffic — drop before parse so
             // garbage never reaches the hashlist or routing tables.
             if has_ifac_flag(raw) {
@@ -1530,7 +1530,7 @@ impl<
             return Ok(IngestAction::Dropped);
         }
         let view = PacketView::parse(raw)?;
-        // The reference rejects a zero-length data field as malformed (Packet.py:275).
+        // The reference rejects a zero-length data field as malformed (Packet.py).
         if view.payload.is_empty() {
             self.stats.protocol_violations = self.stats.protocol_violations.saturating_add(1);
             self.stats.dropped = self.stats.dropped.saturating_add(1);
@@ -1561,7 +1561,7 @@ impl<
         }
         self.stats.accepted = self.stats.accepted.saturating_add(1);
 
-        // Python 1.3.8 (Packet.py:247) / trusted actor/inbound.rs: reject an on-wire hop count
+        // Python 1.3.8 (Packet.py) / trusted actor/inbound.rs: reject an on-wire hop count
         // >= PATHFINDER_M for EVERY packet type, checked on the RAW hops byte before the
         // transport increment. Pre-1.3.8 only announces were capped.
         if view.header.hops >= PATHFINDER_M {
@@ -1578,7 +1578,7 @@ impl<
             return Ok(IngestAction::Dropped);
         }
 
-        // Upstream packet_filter (Transport.py:1635-1666), as trusted actor/inbound.rs: after the
+        // Upstream packet_filter (Transport.py), as trusted actor/inbound.rs: after the
         // repeating contexts, PLAIN and GROUP packets are never announced and travel one hop at
         // most. Checked on wire hops before the hashlist, so a dropped copy reserves no hash.
         if !view.header.context.skip_hashlist()
@@ -1611,7 +1611,7 @@ impl<
                 now_ms,
             );
             if !inserted {
-                // Upstream carve-out (Transport.py:1362-1369): a duplicate SINGLE announce is NOT
+                // Upstream carve-out (Transport.py): a duplicate SINGLE announce is NOT
                 // dropped — SINGLE destinations re-announce to refresh paths, so an exact duplicate
                 // must reach handle_announce. The emission-timebase gate there decides whether to
                 // replace/rebroadcast, so a true duplicate cannot amplify.
@@ -1733,8 +1733,8 @@ impl<
             view.header.flags.context_flag,
             self.config.max_announce_app_data,
         )?;
-        // Identity.validate_announce (Identity.py:838-889@1.6.0): the stamp before the
-        // signature; enforcement drops silently (Transport.py:2047-2049@1.6.0).
+        // Identity.validate_announce (Identity.py): the stamp before the
+        // signature; enforcement drops silently (Transport.py).
         let stamp =
             self.announce_stamp_check(&header.destination_hash, &announce, meta.interface_id);
         let policy = self.config.stamp_policy;
@@ -1779,7 +1779,7 @@ impl<
             }
         };
         // Python remembers every validated announce, replays and path responses included,
-        // before it decides the path (Transport.py:2172, Identity.py:589), as trusted inbound.rs.
+        // before it decides the path (Transport.py, Identity.py), as trusted inbound.rs.
         if KNOWN_DESTINATIONS != 0 && announce.name_hash == name_hash(LXMF_DELIVERY_NAME) {
             self.known_destinations.learn_announce(
                 header.destination_hash,
@@ -1788,7 +1788,7 @@ impl<
                 stamp.lr_cost_fp,
             )?;
         }
-        // Own announces are validated and remembered but route nothing (Transport.py:2453-2454).
+        // Own announces are validated and remembered but route nothing (Transport.py).
         if self.is_own_destination(&header.destination_hash) {
             self.stats.dropped = self.stats.dropped.saturating_add(1);
             return Ok(IngestAction::Dropped);
@@ -1805,7 +1805,7 @@ impl<
         // Trusted inbound.rs: a neighbour carrying our queued rebroadcast cancels its retry. A
         // same-hop copy counts toward LOCAL_REBROADCASTS_MAX; a hops+1 copy before the retry is
         // due was passed on. Runs before the path update, which may replace the entry.
-        // Transport.py:2454-2477@1.6.0: only relayed copies count, every same-hop copy is
+        // Transport.py: only relayed copies count, every same-hop copy is
         // counted, and only an entry already sent completes.
         if self.config.transport_enabled && view.header.transport_id.is_some() {
             let wire_hops = view.header.hops;
@@ -1875,12 +1875,12 @@ impl<
 
         if learned {
             let _ = identity_hash;
-            // Transport.py:2751-2754@1.6.0: a learned path resolves the in-flight request.
+            // Transport.py: a learned path resolves the in-flight request.
             self.inflight_path_requests.take(&header.destination_hash);
             self.stats.learned_announces = self.stats.learned_announces.saturating_add(1);
 
             // Cache the announce only when the path was actually learned/replaced. Upstream caches
-            // inside `if should_add` (Transport.py:1998); caching unconditionally would let a
+            // inside `if should_add` (Transport.py); caching unconditionally would let a
             // freshness-rejected (replayed/older/higher-hop) announce poison the path-response
             // cache that handle_path_request answers from, while the path table kept the fresh entry.
             self.announce_cache.retain_paths(&self.paths, now_ms);
@@ -1907,7 +1907,7 @@ impl<
             // path/contact is kept) but is NOT rebroadcast — skip gracefully instead of erroring
             // after the path was already inserted. (Conformant senders keep announces <= MDU, so
             // this only fires for an over-large directly-received announce.)
-            // Transport.py:2627-2645@1.6.0: a local client's answer to a waiting request goes
+            // Transport.py: a local client's answer to a waiting request goes
             // out once, at once.
             let pending_local_answer = header.context == PacketContext::PathResponse
                 && M::ROUTER
@@ -1970,7 +1970,7 @@ impl<
     ) -> Result<IngestAction, TransportError> {
         let interface_id = meta.interface_id;
         let mode = meta.interface_mode.unwrap_or(self.config.mode);
-        // Transport.py:2073-2086@1.6.0: tagless, oversized and odd-length requests are dropped.
+        // Transport.py: tagless, oversized and odd-length requests are dropped.
         if !matches!(
             payload.len(),
             PR_LEGACY_LENGTH | PR_LENGTH | PR_STAMPED_LENGTH
@@ -2002,7 +2002,7 @@ impl<
             self.stats.duplicates = self.stats.duplicates.saturating_add(1);
             return Ok(IngestAction::Duplicate);
         }
-        // Transport.py:2099-2129@1.6.0: the flags byte is not read, so the lenient
+        // Transport.py: the flags byte is not read, so the lenient
         // 0xC1 0xFF marker fails like any invalid stamp.
         let policy = self.config.stamp_policy;
         if policy.stamps_enabled {
@@ -2018,11 +2018,11 @@ impl<
             }
         }
 
-        // Trusted outbound.rs / Python 1.3.8 Transport.py:2969: a path request for one of
+        // Trusted outbound.rs / Python 1.3.8 Transport.py: a path request for one of
         // our OWN destinations is answered by the HOST (fresh signed announce), never
         // forwarded. Returning Dropped lets the FFI's own-path-request post-check fire in
         // both transport postures.
-        // Transport.py:2135-2157@1.6.0: a request for a destination already in flight joins
+        // Transport.py: a request for a destination already in flight joins
         // its waiting requesters instead of being processed again.
         if self
             .inflight_path_requests
@@ -2043,7 +2043,7 @@ impl<
             self.inflight_path_requests.take(&requested);
             return Ok(IngestAction::LocalEndpoint);
         }
-        // Transport.py:3790-3798@1.6.0: the local client's answer is passed on when it comes.
+        // Transport.py: the local client's answer is passed on when it comes.
         if M::ROUTER
             && self
                 .paths
@@ -2054,19 +2054,19 @@ impl<
         }
 
         if let Some(path) = self.paths.get_live(&requested, now_ms) {
-            // Transport.py:3809@1.6.0: a transport node, or any node asked by a local client,
+            // Transport.py: a transport node, or any node asked by a local client,
             // answers from its cache.
             let from_local_client = M::ROUTER && self.is_local_client_interface(interface_id);
             let answers = self.config.transport_enabled || from_local_client;
             if requestor_transport_id.is_some_and(|requestor| path.next_hop == Some(requestor)) {
-                // Transport.py:3813, :3965-3969@1.6.0: declined still counts as answered.
+                // Transport.py: declined still counts as answered.
                 if answers {
                     self.inflight_path_requests.take(&requested);
                 }
                 return Ok(IngestAction::Dropped);
             }
             // Roaming self-loop suppression: don't answer for a path learned from the same
-            // interface the request arrived on (upstream Transport.py:2941-2942).
+            // interface the request arrived on (upstream Transport.py).
             if mode == crate::config::InterfaceMode::Roaming && path.interface_id == interface_id {
                 if answers {
                     self.inflight_path_requests.take(&requested);
@@ -2080,7 +2080,7 @@ impl<
                         requested,
                         cached.hops,
                     )?;
-                    // Transport.py:3842-3856@1.6.0: wait PATH_REQUEST_GRACE (plus PATH_REQUEST_RG
+                    // Transport.py: wait PATH_REQUEST_GRACE (plus PATH_REQUEST_RG
                     // on a roaming interface) so better-placed peers can answer first.
                     let delay_ms = if from_local_client
                         || (M::ROUTER && self.is_local_client_interface(path.interface_id))
@@ -2092,7 +2092,7 @@ impl<
                         PATH_REQUEST_GRACE_MS
                     };
                     let hops = cached.hops;
-                    // Transport.py:3858-3866@1.6.0: a queued announce waits for the answer.
+                    // Transport.py: a queued announce waits for the answer.
                     self.announce_schedule.hold(&requested);
                     self.announce_schedule.insert(
                         ScheduledAnnounce {
@@ -2122,7 +2122,7 @@ impl<
         }
 
         if M::ROUTER && self.is_local_client_interface(interface_id) {
-            // Transport.py:3873-3879, :3706-3717@1.6.0: a stamping node stamps a local
+            // Transport.py: a stamping node stamps a local
             // client's unstamped request before forwarding it.
             let stamped;
             let ext = match ext {
@@ -2165,7 +2165,7 @@ impl<
                 },
             );
         }
-        // Transport.py:3930-3936, :3955-3956@1.6.0: a stamping node relays someone else's
+        // Transport.py: a stamping node relays someone else's
         // unstamped request with the lenient marker instead of a stamp.
         let relay_ext = match ext {
             None if policy.stamp_prs => Some(&LENIENT_PATH_REQUEST_EXT),
@@ -2182,7 +2182,7 @@ impl<
             else {
                 return Ok(IngestAction::Dropped);
             };
-            // Transport.py:3895-3897@1.6.0: unreachable while enforcement drops above.
+            // Transport.py: unreachable while enforcement drops above.
             if ext.is_none() && policy.stamps_enforced {
                 return Ok(IngestAction::Dropped);
             }
@@ -2296,7 +2296,7 @@ impl<
         if !self.config.transport_enabled {
             return Ok(IngestAction::Dropped);
         }
-        // Upstream (Transport.py:1597, rns-transport actor/inbound.rs:912)
+        // Upstream (Transport.py, rns-transport actor/inbound.rs:912)
         // forwards LINKREQUESTs only when explicitly addressed to this
         // transport instance. A Header1 broadcast overheard from a direct
         // conversation must not be re-transmitted or enter the link table.
@@ -2400,7 +2400,7 @@ impl<
     ) -> Result<IngestAction, TransportError> {
         if header.context == PacketContext::Lrproof {
             if let Some(mut link) = self.links.get(&header.destination_hash, now_ms).copied() {
-                // Transport.py:2886-2907@1.6.0: a validly signed proof that took a different
+                // Transport.py: a validly signed proof that took a different
                 // number of hops re-balances the link and the path before the hop check.
                 if link.outbound_interface == meta.interface_id
                     && link.remaining_hops != header.hops
@@ -2445,7 +2445,7 @@ impl<
                         now_ms.saturating_add((LINK_TIMEOUT_SECS as u64) * 1000),
                         now_ms,
                     );
-                    // Transport.py:2938@1.6.0: a forwarded link proof shows the destination is alive.
+                    // Transport.py: a forwarded link proof shows the destination is alive.
                     self.paths.mark_responsive(&link.destination_hash, now_ms);
                     return Ok(IngestAction::ForwardedProof);
                 }
@@ -2733,7 +2733,7 @@ impl<
         tag: &[u8],
         ext: Option<&[u8; PR_EXT_PAYLOAD_LENGTH]>,
     ) -> Result<PacketBuffer, TransportError> {
-        // Transport.py:3699-3704@1.6.0: dst | own transport id | tag | received extension.
+        // Transport.py: dst | own transport id | tag | received extension.
         let mut payload: PacketBuffer = PacketBuffer::new();
         payload.extend_from_slice(&destination_hash)?;
         payload.extend_from_slice(&self.transport_id)?;
@@ -3104,13 +3104,13 @@ impl<
     }
 }
 
-/// Path-request payload lengths (Transport.py:3975-3980@1.6.0).
+/// Path-request payload lengths (Transport.py).
 pub const PR_LEGACY_LENGTH: usize = 32;
 pub const PR_LENGTH: usize = 48;
 pub const PR_STAMPED_LENGTH: usize = 64;
 pub const PR_EXT_PAYLOAD_LENGTH: usize = PR_STAMPED_LENGTH - PR_LENGTH;
 
-/// `0xC1 0x00` followed by the stamp (Transport.py:3720, :4049@1.6.0).
+/// `0xC1 0x00` followed by the stamp (Transport.py).
 pub fn stamped_path_request_ext(stamp: &[u8; NETWORK_STAMP_SIZE]) -> [u8; PR_EXT_PAYLOAD_LENGTH] {
     let mut ext = [0u8; PR_EXT_PAYLOAD_LENGTH];
     ext[0] = ANNOUNCE_EXT_MARKER;
@@ -3118,7 +3118,7 @@ pub fn stamped_path_request_ext(stamp: &[u8; NETWORK_STAMP_SIZE]) -> [u8; PR_EXT
     ext
 }
 
-/// Marks a relayed unstamped request from a stamping node (Transport.py:3936@1.6.0).
+/// Marks a relayed unstamped request from a stamping node (Transport.py).
 pub const LENIENT_PATH_REQUEST_EXT: [u8; PR_EXT_PAYLOAD_LENGTH] = {
     let mut ext = [0u8; PR_EXT_PAYLOAD_LENGTH];
     ext[0] = ANNOUNCE_EXT_MARKER;
@@ -3158,7 +3158,7 @@ fn announce_jitter_ms(packet_hash: &[u8; 32], transport_id: &Hash16, round: u8) 
 }
 
 /// Whether a queued rebroadcast still carries the announce its path was learned from. A local
-/// client's path response is rebroadcast with context NONE (Transport.py:2592-2645@1.6.0), so
+/// client's path response is rebroadcast with context NONE (Transport.py), so
 /// either context matches.
 fn same_emission_packet(packet: &PacketBuffer, path_hash: &[u8; 32]) -> bool {
     let Ok(view) = PacketView::parse(packet.as_slice()) else {
@@ -3179,7 +3179,7 @@ fn same_emission_packet(packet: &PacketBuffer, path_hash: &[u8; 32]) -> bool {
     packet_hash(copy, header_type) == *path_hash
 }
 
-/// Transport.py:3778-3784@1.6.0: `DISCOVER_PATHS_FOR`, plus Boundary, which searches only
+/// Transport.py: `DISCOVER_PATHS_FOR`, plus Boundary, which searches only
 /// `BOUNDARY_SEARCH_MODES` (Interface.py).
 fn mode_discovers_unknown_paths(mode: crate::config::InterfaceMode) -> bool {
     matches!(
@@ -3192,7 +3192,7 @@ fn mode_discovers_unknown_paths(mode: crate::config::InterfaceMode) -> bool {
     )
 }
 
-/// Learned-path expiry by interface mode (upstream Transport.py:1861-1866).
+/// Learned-path expiry by interface mode (upstream Transport.py).
 fn announce_path_expiry_secs(mode: crate::config::InterfaceMode) -> u32 {
     match mode {
         crate::config::InterfaceMode::AccessPoint => AP_PATH_TIME_SECS,
@@ -3467,7 +3467,7 @@ mod tests {
 
     #[test]
     fn raw_hops_at_or_above_pathfinder_m_drop_for_every_packet_type() {
-        // Python 1.3.8 Packet.py:247 / trusted actor/inbound.rs: parse-reject raw hops >=
+        // Python 1.3.8 Packet.py / trusted actor/inbound.rs: parse-reject raw hops >=
         // PATHFINDER_M for ALL packet types, before dedup — a second copy is still Dropped
         // (never Duplicate), proving the packet never reached the hashlist.
         let mut node =
@@ -3525,7 +3525,7 @@ mod tests {
 
     #[test]
     fn own_destination_path_request_is_dropped_for_host_answer_not_forwarded() {
-        // Trusted outbound.rs / Python Transport.py:2969: a path request for our OWN
+        // Trusted outbound.rs / Python Transport.py: a path request for our OWN
         // destination is never forwarded, even as a transport node — Dropped is the
         // signal the FFI turns into the host re-announce.
         let mut node =
@@ -3615,7 +3615,7 @@ mod tests {
 
     #[test]
     fn plain_and_group_packets_travel_one_wire_hop() {
-        // RNS 1.5.5 packet_filter (Transport.py:1642-1666), on wire hops as trusted inbound.rs.
+        // RNS 1.5.5 packet_filter (Transport.py), on wire hops as trusted inbound.rs.
         for destination_type in [DestinationType::Plain, DestinationType::Group] {
             let mut node = node();
             let one = retyped(path_request([0x11; 16], [0x22; 16]), destination_type, 1);
@@ -3648,7 +3648,7 @@ mod tests {
 
     #[test]
     fn repeating_contexts_bypass_the_plain_hop_rule() {
-        // Python admits these contexts before the PLAIN rule (Transport.py:1635-1640).
+        // Python admits these contexts before the PLAIN rule (Transport.py).
         for (index, context) in [
             PacketContext::Keepalive,
             PacketContext::Resource,
@@ -4168,7 +4168,7 @@ mod tests {
         node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
             .unwrap();
 
-        // Transport.py:2464-2471@1.6.0: a copy heard before our first send counts but
+        // Transport.py: a copy heard before our first send counts but
         // cannot complete the entry.
         assert_eq!(
             node.ingest(neighbour.as_slice(), RxMeta::new(IFACE), 1100)
@@ -4304,7 +4304,7 @@ mod tests {
 
     #[test]
     fn freshness_gate_rejects_replay_accepts_newer_emission() {
-        // Emission-timebase anti-replay (upstream Transport.py:1750-1811): for equal-hop announces,
+        // Emission-timebase anti-replay (upstream Transport.py): for equal-hop announces,
         // only an unseen, more-recently-emitted announce may replace the path.
         let mut node = node();
         let rh = |marker: u8, emitted: u64| {
@@ -4354,7 +4354,7 @@ mod tests {
 
     #[test]
     fn queued_rebroadcast_coalesces_destination_to_freshest_announce() {
-        // Trusted rsReticulum b4c0358 / Python Transport.py:1286-1308 retain one queued
+        // Trusted rsReticulum b4c0358 / Python Transport.py retain one queued
         // rebroadcast per destination and replace it only when the wire emission time advances.
         // Lite obtains the same invariant from the path freshness gate plus AnnounceSchedule's
         // destination-keyed replacement; lock the composition here rather than duplicating packet
@@ -4536,7 +4536,7 @@ mod tests {
 
     #[test]
     fn header1_link_request_is_not_forwarded() {
-        // Upstream Transport.py:1597 / rns-transport actor/inbound.rs:912: a
+        // Upstream Transport.py / rns-transport actor/inbound.rs:912: a
         // broadcast (no transport_id) link request overheard from a direct
         // conversation must be ignored, not repeated on the channel.
         let announce = signed_announce([0x41; 32], "lxmf.delivery", b"node");
@@ -4576,8 +4576,8 @@ mod tests {
 
     #[test]
     fn a_replayed_announce_still_teaches_its_identity() {
-        // Python remembers every validated announce before it decides the path (Transport.py:2172,
-        // Identity.py:511-589), as trusted inbound.rs does; the replay leaves the path alone.
+        // Python remembers every validated announce before it decides the path (Transport.py,
+        // Identity.py), as trusted inbound.rs does; the replay leaves the path alone.
         let announce = signed_announce([0x5D; 32], "lxmf.delivery", b"peer");
         let public_key = announced_key(&announce.raw);
         let mut node = node();
@@ -4759,7 +4759,7 @@ mod tests {
     #[test]
     fn endpoint_does_not_search_for_a_boundary_arrival() {
         // Upstream limits a Boundary search to BOUNDARY_SEARCH_MODES targets
-        // (Transport.py:3781-3783@1.6.0); an Endpoint's host cannot apply that.
+        // (Transport.py); an Endpoint's host cannot apply that.
         let mut node = node();
         let request = path_request([0x77; 16], [0x66; 16]);
         let action = node
@@ -6026,7 +6026,7 @@ mod tests {
             ),
             Ok(IngestAction::ForwardedTransport)
         );
-        // Transport.py:2387@1.6.0: forwarding marks use only; it never renews the path.
+        // Transport.py: forwarding marks use only; it never renews the path.
         assert_eq!(*n.path(&ann.destination_hash, 1100).unwrap(), original);
     }
 

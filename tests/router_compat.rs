@@ -727,7 +727,7 @@ fn boundary_unknown_path_request_searches_boundary_search_modes_only() {
             .unwrap(),
         IngestAction::ForwardedPathRequest
     );
-    // Transport.py:3782-3784, :3938-3940@1.6.0: BOUNDARY_SEARCH_MODES is Boundary and Gateway.
+    // Transport.py: BOUNDARY_SEARCH_MODES is Boundary and Gateway.
     assert_eq!(node.poll_tx_for_interface(1).unwrap().interface_id, 1);
     assert!(node.poll_tx_for_interface(3).is_none());
 }
