@@ -220,7 +220,7 @@ fn lite_proof_matches_rsreticulum_identity() {
     }
 }
 
-// The well-known path-request destination must match Python RNS 1.4.2 and rsReticulum, or the
+// The well-known path-request destination must match Python RNS and rsReticulum, or the
 // endpoint's path requests would target a destination no peer answers.
 #[test]
 fn path_request_destination_matches_python_and_rsreticulum() {
@@ -1212,7 +1212,7 @@ async fn drain_inbound_queues(queues: &rns_transport::inbound_queues::InboundQue
     }
 }
 
-// RNS 1.5.5 packet_filter as trusted rns-transport runs it (actor/inbound.rs): after the
+// RNS packet_filter as trusted rns-transport runs it (actor/inbound.rs): after the
 // repeating contexts, PLAIN and GROUP packets are dropped when announced or beyond one wire hop.
 // The trusted actor records packet metrics only for packets past that filter, so a metrics
 // lookup reads its verdict; Lite's is any action but Dropped on a path request or announce.
