@@ -2037,12 +2037,16 @@ impl<
         }
 
         // Transport.py: a request for a destination already in flight joins
-        // its waiting requesters instead of being processed again.
+        // its waiting requesters instead of being processed again. A local
+        // client's request for a live path is answered from the table.
         let from_local_client = M::ROUTER && self.is_local_client_interface(interface_id);
-        if self
-            .inflight_path_requests
-            .last(&requested)
-            .is_some_and(|at| now_ms.saturating_sub(at) <= PATH_REQUEST_GATE_TIMEOUT_MS)
+        let answer_from_table =
+            from_local_client && self.paths.get_live(&requested, now_ms).is_some();
+        if !answer_from_table
+            && self
+                .inflight_path_requests
+                .last(&requested)
+                .is_some_and(|at| now_ms.saturating_sub(at) <= PATH_REQUEST_GATE_TIMEOUT_MS)
         {
             if self.config.transport_enabled || from_local_client {
                 if let Some(slot) = self.interface_slot(interface_id) {
@@ -4960,6 +4964,56 @@ mod tests {
             Ok(IngestAction::Dropped)
         );
         assert!(n.inflight_path_requests.last(&unstamped).is_none());
+    }
+
+    #[test]
+    fn a_local_client_is_answered_from_the_table_while_in_flight() {
+        // Transport.py batches every request for an in-flight destination, so a
+        // local client waited for a new announce although the instance held the path.
+        const NET: InterfaceId = 1;
+        const LOCAL: InterfaceId = 2;
+        let mut n = router(&[
+            InterfaceConfig::lora(NET, 1000, 4),
+            InterfaceConfig::local_client(LOCAL, 100_000, 4),
+        ]);
+        n.config.transport_enabled = false;
+        let announce = signed_announce([0x66; 32], "lxmf.delivery", b"node");
+        let dest = announce.destination_hash;
+        n.ingest(announce.raw.as_slice(), RxMeta::new(NET), 1000)
+            .unwrap();
+        n.tick(3000);
+        drain_router(&mut n, &[NET, LOCAL]);
+
+        // A leaf only forwards a network request to its local clients, holding the gate.
+        assert_eq!(
+            n.ingest(
+                path_request(dest, [0x01; 16]).as_slice(),
+                RxMeta::new(NET),
+                3100
+            ),
+            Ok(IngestAction::ForwardedPathRequest)
+        );
+        assert_eq!(
+            n.poll_tx_for_interface(LOCAL).unwrap().reason,
+            OutboundReason::PathRequestForward
+        );
+        assert!(n.inflight_path_requests.last(&dest).is_some());
+
+        assert_eq!(
+            n.ingest(
+                path_request(dest, [0x02; 16]).as_slice(),
+                RxMeta::new(LOCAL),
+                3200
+            ),
+            Ok(IngestAction::AnsweredPathRequest)
+        );
+        assert!(n.inflight_path_requests.last(&dest).is_none());
+        n.tick(3200);
+        let answer = n.poll_tx_for_interface(LOCAL).unwrap();
+        assert_eq!(answer.reason, OutboundReason::PathResponse);
+        let view = PacketView::parse(answer.packet.as_slice()).unwrap();
+        assert_eq!(view.header.destination_hash, dest);
+        assert_eq!(view.header.context, PacketContext::PathResponse);
     }
 
     #[test]
