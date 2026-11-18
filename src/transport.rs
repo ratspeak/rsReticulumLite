@@ -1276,8 +1276,8 @@ impl<
             let target = self.interfaces.facts(slot);
             if owner.requesters & (1 << slot) != 0
                 && target.outbound()
-                && (target.id != meta.interface_id
-                    || (target.flags & 8 == 0 && target.mode != InterfaceMode::Roaming))
+                // Transport.py answers every requester; a local client edge is one peer.
+                && (target.id != meta.interface_id || target.flags & 8 == 0)
             {
                 // One bounded admission attempt. Existing enqueue accounts loss;
                 // no packet or retry queue is introduced by the requester ledger.
@@ -2115,10 +2115,13 @@ impl<
                     return Ok(IngestAction::AnsweredPathRequest);
                 }
             }
-            // Trusted Rust outbound.rs deliberately falls through to the ordinary
-            // discovery gates when signed cache material is unavailable. Python
-            // ignores this case; the September 2026 canon adjudication retains the
-            // trusted Rust recovery behavior without bypassing discovery policy.
+            // With signed cache material unavailable, fall through to the ordinary
+            // discovery gates, where Python ignores the request; the bounded cache
+            // makes this common. Python still counts it as answered, so the search
+            // never holds the in-flight gate.
+            if answers {
+                self.inflight_path_requests.take(&requested);
+            }
         }
 
         if M::ROUTER && self.is_local_client_interface(interface_id) {
@@ -4647,8 +4650,8 @@ mod tests {
 
     #[test]
     fn path_request_for_live_path_with_evicted_cache_uses_trusted_discovery() {
-        // Trusted Rust falls through to ordinary discovery when cache material is absent.
-        // This intentionally differs from Python; see the internal canon adjudication.
+        // Lite falls through to ordinary discovery when cache material is absent,
+        // where Python ignores the request; either way it is no longer in flight.
         // One-slot announce cache so the second announce evicts the first.
         type TinyCacheNode = LiteNode<8, 16, 1, 4, 4, 8, 4>;
         let mut config = LiteConfig::ESP32_LORA_TRANSPORT_SMALL;
@@ -4690,6 +4693,11 @@ mod tests {
         assert_eq!(
             node.take_queued().unwrap().reason,
             OutboundReason::PathRequestForward
+        );
+        assert!(
+            node.inflight_path_requests
+                .last(&first.destination_hash)
+                .is_none()
         );
     }
 
@@ -6313,6 +6321,34 @@ mod tests {
         assert_eq!(
             n.poll_tx_for_interface(2).unwrap().reason,
             OutboundReason::PathRequestForward
+        );
+    }
+
+    #[test]
+    fn a_found_path_answers_a_roaming_requester_on_the_arrival_interface() {
+        // Transport.py answers every waiting requester, roaming radios included.
+        let mut radio = InterfaceConfig::lora_repeater(1, 1000, 4);
+        radio.mode = InterfaceMode::Roaming;
+        let mut n = router(&[radio, InterfaceConfig::network_peer(2, 100000, 4)]);
+        let announce = signed_announce([0x63; 32], "lxmf.delivery", b"roam");
+        assert_eq!(
+            n.ingest(
+                path_request(announce.destination_hash, [0x64; 16]).as_slice(),
+                RxMeta::with_mode(1, InterfaceMode::Roaming),
+                1000
+            ),
+            Ok(IngestAction::ForwardedPathRequest)
+        );
+        while n.poll_tx_for_interface(2).is_some() {}
+        n.ingest(
+            announce.raw.as_slice(),
+            RxMeta::with_mode(1, InterfaceMode::Roaming),
+            1100,
+        )
+        .unwrap();
+        assert!(
+            core::iter::from_fn(|| n.poll_tx_for_interface(1))
+                .any(|out| out.reason == OutboundReason::PathResponse)
         );
     }
 }
