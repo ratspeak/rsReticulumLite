@@ -33,8 +33,8 @@ use crate::pr_stamper::{
 use crate::stamps::{NETWORK_STAMP_SIZE, StampPolicy};
 use crate::tables::{
     AnnounceCache, AnnounceSchedule, AnnounceValidations, CachedAnnounce, Hash16, InterfaceId,
-    LinkEntry, LinkTable, PacketHashTable, PathEntry, PathRequestTimes, PathTable, Queue,
-    RequestTagTable, ReverseEntry, ReverseTable, ScheduledAnnounce,
+    LinkEntry, LinkTable, PacketHashTable, PathEntry, PathInsert, PathRequestTimes, PathTable,
+    PendingLocalRequests, Queue, RequestTagTable, ReverseEntry, ReverseTable, ScheduledAnnounce,
 };
 use crate::wire::{
     DestinationType, HeaderType, PacketContext, PacketFlags, PacketHeader, PacketType, PacketView,
@@ -450,7 +450,7 @@ pub struct LiteNode<
     pub request_tags: RequestTagTable<TAGS>,
     pub path_request_times: PathRequestTimes<LINKS>,
     /// Path requests waiting on a local client's answer (Python `pending_local_path_requests`).
-    pub pending_local_path_requests: PathRequestTimes<LINKS>,
+    pub pending_local_path_requests: PendingLocalRequests<LINKS>,
     /// Destinations with a path request being handled (Python `inflight_path_requests`).
     pub inflight_path_requests: PathRequestTimes<LINKS>,
     #[doc(hidden)]
@@ -548,7 +548,7 @@ impl<
             links: LinkTable::new(),
             request_tags: RequestTagTable::new(),
             path_request_times: PathRequestTimes::new(),
-            pending_local_path_requests: PathRequestTimes::new(),
+            pending_local_path_requests: PendingLocalRequests::new(),
             inflight_path_requests: PathRequestTimes::new(),
             outbound: Queue::new(),
             last_delivery_identity: 0,
@@ -1078,7 +1078,7 @@ impl<
                     .paths
                     .generation(&path.destination_hash, now_ms)
                     .unwrap_or(0);
-                lifetime.expires_ms = lifetime.expires_ms.min(path.expires_ms);
+                lifetime.expires_ms = lifetime.expires_ms.min(path.live_until());
             }
         }
         Ok(lifetime)
@@ -1140,7 +1140,7 @@ impl<
                 .paths
                 .generation(&path.destination_hash, now_ms)
                 .unwrap_or(0);
-            lifetime.expires_ms = lifetime.expires_ms.min(path.expires_ms);
+            lifetime.expires_ms = lifetime.expires_ms.min(path.live_until());
             if header.flags.packet_type == PacketType::LinkRequest {
                 // handle_link_request supplies the checked generation reserved
                 // for the insertion after successful queue admission.
@@ -1307,7 +1307,13 @@ impl<
             .paths
             .get_live(&destination, now_ms)
             .map(|path| path.hops);
-        let blocked = if path_hops.is_none() || (!throttled && link.taken_hops == 0) {
+        let blocked = if path_hops.is_none() {
+            None
+        } else if !throttled && link.taken_hops == 0 {
+            // A local client's Link to an instance-local destination asks nothing.
+            if path_hops == Some(0) {
+                return;
+            }
             None
         } else if !throttled && (path_hops == Some(1) || link.taken_hops == 1) {
             let boundary = self
@@ -1874,7 +1880,8 @@ impl<
             unresponsive: false,
         };
 
-        let learned = self.paths.insert_or_update(path_entry, now_ms);
+        let inserted = self.paths.upsert(path_entry, now_ms);
+        let learned = inserted != PathInsert::Refused;
         if bulk && new_destination {
             if let Some(router) = self.interfaces.router_mut() {
                 let counter = if learned {
@@ -1913,50 +1920,48 @@ impl<
             // retained requester, without becoming a general broadcast.
             self.finish_discovery(raw, header, meta, now_ms)?;
 
-            // Rebroadcast only when the announce actually updated the path (upstream rebroadcasts
-            // only on should_add) — a duplicate/older announce that did not replace must not amplify.
-            // Reframing for forwarding adds the HEADER_2 transport_id (16 B); a single-packet
-            // announce large enough that the reframed packet would exceed MTU is still LEARNED (the
-            // path/contact is kept) but is NOT rebroadcast — skip gracefully instead of erroring
-            // after the path was already inserted. (Conformant senders keep announces <= MDU, so
-            // this only fires for an over-large directly-received announce.)
-            // Transport.py: a local client's answer to a waiting request goes
-            // out once, at once.
-            let pending_local_answer = header.context == PacketContext::PathResponse
-                && M::ROUTER
-                && self.is_local_client_interface(meta.interface_id)
-                && self
-                    .pending_local_path_requests
-                    .take(&header.destination_hash);
-            if (self.config.transport_enabled && header.context != PacketContext::PathResponse)
-                || pending_local_answer
-            {
+            // Rebroadcast only an announce that updated the path, and not one that only
+            // replaced an unresponsive route (Transport.py). A local client's announce goes
+            // out at once, once; its answer to a waiting request goes once, as a path
+            // response, to the interface that asked.
+            let from_local_client = M::ROUTER && self.is_local_client_interface(meta.interface_id);
+            let answer_to = if header.context == PacketContext::PathResponse && from_local_client {
+                self.pending_local_path_requests
+                    .take(&header.destination_hash)
+            } else {
+                None
+            };
+            let rebroadcast = (self.config.transport_enabled || from_local_client)
+                && header.context != PacketContext::PathResponse
+                && inserted != PathInsert::TableOnly;
+            if rebroadcast || answer_to.is_some() {
+                let context = if answer_to.is_some() {
+                    PacketContext::PathResponse
+                } else {
+                    PacketContext::None
+                };
                 if let Ok(packet) = self.transport_announce_from_raw(
                     raw,
                     header.destination_hash,
                     header.hops,
-                    PacketContext::None,
+                    context,
                 ) {
                     let jitter = announce_jitter_ms(&packet_hash, &self.transport_id, 0);
                     self.announce_schedule.insert(
                         ScheduledAnnounce {
                             destination_hash: header.destination_hash,
                             packet,
-                            interface_id: meta.interface_id,
-                            due_ms: if pending_local_answer {
+                            interface_id: answer_to.unwrap_or(meta.interface_id),
+                            due_ms: if from_local_client {
                                 now_ms
                             } else {
                                 now_ms.saturating_add(jitter)
                             },
                             expires_ms: now_ms
                                 .saturating_add((QUEUED_ANNOUNCE_LIFE_SECS as u64) * 1000),
-                            block_rebroadcast: false,
+                            block_rebroadcast: answer_to.is_some(),
                             hops: header.hops,
-                            retries: if pending_local_answer {
-                                PATHFINDER_R
-                            } else {
-                                0
-                            },
+                            retries: if from_local_client { PATHFINDER_R } else { 0 },
                             local_rebroadcasts: 0,
                             pending_targets: 0,
                             held: false,
@@ -2063,7 +2068,8 @@ impl<
                 .get_live(&requested, now_ms)
                 .is_some_and(|path| self.is_local_client_interface(path.interface_id))
         {
-            self.pending_local_path_requests.record(requested, now_ms);
+            self.pending_local_path_requests
+                .record(requested, interface_id);
         }
 
         if let Some(path) = self.paths.get_live(&requested, now_ms) {
@@ -3129,6 +3135,7 @@ impl<
         self.announce_schedule.remove_interface(interface);
         self.reverse.remove_interface(interface);
         self.links.remove_interface(interface);
+        self.pending_local_path_requests.remove_interface(interface);
         self.announce_cache.retain_paths(&self.paths, self.clock_ms);
         self.expire_outbound(self.clock_ms);
     }
@@ -5227,9 +5234,8 @@ mod tests {
         // Cardputer budget (no PSRAM, ~55 KB free heap): the MICRO node must stay <= 32 KB so
         // cap drift can't silently blow the internal-heap allocation.
         let micro = core::mem::size_of::<MicroNode>();
-        // 33,464 since transit links keep their destination, path requests their time,
-        // origin and in-flight state, and announce validations their verdict.
-        assert_eq!(micro, 33_464, "MicroNode layout changed unexpectedly");
+        // 33,408 since pending local path requests keep their requester, not a time.
+        assert_eq!(micro, 33_408, "MicroNode layout changed unexpectedly");
         assert!(micro <= 33 * 1024, "MicroNode grew to {micro} B (> 33 KB)");
         std::println!(
             "MicroNode={micro} SmallNode={} Esp32PsramNode={} OutboundFrame={} OutboundLifetime={} token={}",
@@ -6316,17 +6322,17 @@ mod tests {
 
     #[test]
     fn endpoint_layout_and_transit_key_storage_remain_bounded() {
-        assert_eq!(core::mem::size_of::<MicroNode>(), 33464);
-        assert_eq!(core::mem::size_of::<SmallNode>(), 220120);
+        assert_eq!(core::mem::size_of::<MicroNode>(), 33408);
+        assert_eq!(core::mem::size_of::<SmallNode>(), 219672);
         assert_eq!(core::mem::size_of::<LinkEntry>(), 88);
         type ConstrainedRouter = LiteNode<16, 64, 16, 8, 4, 16, 8, 0, 4, Router>;
         type PsramRouter = LiteNode<128, 512, 32, 32, 16, 64, 16, 0, 16, Router>;
         if cfg!(target_pointer_width = "64") {
-            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 39992);
-            assert_eq!(core::mem::size_of::<PsramRouter>(), 106936);
+            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 39936);
+            assert_eq!(core::mem::size_of::<PsramRouter>(), 106712);
         } else if cfg!(target_pointer_width = "32") {
-            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 39616);
-            assert_eq!(core::mem::size_of::<PsramRouter>(), 106272);
+            assert_eq!(core::mem::size_of::<ConstrainedRouter>(), 39560);
+            assert_eq!(core::mem::size_of::<PsramRouter>(), 106048);
         }
     }
 

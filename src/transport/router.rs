@@ -190,6 +190,7 @@ impl<
         self.reverse.remove_interface(id);
         self.links.remove_interface(id);
         self.announce_schedule.remove_interface(id);
+        self.pending_local_path_requests.remove_interface(id);
         self.announce_cache.retain_paths(&self.paths, self.clock_ms);
         self.expire_outbound(self.clock_ms);
     }

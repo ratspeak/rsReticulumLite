@@ -197,6 +197,18 @@ impl<const N: usize> Default for PacketHashTable<N> {
     }
 }
 
+/// What [`PathTable::upsert`] did with an announce's path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PathInsert {
+    /// Not stored.
+    Refused,
+    /// Stored as a new or fresher path.
+    Updated,
+    /// Stored over an unresponsive route with the same emission; the
+    /// announce is not rebroadcast.
+    TableOnly,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PathEntry {
     pub destination_hash: Hash16,
@@ -217,8 +229,19 @@ pub struct PathEntry {
 }
 
 impl PathEntry {
+    /// Unexpired, or instance-local (0 hops), which never times out (Transport.py).
     pub fn is_live(self, now_ms: u64) -> bool {
-        now_ms < self.expires_ms
+        self.hops == 0 || now_ms < self.expires_ms
+    }
+
+    /// When the path stops being live: never for an instance-local path,
+    /// which eviction therefore takes last.
+    pub fn live_until(self) -> u64 {
+        if self.hops == 0 {
+            u64::MAX
+        } else {
+            self.expires_ms
+        }
     }
 }
 
@@ -263,7 +286,7 @@ impl<const N: usize> PathTable<N> {
             .zip(self.generations.iter())
             .find_map(|(slot, generation)| {
                 slot.as_ref()
-                    .filter(|entry| &entry.destination_hash == key && now_ms < entry.expires_ms)
+                    .filter(|entry| &entry.destination_hash == key && entry.is_live(now_ms))
                     .and_then(|_| (*generation != 0).then_some(*generation))
             })
     }
@@ -277,7 +300,7 @@ impl<const N: usize> PathTable<N> {
             .zip(self.generations.iter())
             .find_map(|(slot, current)| {
                 slot.as_ref()
-                    .filter(|entry| *current == generation && now_ms < entry.expires_ms)
+                    .filter(|entry| *current == generation && entry.is_live(now_ms))
             })
     }
 
@@ -349,12 +372,15 @@ impl<const N: usize> PathTable<N> {
 
     /// Immediately remove a failed route, like trusted rns-transport's
     /// PathTable::expire(destination). Known identities are stored separately.
+    /// An instance-local (0-hop) route is reported and kept, as upstream's is.
     pub fn drop_path(&mut self, destination_hash: &Hash16) -> bool {
         if let Some(slot) = self.entries.iter_mut().find(|slot| {
             slot.as_ref()
                 .is_some_and(|entry| &entry.destination_hash == destination_hash)
         }) {
-            *slot = None;
+            if slot.is_some_and(|entry| entry.hops != 0) {
+                *slot = None;
+            }
             true
         } else {
             false
@@ -385,6 +411,13 @@ impl<const N: usize> PathTable<N> {
     /// `false` for a rejected replacement, no eligible slot, or generation exhaustion.
     /// The caller checks signatures, key binding and the new entry's expiry.
     pub fn insert_or_update(&mut self, entry: PathEntry, now_ms: u64) -> bool {
+        self.upsert(entry, now_ms) != PathInsert::Refused
+    }
+
+    /// As [`Self::insert_or_update`], saying whether the entry only replaced
+    /// an unresponsive route with the same emission, which is not rebroadcast
+    /// (Transport.py).
+    pub fn upsert(&mut self, entry: PathEntry, now_ms: u64) -> PathInsert {
         self.expire(now_ms);
         if let Some(idx) = self
             .entries
@@ -401,28 +434,36 @@ impl<const N: usize> PathTable<N> {
             let new_emitted = announce_emitted(&entry.random_hash);
             let old_emitted = announce_emitted(&old.random_hash);
             let random_seen = entry.random_hash == old.random_hash;
-            let should_replace = if entry.hops <= old.hops {
+            let (should_replace, outcome) = if entry.hops <= old.hops {
                 // Equal-or-closer hop: accept only an unseen, more-recently-emitted announce.
-                !random_seen && new_emitted > old_emitted
+                (
+                    !random_seen && new_emitted > old_emitted,
+                    PathInsert::Updated,
+                )
             } else if !old.is_live(now_ms) || new_emitted > old_emitted {
                 // Farther hop: accept only if the path expired or the announce is newer.
-                !random_seen
+                (!random_seen, PathInsert::Updated)
             } else {
                 // Transport.py: the same emission replaces only an unresponsive route.
-                new_emitted == old_emitted && old.unresponsive
+                (
+                    new_emitted == old_emitted && old.unresponsive,
+                    PathInsert::TableOnly,
+                )
             };
-            return should_replace && self.replace_entry(idx, entry);
+            return if should_replace && self.replace_entry(idx, entry) {
+                outcome
+            } else {
+                PathInsert::Refused
+            };
         }
 
-        let replacement = self
-            .entries
-            .iter()
-            .position(Option::is_none)
-            .or_else(|| class_victim(&self.entries, entry.bulk, |e| e.bulk, |e| e.expires_ms));
-        if let Some(idx) = replacement {
-            self.replace_entry(idx, entry)
-        } else {
-            false
+        let replacement =
+            self.entries.iter().position(Option::is_none).or_else(|| {
+                class_victim(&self.entries, entry.bulk, |e| e.bulk, PathEntry::live_until)
+            });
+        match replacement {
+            Some(idx) if self.replace_entry(idx, entry) => PathInsert::Updated,
+            _ => PathInsert::Refused,
         }
     }
 
@@ -472,6 +513,21 @@ pub struct CachedAnnounce {
     pub bulk: bool,
 }
 
+impl CachedAnnounce {
+    /// Kept as long as its path: an instance-local one never times out.
+    fn is_live(self, now_ms: u64) -> bool {
+        self.hops == 0 || now_ms < self.expires_ms
+    }
+
+    fn retention(self) -> u64 {
+        if self.hops == 0 {
+            u64::MAX
+        } else {
+            self.expires_ms
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AnnounceCache<const N: usize> {
     #[doc(hidden)]
@@ -492,7 +548,7 @@ impl<const N: usize> AnnounceCache<N> {
         self.entries
             .iter()
             .flatten()
-            .find(|entry| &entry.destination_hash == destination_hash && now_ms < entry.expires_ms)
+            .find(|entry| &entry.destination_hash == destination_hash && entry.is_live(now_ms))
     }
 
     /// Cache an already-validated announce, replacing an existing destination
@@ -509,11 +565,14 @@ impl<const N: usize> AnnounceCache<N> {
             *slot = Some(entry);
             return;
         }
-        let replacement = self
-            .entries
-            .iter()
-            .position(Option::is_none)
-            .or_else(|| class_victim(&self.entries, entry.bulk, |e| e.bulk, |e| e.expires_ms));
+        let replacement = self.entries.iter().position(Option::is_none).or_else(|| {
+            class_victim(
+                &self.entries,
+                entry.bulk,
+                |e| e.bulk,
+                CachedAnnounce::retention,
+            )
+        });
         if let Some(idx) = replacement {
             self.entries[idx] = Some(entry);
         }
@@ -532,7 +591,7 @@ impl<const N: usize> AnnounceCache<N> {
 
     pub fn expire(&mut self, now_ms: u64) {
         for slot in &mut self.entries {
-            if slot.is_some_and(|entry| now_ms >= entry.expires_ms) {
+            if slot.is_some_and(|entry| !entry.is_live(now_ms)) {
                 *slot = None;
             }
         }
@@ -1266,6 +1325,72 @@ impl<const N: usize> Default for PathRequestTimes<N> {
     }
 }
 
+/// Requests a local client is expected to answer, each with the interface that
+/// asked (Python `pending_local_path_requests`, Transport.py). Entries stay
+/// packed oldest first; a full table drops its oldest request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingLocalRequests<const N: usize> {
+    #[doc(hidden)]
+    pub entries: [Option<(Hash16, InterfaceId)>; N],
+}
+
+impl<const N: usize> PendingLocalRequests<N> {
+    pub fn clear(&mut self) {
+        self.entries.fill(None);
+    }
+
+    pub const fn new() -> Self {
+        Self { entries: [None; N] }
+    }
+
+    /// Remember the latest requester for the destination.
+    pub fn record(&mut self, destination_hash: Hash16, requester: InterfaceId) {
+        if N == 0 {
+            return;
+        }
+        self.take(&destination_hash);
+        let idx = match self.entries.iter().position(Option::is_none) {
+            Some(idx) => idx,
+            None => {
+                self.entries.copy_within(1.., 0);
+                N - 1
+            }
+        };
+        self.entries[idx] = Some((destination_hash, requester));
+    }
+
+    /// Forget the destination, returning the interface that asked for it.
+    pub fn take(&mut self, destination_hash: &Hash16) -> Option<InterfaceId> {
+        let idx = self
+            .entries
+            .iter()
+            .position(|slot| slot.is_some_and(|(dest, _)| dest == *destination_hash))?;
+        let requester = self.entries[idx].map(|(_, requester)| requester);
+        self.entries.copy_within(idx + 1.., idx);
+        self.entries[N - 1] = None;
+        requester
+    }
+
+    /// Forget requests from an interface that is gone (Transport.py).
+    pub fn remove_interface(&mut self, interface: InterfaceId) {
+        let mut kept = 0;
+        for idx in 0..N {
+            if let Some(entry) = self.entries[idx].filter(|(_, requester)| *requester != interface)
+            {
+                self.entries[kept] = Some(entry);
+                kept += 1;
+            }
+        }
+        self.entries[kept..].fill(None);
+    }
+}
+
+impl<const N: usize> Default for PendingLocalRequests<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const N: usize> Default for RequestTagTable<N> {
     fn default() -> Self {
         Self::new()
@@ -1576,6 +1701,74 @@ mod tests {
         assert!(table.get(&[1; 16]).is_none());
         assert!(table.get(&[2; 16]).is_some());
         assert!(table.get(&[3; 16]).is_some());
+    }
+
+    #[test]
+    fn instance_local_paths_outlive_expiry_and_go_last() {
+        let mut table: PathTable<2> = PathTable::new();
+        let local = PathEntry {
+            hops: 0,
+            ..path(1, 100)
+        };
+        assert!(table.insert_or_update(local, 0));
+        assert!(table.insert_or_update(path(2, 200), 0));
+        table.expire(1_000);
+        assert_eq!(table.get_live(&[1; 16], 1_000), Some(&local));
+        assert!(table.get(&[2; 16]).is_none());
+        assert!(table.drop_path(&[1; 16]));
+        assert!(table.get(&[1; 16]).is_some());
+
+        assert!(table.insert_or_update(path(3, 2_000), 1_000));
+        assert!(table.insert_or_update(path(4, 3_000), 1_000));
+        assert!(table.get(&[1; 16]).is_some());
+        assert!(table.get(&[3; 16]).is_none());
+
+        let mut cache: AnnounceCache<2> = AnnounceCache::new();
+        let cached = CachedAnnounce {
+            hops: 0,
+            ..cached_announce(1, 100)
+        };
+        cache.insert(cached, 0);
+        cache.insert(cached_announce(2, 200), 0);
+        cache.expire(1_000);
+        assert_eq!(cache.get(&[1; 16], 1_000), Some(&cached));
+        cache.insert(cached_announce(3, 2_000), 1_000);
+        cache.insert(cached_announce(4, 3_000), 1_000);
+        assert!(cache.get(&[1; 16], 1_000).is_some());
+    }
+
+    #[test]
+    fn same_emission_over_an_unresponsive_path_is_table_only() {
+        let mut table: PathTable<2> = PathTable::new();
+        let direct = path(1, 100);
+        assert_eq!(table.upsert(direct, 0), PathInsert::Updated);
+        let farther = PathEntry {
+            hops: 2,
+            interface_id: 2,
+            ..direct
+        };
+        assert_eq!(table.upsert(farther, 1), PathInsert::Refused);
+        assert!(table.mark_unresponsive(&direct.destination_hash));
+        assert_eq!(table.upsert(farther, 1), PathInsert::TableOnly);
+        assert_eq!(table.get_live(&[1; 16], 1), Some(&farther));
+    }
+
+    #[test]
+    fn pending_local_requests_keep_the_latest_requester_oldest_first() {
+        let mut pending: PendingLocalRequests<2> = PendingLocalRequests::new();
+        pending.record([1; 16], 1);
+        pending.record([2; 16], 2);
+        pending.record([1; 16], 3);
+        pending.record([3; 16], 4);
+        assert_eq!(pending.take(&[2; 16]), None);
+        assert_eq!(pending.take(&[1; 16]), Some(3));
+        assert_eq!(pending.take(&[1; 16]), None);
+        pending.record([4; 16], 4);
+        pending.remove_interface(4);
+        assert_eq!(pending.entries, [None, None]);
+        let mut none: PendingLocalRequests<0> = PendingLocalRequests::new();
+        none.record([1; 16], 1);
+        assert_eq!(none.take(&[1; 16]), None);
     }
 
     #[test]
