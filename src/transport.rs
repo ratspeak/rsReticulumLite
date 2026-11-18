@@ -2092,14 +2092,28 @@ impl<
                         PATH_REQUEST_GRACE_MS
                     };
                     let hops = cached.hops;
-                    // Transport.py: a queued announce waits for the answer.
-                    self.announce_schedule.hold(&requested);
+                    let due_ms = now_ms.saturating_add(delay_ms);
+                    // A repeat request keeps the time of an answer already queued
+                    // to the same interface, so a fast requester is still answered.
+                    let queued_due = self
+                        .announce_schedule
+                        .get_mut(&requested)
+                        .filter(|entry| {
+                            entry.block_rebroadcast
+                                && entry.interface_id == interface_id
+                                && !entry.pending_only()
+                        })
+                        .map(|entry| entry.due_ms);
+                    if queued_due.is_none() {
+                        // Transport.py: a queued announce waits for the answer.
+                        self.announce_schedule.hold(&requested);
+                    }
                     self.announce_schedule.insert(
                         ScheduledAnnounce {
                             destination_hash: requested,
                             packet: response,
                             interface_id,
-                            due_ms: now_ms.saturating_add(delay_ms),
+                            due_ms: queued_due.map_or(due_ms, |queued| queued.min(due_ms)),
                             expires_ms: now_ms
                                 .saturating_add(u64::from(QUEUED_ANNOUNCE_LIFE_SECS) * 1000),
                             block_rebroadcast: true,
@@ -4743,6 +4757,30 @@ mod tests {
         assert_eq!(view.header.context, PacketContext::PathResponse);
         assert_eq!(view.header.transport_id, Some(TRANSPORT_ID));
         assert_eq!(view.header.destination_hash, announce.destination_hash);
+    }
+
+    #[test]
+    fn a_repeated_path_request_keeps_the_queued_answer_time() {
+        let announce = signed_announce([0x14; 32], "lxmf.delivery", b"node");
+        let mut node = node();
+        node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
+            .unwrap();
+        node.tick(2000);
+        while node.take_queued().is_some() {}
+
+        for (tag, at) in [(0x56, 3000), (0x57, 3300)] {
+            let request = path_request(announce.destination_hash, [tag; 16]);
+            assert_eq!(
+                node.ingest(request.as_slice(), RxMeta::new(IFACE), at)
+                    .unwrap(),
+                IngestAction::AnsweredPathRequest
+            );
+        }
+        node.tick(3000 + PATH_REQUEST_GRACE_MS);
+        assert_eq!(
+            node.take_queued().unwrap().reason,
+            OutboundReason::PathResponse
+        );
     }
 
     #[test]

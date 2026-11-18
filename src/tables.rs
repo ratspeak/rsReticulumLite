@@ -569,7 +569,7 @@ impl ScheduledAnnounce {
     /// `due_ms` of an entry with no send left to schedule, kept only for its pending targets.
     pub const PENDING_ONLY: u64 = u64::MAX;
 
-    const fn pending_only(&self) -> bool {
+    pub(crate) const fn pending_only(&self) -> bool {
         self.due_ms == Self::PENDING_ONLY
     }
 }
