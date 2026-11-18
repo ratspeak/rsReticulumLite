@@ -1225,14 +1225,12 @@ fn plain_and_group_filter_matches_trusted_transport() {
         InboundPacket, InterfaceEntry, TransportMessage, TransportQuery, TransportQueryResponse,
     };
 
-    let identity = rns_identity::identity::Identity::from_private_key(&[0x52; 64]).unwrap();
     let app_name = "lxmf.delivery";
-    let announced = rns_identity::destination::Destination::hash_from_name_and_identity(
-        app_name,
-        Some(&identity.hash),
-    );
     let packet = |packet_type, destination_type, context, hops, case: u8| {
         let (destination_hash, payload) = if packet_type == PacketType::Announce {
+            // One identity per case: the trusted prefilter drops a same-second
+            // announce for a destination it already knows.
+            let identity = rns_identity::identity::Identity::from_private_key(&[case; 64]).unwrap();
             let announce = rns_identity::announce::AnnounceData::create(
                 &identity,
                 app_name,
@@ -1240,6 +1238,10 @@ fn plain_and_group_filter_matches_trusted_transport() {
                 None,
             )
             .unwrap();
+            let announced = rns_identity::destination::Destination::hash_from_name_and_identity(
+                app_name,
+                Some(&identity.hash),
+            );
             (announced, announce.pack())
         } else {
             let mut request = vec![case; 16];
