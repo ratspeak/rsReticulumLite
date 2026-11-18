@@ -7,9 +7,10 @@ use crate::announce_cap::{bitrate_spacing_ms, lora_spacing_ms};
 use crate::config::{ConfigError, InterfaceConfig, InterfaceRegistry, InterfaceRole};
 use crate::config::{InterfaceMode, LiteConfig};
 use crate::constants::{
-    AP_PATH_TIME_SECS, LINK_TIMEOUT_SECS, LOCAL_REBROADCASTS_MAX, PATH_REQUEST_DUPLICATE_GATE_SECS,
-    PATHFINDER_E_SECS, PATHFINDER_G_SECS, PATHFINDER_M, PATHFINDER_R, QUEUED_ANNOUNCE_LIFE_SECS,
-    REVERSE_TIMEOUT_SECS, ROAMING_PATH_TIME_SECS,
+    AP_PATH_TIME_SECS, LINK_TIMEOUT_SECS, LOCAL_REBROADCASTS_MAX, MTU,
+    PATH_REQUEST_DUPLICATE_GATE_SECS, PATHFINDER_E_SECS, PATHFINDER_G_SECS, PATHFINDER_M,
+    PATHFINDER_R, QUEUED_ANNOUNCE_LIFE_SECS, REVERSE_TIMEOUT_SECS, ROAMING_PATH_TIME_SECS,
+    TRANSPORT_ID_LENGTH,
 };
 use crate::discovery::{
     BeginDiscovery, Discoveries, REQUEST_GATE_MS, REQUESTERS, discovery_timeout, link_deadline,
@@ -1588,6 +1589,18 @@ impl<
             )
             && (view.header.flags.packet_type == PacketType::Announce || view.header.hops > 1)
         {
+            self.stats.dropped = self.stats.dropped.saturating_add(1);
+            return Ok(IngestAction::Dropped);
+        }
+
+        // Transport.py: a HEADER_1 announce must leave room for a relay's
+        // transport id; oversize announces are protocol violations.
+        if view.header.flags.packet_type == PacketType::Announce
+            && (raw.len() > MTU
+                || (view.header.flags.header_type == HeaderType::Header1
+                    && raw.len() > MTU - TRANSPORT_ID_LENGTH))
+        {
+            self.stats.protocol_violations = self.stats.protocol_violations.saturating_add(1);
             self.stats.dropped = self.stats.dropped.saturating_add(1);
             return Ok(IngestAction::Dropped);
         }
@@ -3462,24 +3475,24 @@ mod tests {
     }
 
     #[test]
-    fn relay_learns_unforwardable_announce_without_erroring() {
-        // app_data at the single-packet receive max (333) but above the HEADER_2-forwardable bound
-        // (~317): the path is LEARNED, ingest does NOT error, and nothing is rebroadcast (the
-        // reframed HEADER_2 announce would exceed MTU). Guards the "Err after learning" regression.
+    fn header1_announce_without_room_for_a_transport_id_is_a_protocol_violation() {
         let mut node =
             SmallNode::new(LiteConfig::ESP32_LORA_TRANSPORT_SMALL, TRANSPORT_ID).unwrap();
-        let app_data = [0x5au8; 333];
-        let ann = signed_announce([0xA1u8; 32], "lxmf.delivery", &app_data);
-        let action = node
-            .ingest(ann.raw.as_slice(), RxMeta::new(IFACE), 1000)
-            .unwrap();
-        assert_eq!(action, IngestAction::LearnedAnnounce);
-        assert!(node.has_path(&ann.destination_hash, 1000));
-        node.tick(5000);
-        assert!(
-            node.take_queued().is_none(),
-            "unforwardable announce must not rebroadcast"
+        let fits = signed_announce([0xA1u8; 32], "lxmf.delivery", &[0x5au8; 317]);
+        assert_eq!(fits.raw.len(), crate::constants::MTU - 16);
+        assert_eq!(
+            node.ingest(fits.raw.as_slice(), RxMeta::new(IFACE), 1000)
+                .unwrap(),
+            IngestAction::ScheduledAnnounce
         );
+        let over = signed_announce([0xA2u8; 32], "lxmf.delivery", &[0x5au8; 318]);
+        assert_eq!(
+            node.ingest(over.raw.as_slice(), RxMeta::new(IFACE), 1000)
+                .unwrap(),
+            IngestAction::Dropped
+        );
+        assert!(!node.has_path(&over.destination_hash, 1000));
+        assert_eq!(node.stats().protocol_violations, 1);
     }
 
     #[test]

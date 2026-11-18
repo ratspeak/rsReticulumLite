@@ -3,7 +3,7 @@ use zeroize::Zeroize;
 
 use crate::constants::{
     DESTINATION_LENGTH, HEADER_MINSIZE, MTU, NAME_HASH_LENGTH, PRIVATE_KEY_LENGTH,
-    PUBLIC_KEY_LENGTH, RANDOM_HASH_LENGTH, SIGNATURE_LENGTH,
+    PUBLIC_KEY_LENGTH, RANDOM_HASH_LENGTH, SIGNATURE_LENGTH, TRANSPORT_ID_LENGTH,
 };
 use crate::stamps;
 use crate::wire::truncated_hash;
@@ -423,17 +423,17 @@ const ANNOUNCE_FIXED_NO_RATCHET: usize =
     PUBLIC_KEY_LENGTH + NAME_HASH_LENGTH + RANDOM_HASH_LENGTH + SIGNATURE_LENGTH;
 
 /// Largest app-data allowance for a header-1 announce without a ratchet or
-/// IFAC: `MTU - HEADER_MINSIZE - ANNOUNCE_FIXED_NO_RATCHET` (333 bytes).
+/// IFAC that leaves room for the transport id a relay inserts (Packet.py):
+/// `MTU - HEADER_MINSIZE - TRANSPORT_ID_LENGTH - ANNOUNCE_FIXED_NO_RATCHET`
+/// (317 bytes, 285 with a ratchet).
 ///
-/// This is an upper receive bound, not a guarantee that every constructed
-/// announce fits a packet. A ratchet adds 32 bytes, forwarding headers add
-/// packet bytes, and IFAC adds to the wrapped frame. Callers must check both
-/// the packet budget and the interface's frame limit.
-pub const MAX_ANNOUNCE_APP_DATA: usize = MTU - HEADER_MINSIZE - ANNOUNCE_FIXED_NO_RATCHET;
+/// A ratchet takes 32 of these bytes and IFAC adds to the wrapped frame;
+/// callers must still check the interface's frame limit.
+pub const MAX_ANNOUNCE_APP_DATA: usize =
+    MTU - HEADER_MINSIZE - TRANSPORT_ID_LENGTH - ANNOUNCE_FIXED_NO_RATCHET;
 
-// Pin the wire bound (MTU 500 - HEADER_MINSIZE 19 - fixed 148 = 333). A regression that lowers it
-// would re-introduce the long-display-name black-hole; raising MTU should bump this in lockstep.
-const _: () = assert!(MAX_ANNOUNCE_APP_DATA == 333);
+// MTU 500 - HEADER_MINSIZE 19 - transport id 16 - fixed 148 = 317.
+const _: () = assert!(MAX_ANNOUNCE_APP_DATA == 317);
 
 /// Scratch capacity for `dest_hash || pub || name_hash || random_hash ||
 /// ratchet || app_data` at the maximum app-data allowance. This sizes signing
@@ -544,10 +544,11 @@ impl LocalIdentity {
     /// Layout: `pub(64) || name_hash(10) || random_hash(10) || [ratchet(32)] || sig(64) || app_data`.
     /// The signature covers `dest_hash(16)` followed by those fields without `sig`.
     ///
-    /// The helper accepts up to [`MAX_ANNOUNCE_APP_DATA`] app-data bytes even when
-    /// a ratchet is present. The caller must fit the result plus packet headers
-    /// and IFAC within the interface budget, and set the packet's `context_flag`
-    /// exactly when `ratchet` is `Some`. It does not send or schedule the announce.
+    /// App data beyond [`MAX_ANNOUNCE_APP_DATA`], less 32 bytes with a ratchet,
+    /// is refused: the header-1 packet must leave room for a relay's transport
+    /// id. The caller must fit IFAC within the interface budget, and set the
+    /// packet's `context_flag` exactly when `ratchet` is `Some`. It does not
+    /// send or schedule the announce.
     pub fn create_announce_named(
         &self,
         name: &str,
@@ -587,10 +588,10 @@ impl LocalIdentity {
     ) -> Result<usize, AnnounceError> {
         let ext = ext.map(AnnounceStampExt::encode);
         let ext: &[u8] = ext.as_ref().map_or(&[], |ext| ext);
-        if app_data.len() + ext.len() > MAX_ANNOUNCE_APP_DATA {
+        let ratchet_len = ratchet.map_or(0, |_| RATCHET_SIZE);
+        if app_data.len() + ext.len() + ratchet_len > MAX_ANNOUNCE_APP_DATA {
             return Err(AnnounceError::AppDataTooLong);
         }
-        let ratchet_len = ratchet.map_or(0, |_| RATCHET_SIZE);
         let announce_len = PUBLIC_KEY_LENGTH
             + NAME_HASH_LENGTH
             + RANDOM_HASH_LENGTH
@@ -785,8 +786,8 @@ mod create_tests {
 
     #[test]
     fn create_announce_accepts_full_single_packet_app_data() {
-        // A no-ratchet announce can carry MAX_ANNOUNCE_APP_DATA (= MDU - fixed) bytes and still
-        // round-trips through parse+validate. Guards the receive-path parity bound (>256).
+        // A no-ratchet announce can carry MAX_ANNOUNCE_APP_DATA bytes and still
+        // round-trips through parse+validate.
         let id = LocalIdentity::from_private_key(&unhex::<PRIVATE_KEY_LENGTH>(INCREMENTING));
         let app = [0x5au8; MAX_ANNOUNCE_APP_DATA];
         let mut out = [0u8; 600];
