@@ -28,7 +28,8 @@ pub const LOCAL_REBROADCASTS_MAX: u8 = 2;
 pub const PATHFINDER_E_SECS: u32 = 604_800;
 pub const AP_PATH_TIME_SECS: u32 = 86_400;
 pub const ROAMING_PATH_TIME_SECS: u32 = 21_600;
-pub const REVERSE_TIMEOUT_SECS: u32 = 480;
+// Transport.py `REVERSE_TIMEOUT` (3 min).
+pub const REVERSE_TIMEOUT_SECS: u32 = 180;
 pub const LINK_TIMEOUT_SECS: u32 = 900;
 // Matches upstream ESTABLISHMENT_TIMEOUT_PER_HOP / DEFAULT_PER_HOP_TIMEOUT (6s).
 // discovery::link_deadline adds the sampled outbound bitrate serialization allowance.
@@ -55,6 +56,7 @@ mod tests {
         assert_eq!(LOCAL_REBROADCASTS_MAX, 2); // LOCAL_REBROADCASTS_MAX
         assert_eq!(AP_PATH_TIME_SECS, 86_400); // AP_PATH_TIME (24h)
         assert_eq!(ROAMING_PATH_TIME_SECS, 21_600); // ROAMING_PATH_TIME (6h)
+        assert_eq!(REVERSE_TIMEOUT_SECS, 180); // REVERSE_TIMEOUT (3 min)
         // Wire lengths
         assert_eq!(MTU, 500);
         assert_eq!(DESTINATION_LENGTH, 16);
