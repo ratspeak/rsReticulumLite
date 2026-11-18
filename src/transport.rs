@@ -2036,18 +2036,14 @@ impl<
             }
         }
 
-        // Trusted outbound.rs / Python 1.3.8 Transport.py: a path request for one of
-        // our OWN destinations is answered by the HOST (fresh signed announce), never
-        // forwarded. Returning Dropped lets the FFI's own-path-request post-check fire in
-        // both transport postures.
         // Transport.py: a request for a destination already in flight joins
         // its waiting requesters instead of being processed again.
+        let from_local_client = M::ROUTER && self.is_local_client_interface(interface_id);
         if self
             .inflight_path_requests
             .last(&requested)
             .is_some_and(|at| now_ms.saturating_sub(at) <= PATH_REQUEST_GATE_TIMEOUT_MS)
         {
-            let from_local_client = M::ROUTER && self.is_local_client_interface(interface_id);
             if self.config.transport_enabled || from_local_client {
                 if let Some(slot) = self.interface_slot(interface_id) {
                     let timeout = discovery_timeout(self.slowest_outbound_bitrate(interface_id));
@@ -2057,6 +2053,8 @@ impl<
             return Ok(IngestAction::Accepted);
         }
         self.inflight_path_requests.record(requested, now_ms);
+        // Trusted outbound.rs / Transport.py: a path request for one of our OWN
+        // destinations is answered by the HOST (fresh signed announce), never forwarded.
         if self.is_own_destination(&requested) {
             self.inflight_path_requests.take(&requested);
             return Ok(IngestAction::LocalEndpoint);
@@ -2075,7 +2073,6 @@ impl<
         if let Some(path) = self.paths.get_live(&requested, now_ms) {
             // Transport.py: a transport node, or any node asked by a local client,
             // answers from its cache.
-            let from_local_client = M::ROUTER && self.is_local_client_interface(interface_id);
             let answers = self.config.transport_enabled || from_local_client;
             if requestor_transport_id.is_some_and(|requestor| path.next_hop == Some(requestor)) {
                 // Transport.py: declined still counts as answered.
@@ -2093,12 +2090,19 @@ impl<
                 return Ok(IngestAction::Dropped);
             }
             if answers {
-                if let Some(cached) = self.announce_cache.get(&requested, now_ms) {
-                    let response = self.path_response_from_cached_announce(
-                        cached.raw.as_slice(),
-                        requested,
-                        cached.hops,
-                    )?;
+                let answer = self
+                    .announce_cache
+                    .get(&requested, now_ms)
+                    .and_then(|cached| {
+                        self.path_response_from_cached_announce(
+                            cached.raw.as_slice(),
+                            requested,
+                            cached.hops,
+                        )
+                        .ok()
+                        .map(|response| (response, cached.hops))
+                    });
+                if let Some((response, hops)) = answer {
                     // Transport.py: wait PATH_REQUEST_GRACE (plus PATH_REQUEST_RG
                     // on a roaming interface) so better-placed peers can answer first.
                     let delay_ms = if from_local_client
@@ -2110,7 +2114,6 @@ impl<
                     } else {
                         PATH_REQUEST_GRACE_MS
                     };
-                    let hops = cached.hops;
                     let due_ms = now_ms.saturating_add(delay_ms);
                     // A repeat request keeps the time of an answer already queued
                     // to the same interface, so a fast requester is still answered.
@@ -2148,16 +2151,16 @@ impl<
                     return Ok(IngestAction::AnsweredPathRequest);
                 }
             }
-            // With signed cache material unavailable, fall through to the ordinary
-            // discovery gates, where Python ignores the request; the bounded cache
-            // makes this common. Python still counts it as answered, so the search
-            // never holds the in-flight gate.
+            // With signed cache material unavailable or unusable, fall through to the
+            // ordinary discovery gates, where Python ignores the request; the bounded
+            // cache makes this common. Python still counts it as answered, so the
+            // search never holds the in-flight gate.
             if answers {
                 self.inflight_path_requests.take(&requested);
             }
         }
 
-        if M::ROUTER && self.is_local_client_interface(interface_id) {
+        if from_local_client {
             // Transport.py: a stamping node stamps a local
             // client's unstamped request before forwarding it.
             let stamped;
@@ -2171,35 +2174,35 @@ impl<
                             Some(&stamped)
                         }
                         None => {
-                            return Ok(
-                                match self.queue_path_request_stamp(
+                            if self
+                                .queue_path_request_stamp(
                                     requested,
                                     tag16,
                                     PathRequestTarget::AllExcept(interface_id),
-                                ) {
-                                    Ok(()) => IngestAction::Accepted,
-                                    Err(_) => IngestAction::Dropped,
-                                },
-                            );
+                                )
+                                .is_ok()
+                            {
+                                return Ok(IngestAction::Accepted);
+                            }
+                            self.release_path_request_gate(&requested, now_ms);
+                            return Ok(IngestAction::Dropped);
                         }
                     }
                 }
                 ext => ext,
             };
             let request = self.build_path_request(requested, tag, ext)?;
-            return Ok(
-                if self.enqueue_packet_broadcast(
-                    interface_id,
-                    request,
-                    OutboundReason::PathRequestForward,
-                    false,
-                ) > 0
-                {
-                    IngestAction::ForwardedPathRequest
-                } else {
-                    IngestAction::Dropped
-                },
-            );
+            if self.enqueue_packet_broadcast(
+                interface_id,
+                request,
+                OutboundReason::PathRequestForward,
+                false,
+            ) > 0
+            {
+                return Ok(IngestAction::ForwardedPathRequest);
+            }
+            self.release_path_request_gate(&requested, now_ms);
+            return Ok(IngestAction::Dropped);
         }
         // Transport.py: a stamping node relays someone else's
         // unstamped request with the lenient marker instead of a stamp.
@@ -2216,10 +2219,12 @@ impl<
                 .interface_slot(interface_id)
                 .filter(|&slot| self.interfaces.facts(slot).outbound())
             else {
+                self.release_path_request_gate(&requested, now_ms);
                 return Ok(IngestAction::Dropped);
             };
             // Transport.py: unreachable while enforcement drops above.
             if ext.is_none() && policy.stamps_enforced {
+                self.release_path_request_gate(&requested, now_ms);
                 return Ok(IngestAction::Dropped);
             }
             let timeout = discovery_timeout(self.slowest_outbound_bitrate(interface_id));
@@ -2227,6 +2232,7 @@ impl<
                 BeginDiscovery::Joined => return Ok(IngestAction::Accepted),
                 BeginDiscovery::Refused => {
                     self.stats.dropped = self.stats.dropped.saturating_add(1);
+                    self.release_path_request_gate(&requested, now_ms);
                     return Ok(IngestAction::Dropped);
                 }
                 BeginDiscovery::New(identity) => {
@@ -2266,7 +2272,17 @@ impl<
                 return Ok(IngestAction::ForwardedPathRequest);
             }
         }
+        self.release_path_request_gate(&requested, now_ms);
         Ok(IngestAction::Dropped)
+    }
+
+    /// Release the in-flight gate after a request that left nothing pending,
+    /// unless a search for the destination still is. Transport.py keeps it for
+    /// 45 s, batching every later request.
+    fn release_path_request_gate(&mut self, requested: &Hash16, now_ms: u64) {
+        if !self.discoveries.live_for(requested, now_ms) {
+            self.inflight_path_requests.take(requested);
+        }
     }
 
     fn handle_transport_forward(
@@ -4733,6 +4749,246 @@ mod tests {
                 .last(&first.destination_hash)
                 .is_none()
         );
+    }
+
+    fn drain_router(n: &mut TestRouter, ids: &[InterfaceId]) -> usize {
+        let mut frames = 0;
+        for &id in ids {
+            while n.poll_tx_for_interface(id).is_some() {
+                frames += 1;
+            }
+        }
+        frames
+    }
+
+    #[test]
+    fn an_ignored_path_request_releases_the_gate() {
+        // Transport.py keeps a request ignored on a non-searching interface in
+        // flight, so a searching requester was batched for 45 s instead of searched for.
+        let requested = [0x61; 16];
+        let mut node = node();
+        assert_eq!(
+            node.ingest(
+                path_request(requested, [0x01; 16]).as_slice(),
+                RxMeta::with_mode(9, InterfaceMode::Full),
+                1000
+            ),
+            Ok(IngestAction::Dropped)
+        );
+        assert!(node.take_queued().is_none());
+        assert_eq!(
+            node.ingest(
+                path_request(requested, [0x02; 16]).as_slice(),
+                RxMeta::new(IFACE),
+                1100
+            ),
+            Ok(IngestAction::ForwardedPathRequest)
+        );
+
+        let mut n = router(&[
+            InterfaceConfig {
+                mode: InterfaceMode::Full,
+                ..InterfaceConfig::lora(1, 1000, 4)
+            },
+            InterfaceConfig::lora(2, 1000, 4),
+        ]);
+        assert_eq!(
+            n.ingest(
+                path_request(requested, [0x01; 16]).as_slice(),
+                RxMeta::new(1),
+                1000
+            ),
+            Ok(IngestAction::Dropped)
+        );
+        assert_eq!(drain_router(&mut n, &[1, 2]), 0);
+        assert_eq!(
+            n.ingest(
+                path_request(requested, [0x02; 16]).as_slice(),
+                RxMeta::new(2),
+                1100
+            ),
+            Ok(IngestAction::ForwardedPathRequest)
+        );
+        assert_eq!(
+            n.poll_tx_for_interface(1).unwrap().reason,
+            OutboundReason::PathRequestForward
+        );
+    }
+
+    #[test]
+    fn a_refused_or_unslotted_search_releases_the_gate() {
+        let mut n = router(&[
+            InterfaceConfig {
+                direction: crate::config::InterfaceDirection::INBOUND_ONLY,
+                ..InterfaceConfig::lora(1, 1000, 4)
+            },
+            InterfaceConfig::lora(2, 1000, 4),
+            InterfaceConfig::lora(3, 1000, 4),
+        ]);
+        let unslotted = [0x62; 16];
+        assert_eq!(
+            n.ingest(
+                path_request(unslotted, [0x01; 16]).as_slice(),
+                RxMeta::new(1),
+                1000
+            ),
+            Ok(IngestAction::Dropped)
+        );
+        assert_eq!(
+            n.ingest(
+                path_request(unslotted, [0x02; 16]).as_slice(),
+                RxMeta::new(2),
+                1100
+            ),
+            Ok(IngestAction::ForwardedPathRequest)
+        );
+        drain_router(&mut n, &[1, 2, 3]);
+
+        let refused = [0x63; 16];
+        let last_identity = n.discoveries.last_identity;
+        n.discoveries.last_identity = u64::MAX;
+        assert_eq!(
+            n.ingest(
+                path_request(refused, [0x01; 16]).as_slice(),
+                RxMeta::new(2),
+                1200
+            ),
+            Ok(IngestAction::Dropped)
+        );
+        n.discoveries.last_identity = last_identity;
+        assert_eq!(
+            n.ingest(
+                path_request(refused, [0x02; 16]).as_slice(),
+                RxMeta::new(2),
+                1300
+            ),
+            Ok(IngestAction::ForwardedPathRequest)
+        );
+        // A search in progress still batches later requesters.
+        assert_eq!(
+            n.ingest(
+                path_request(refused, [0x03; 16]).as_slice(),
+                RxMeta::new(3),
+                1400
+            ),
+            Ok(IngestAction::Accepted)
+        );
+    }
+
+    #[test]
+    fn a_search_in_progress_keeps_the_gate() {
+        // A 100 bps target keeps the search live past the 45 s gate.
+        let mut n = router(&[
+            InterfaceConfig {
+                mode: InterfaceMode::Full,
+                ..InterfaceConfig::lora(1, 1000, 4)
+            },
+            InterfaceConfig::lora(2, 1000, 4),
+            InterfaceConfig::lora(3, 100, 4),
+        ]);
+        let requested = [0x68; 16];
+        assert_eq!(
+            n.ingest(
+                path_request(requested, [0x01; 16]).as_slice(),
+                RxMeta::new(2),
+                1000
+            ),
+            Ok(IngestAction::ForwardedPathRequest)
+        );
+        let later = 1000 + PATH_REQUEST_GATE_TIMEOUT_MS + 1;
+        assert_eq!(
+            n.ingest(
+                path_request(requested, [0x02; 16]).as_slice(),
+                RxMeta::new(1),
+                later
+            ),
+            Ok(IngestAction::Dropped)
+        );
+        assert_eq!(n.inflight_path_requests.last(&requested), Some(later));
+    }
+
+    #[test]
+    fn a_local_client_forward_that_sends_nothing_releases_the_gate() {
+        const NET: InterfaceId = 1;
+        const LOCAL: InterfaceId = 2;
+        let mut n = router(&[
+            InterfaceConfig {
+                online: false,
+                ..InterfaceConfig::lora(NET, 1000, 4)
+            },
+            InterfaceConfig::local_client(LOCAL, 100_000, 4),
+        ]);
+        let requested = [0x64; 16];
+        assert_eq!(
+            n.ingest(
+                path_request(requested, [0x01; 16]).as_slice(),
+                RxMeta::new(LOCAL),
+                1000
+            ),
+            Ok(IngestAction::Dropped)
+        );
+        n.set_interface_online(NET, true).unwrap();
+        assert_eq!(
+            n.ingest(
+                path_request(requested, [0x02; 16]).as_slice(),
+                RxMeta::new(LOCAL),
+                1100
+            ),
+            Ok(IngestAction::ForwardedPathRequest)
+        );
+
+        // A stamping node whose stamp queue is full sends nothing either.
+        n.config.stamp_policy.stamp_prs = true;
+        let mut filler = 0u8;
+        while n
+            .queue_path_request_stamp(
+                [filler; 16],
+                [filler; 16],
+                PathRequestTarget::AllExcept(LOCAL),
+            )
+            .is_ok()
+        {
+            filler += 1;
+        }
+        let unstamped = [0x65; 16];
+        assert_eq!(
+            n.ingest(
+                path_request(unstamped, [0x01; 16]).as_slice(),
+                RxMeta::new(LOCAL),
+                1200
+            ),
+            Ok(IngestAction::Dropped)
+        );
+        assert!(n.inflight_path_requests.last(&unstamped).is_none());
+    }
+
+    #[test]
+    fn an_unusable_cached_answer_releases_the_gate() {
+        let announce = signed_announce([0x67; 32], "lxmf.delivery", b"node");
+        let dest = announce.destination_hash;
+        let mut node = node();
+        node.ingest(announce.raw.as_slice(), RxMeta::new(IFACE), 1000)
+            .unwrap();
+        node.tick(3000);
+        while node.take_queued().is_some() {}
+        let cached = node
+            .announce_cache
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|cached| cached.destination_hash == dest)
+            .unwrap();
+        cached.raw = PacketBuffer::from_slice(&announce.raw.as_slice()[..2]).unwrap();
+
+        assert_eq!(
+            node.ingest(
+                path_request(dest, [0x01; 16]).as_slice(),
+                RxMeta::new(IFACE),
+                3100
+            ),
+            Ok(IngestAction::ForwardedPathRequest)
+        );
+        assert!(node.inflight_path_requests.last(&dest).is_none());
     }
 
     #[test]

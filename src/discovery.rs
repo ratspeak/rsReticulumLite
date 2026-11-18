@@ -137,6 +137,11 @@ impl<const N: usize> Discoveries<N> {
             .iter()
             .any(|e| e.identity == identity && e.live(now))
     }
+    pub fn live_for(&self, destination: &[u8; 16], now: u64) -> bool {
+        self.entries
+            .iter()
+            .any(|e| &e.destination == destination && e.live(now))
+    }
     pub fn deadline(&self, identity: u64) -> Option<u64> {
         self.entries
             .iter()
@@ -177,6 +182,9 @@ mod tests {
         assert_eq!(d.deadline(1), Some(15_000));
         assert!(d.live(1, 14_999));
         assert!(!d.live(1, 15_000));
+        assert!(d.live_for(&[1; 16], 14_999));
+        assert!(!d.live_for(&[1; 16], 15_000));
+        assert!(!d.live_for(&[2; 16], 14_999));
         assert_eq!(d.begin([1; 16], 0, 15_000, 15_000), BeginDiscovery::New(2));
         assert!(!d.live(1, 15_000));
         assert!(d.live(2, 15_000));
